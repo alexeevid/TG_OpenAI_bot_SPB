@@ -4,6 +4,7 @@ import logging
 import os
 from functools import wraps
 from typing import Optional
+from textwrap import dedent
 
 from telegram import (Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand)
 from telegram.ext import (
@@ -31,6 +32,22 @@ from bot.knowledge_base.passwords import (
     clear_awaiting_password,
     store_pdf_password,
 )
+
+HELP_TEXT = dedent("""\
+/start, /help — помощь
+/reset — сброс диалога
+/kb [запрос] — показать файлы/поиск в БЗ
+/kb_reset — сброс выбранного контекста
+/kb_sync — синхронизация базы знаний (админ)
+/pdfpass <file.pdf> <password> — пароль к PDF
+/list_models — показать доступные модели (кнопки)
+/set_model <name> — выбрать модель вручную
+/image <prompt> — сгенерировать изображение
+
+Также:
+— Пришли голос — я транскрибирую и СРАЗУ отвечу по смыслу.
+— Пришли фото/документ — проанализирую и отвечу.
+""")
 
 settings = load_settings()
 ALLOWED_USER_IDS = set(int(x.strip()) for x in (settings.allowed_user_ids or "").split(",") if x.strip().isdigit())
@@ -95,23 +112,6 @@ class ChatGPTTelegramBot:
     @only_allowed
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(HELP_TEXT)
-            from textwrap import dedent
-            
-            HELP_TEXT = dedent("""\
-            /start, /help — помощь
-            /reset — сброс диалога
-            /kb [запрос] — показать файлы/поиск в БЗ
-            /kb_reset — сброс выбранного контекста
-            /kb_sync — синхронизация базы знаний (админ)
-            /pdfpass <file.pdf> <password> — пароль к PDF
-            /list_models — показать доступные модели (кнопки)
-            /set_model <name> — выбрать модель вручную
-            /image <prompt> — сгенерировать изображение
-            
-            Также:
-            — Пришли голос — я транскрибирую и СРАЗУ отвечу по смыслу.
-            — Пришли фото/документ — проанализирую и отвечу.
-            """)
 
     @only_allowed
     async def reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
