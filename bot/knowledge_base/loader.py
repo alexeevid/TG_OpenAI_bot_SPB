@@ -1,77 +1,98 @@
-import io, hashlib, logging, tempfile, os
+import io
+import hashlib
 from typing import Optional
-import PyPDF2, docx2txt
-from sqlalchemy import select
 from bot.db.session import SessionLocal
 from bot.db.models import Document, DocumentChunk
 from bot.knowledge_base.yandex_client import YandexDiskClient
 from bot.knowledge_base.splitter import split_text
 from bot.knowledge_base.passwords import get_pdf_password
+import PyPDF2
+import docx2txt
 
-def sha256_bytes(b: bytes) -> str: return hashlib.sha256(b).hexdigest()
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-def extract_pdf(content: bytes, password: Optional[str] = None) -> str:
+def extract_text_from_pdf(content: bytes, password: Optional[str] = None) -> str:
     reader = PyPDF2.PdfReader(io.BytesIO(content))
     if reader.is_encrypted:
-        if password: reader.decrypt(password)
-        else: raise RuntimeError("PDF encrypted")
-    return "\n".join((p.extract_text() or "") for p in reader.pages)
+        if password:
+            reader.decrypt(password)
+        else:
+            raise RuntimeError("PDF encrypted")
+    texts = []
+    for page in reader.pages:
+        texts.append(page.extract_text() or "")
+    return "\n".join(texts)
 
-def extract_docx(content: bytes) -> str:
+def extract_text_from_docx(content: bytes) -> str:
+    import tempfile, os
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
-        tmp.write(content); path = tmp.name
-    try: return docx2txt.process(path) or ""
-    finally: 
+        tmp.write(content)
+        path = tmp.name
+    try:
+        return docx2txt.process(path) or ""
+    finally:
         try: os.remove(path)
         except Exception: pass
 
-def detect_password(path: str, content: bytes) -> bool:
+def detect_password_need(path: str, content: bytes) -> bool:
     if path.lower().endswith(".pdf"):
-        try: extract_pdf(content, None); return False
-        except Exception: return True
+        try:
+            _ = extract_text_from_pdf(content, password=None)
+            return False
+        except Exception:
+            return True
     return False
 
-def extract_text(path: str, content: bytes, password: Optional[str] = None) -> str:
-    p = path.lower()
-    if p.endswith(".pdf"): return extract_pdf(content, password)
-    if p.endswith(".docx"): return extract_docx(content)
-    if p.endswith(".txt") or p.endswith(".md"): return content.decode("utf-8", "ignore")
-    return ""
+def guess_text(path: str, content: bytes, password: Optional[str] = None) -> str:
+    lower = path.lower()
+    if lower.endswith(".pdf"):
+        return extract_text_from_pdf(content, password=password)
+    elif lower.endswith(".docx"):
+        return extract_text_from_docx(content)
+    elif lower.endswith(".txt") or lower.endswith(".md"):
+        return content.decode("utf-8", errors="ignore")
+    else:
+        return ""
 
-async def sync_yandex_disk_to_db(token, base_url, root_path, embedding_client, embedding_model, chunk_size_tokens=1000, overlap_tokens=100):
-    yd = YandexDiskClient(token, base_url)
+async def sync_yandex_disk_to_db(token: str, base_url: str, root_path: str, embedding_client, embedding_model: str):
+    yd = YandexDiskClient(token=token, base_url=base_url)
     files = list(yd.iter_files(root_path))
     with SessionLocal() as s:
-        ex = {d.path: d for d in s.query(Document).all()}
+        existing = {d.path: d for d in s.query(Document).all()}
         for path, size in files:
             content = yd.download(path)
             sha = sha256_bytes(content)
-            doc = ex.get(path)
-            pw_req = detect_password(path, content)
+            doc = existing.get(path)
+
+            password_required = detect_password_need(path, content)
             text = ""
-            if not pw_req:
+            if not password_required:
                 pwd = get_pdf_password(path)
-                try: text = extract_text(path, content, pwd)
-                except Exception: pw_req = True
+                try:
+                    text = guess_text(path, content, password=pwd)
+                except Exception:
+                    password_required = True
+
             if doc:
-                s.query(DocumentChunk).filter(DocumentChunk.document_id==doc.id).delete()
-                doc.size=size; doc.sha256=sha; doc.password_required=pw_req
+                s.query(DocumentChunk).filter(DocumentChunk.document_id == doc.id).delete()
+                doc.size = size
+                doc.sha256 = sha
+                doc.password_required = password_required
             else:
-                doc = Document(path=path, size=size, sha256=sha, password_required=pw_req)
-                s.add(doc); s.flush()
-            if not pw_req and text.strip():
-                chunks = split_text(text, chunk_size_tokens, overlap_tokens)
-                if embedding_client:
-                    resp = await embedding_client.embeddings.create(model=embedding_model, input=chunks)
-                    for i, (t,d) in enumerate(zip(chunks, resp.data)):
-                        s.add(DocumentChunk(document_id=doc.id, chunk_index=i, text=t, embedding=d.embedding))
-                else:
-                    for i, t in enumerate(chunks):
-                        s.add(DocumentChunk(document_id=doc.id, chunk_index=i, text=t, embedding=[0.0]*3072))
+                doc = Document(path=path, size=size, sha256=sha, password_required=password_required)
+                s.add(doc)
+                s.flush()
+
+            if not password_required and text.strip():
+                chunks = split_text(text)
+                for idx, ch in enumerate(chunks):
+                    s.add(DocumentChunk(document_id=doc.id, chunk_index=idx, text=ch, embedding=[0.0]*3072))
             s.commit()
-        disk_paths = set(p for p,_ in files)
-        for p,d in ex.items():
+
+        disk_paths = set(p for p, _ in files)
+        for p, d in existing.items():
             if p not in disk_paths:
-                s.query(DocumentChunk).filter(DocumentChunk.document_id==d.id).delete()
+                s.query(DocumentChunk).filter(DocumentChunk.document_id == d.id).delete()
                 s.delete(d)
         s.commit()
