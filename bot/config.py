@@ -1,0 +1,33 @@
+from pydantic import BaseModel, Field
+import os
+class Settings(BaseModel):
+    telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
+    openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
+    openai_model: str = Field("gpt-4o", alias="OPENAI_MODEL")
+    vision_model: str = Field("gpt-4o", alias="VISION_MODEL")
+    image_model: str = Field("gpt-image-1", alias="IMAGE_MODEL")
+    tts_model: str = Field("gpt-4o-mini-tts", alias="TTS_MODEL")
+    embedding_model: str = Field("text-embedding-3-large", alias="EMBEDDING_MODEL")
+    enable_image_generation: bool = Field(True, alias="ENABLE_IMAGE_GENERATION")
+    enable_tts_generation: bool = Field(False, alias="ENABLE_TTS_GENERATION")
+    allowed_models_whitelist: str | None = Field(None, alias="ALLOWED_MODELS_WHITELIST")
+    denylist_models: str | None = Field(None, alias="DENYLIST_MODELS")
+    yandex_disk_token: str = Field(..., alias="YANDEX_DISK_TOKEN")
+    yandex_disk_webdav_url: str = Field("https://webdav.yandex.ru", alias="YANDEX_DISK_WEBDAV_URL")
+    yandex_root_path: str = Field("/База Знаний", alias="YANDEX_ROOT_PATH")
+    postgres_url: str = Field(..., alias="POSTGRES_URL")
+    bot_language: str = Field("ru", alias="BOT_LANGUAGE")
+    openai_temperature: float = Field(0.7, alias="OPENAI_TEMPERATURE")
+    max_history_size: int = Field(20, alias="MAX_HISTORY_SIZE")
+    max_tokens: int = Field(2048, alias="MAX_TOKENS")
+    vision_max_tokens: int = Field(1024, alias="VISION_MAX_TOKENS")
+    vision_detail: str = Field("auto", alias="VISION_DETAIL")
+    functions_max_consecutive_calls: int = Field(3, alias="FUNCTIONS_MAX_CONSECUTIVE_CALLS")
+    rag_top_k: int = Field(5, alias="RAG_TOP_K")
+    admin_ids: str = Field("", alias="ADMIN_IDS")
+    sentry_dsn: str | None = Field(None, alias="SENTRY_DSN")
+    log_level: str = Field("INFO", alias="LOG_LEVEL")
+    kb_sync_interval: int = Field(0, alias="KB_SYNC_INTERVAL")
+    class Config: populate_by_name = True
+def load_settings() -> Settings:
+    return Settings(**os.environ)
