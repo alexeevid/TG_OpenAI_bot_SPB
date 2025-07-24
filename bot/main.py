@@ -1,9 +1,9 @@
+# bot/main.py
 import logging
-import os
 from pathlib import Path
 
-from telegram.ext import ApplicationBuilder
 from telegram import BotCommand
+from telegram.ext import ApplicationBuilder
 
 from bot.config import load_settings
 from bot.error_tracer import init_error_tracer
@@ -17,18 +17,80 @@ from bot.knowledge_base.context_manager import ContextManager
 # DB & migrations
 from bot.db.session import DB_URL, engine
 from bot.db.models import Base
+
 from alembic.config import Config
 from alembic import command
 
 
-def setup_logging(level: str):
+# ---------------------------
+# infra
+# ---------------------------
+
+def setup_logging(level: str) -> None:
     logging.basicConfig(
         level=level,
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
     )
 
 
-async def post_init(application, bot: ChatGPTTelegramBot, settings):
+def run_migrations() -> None:
+    """
+    1) Пытаемся создать EXTENSION vector (если есть права).
+    2) Пробуем прогнать alembic upgrade head.
+       - Если нет alembic.ini или script_location, настраиваем programmatically.
+    3) Если alembic не взлетел — fallback: Base.metadata.create_all(engine).
+    """
+    logging.info("DB_URL resolved to: %s", DB_URL)
+
+    # 1) vector
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
+        logging.info("pgvector extension ensured (CREATE EXTENSION IF NOT EXISTS vector)")
+    except Exception as e:
+        logging.warning("Couldn't ensure pgvector extension automatically: %s", e)
+
+    # 2) alembic
+    try:
+        # ищем alembic.ini в корне проекта (../.. от этого файла)
+        alembic_ini = Path(__file__).resolve().parents[2] / "alembic.ini"
+        if alembic_ini.exists():
+            cfg = Config(str(alembic_ini))
+            # если в ini отсутствует ключ script_location — поставим явно
+            if not cfg.get_main_option("script_location"):
+                cfg.set_main_option(
+                    "script_location",
+                    str(Path(__file__).resolve().parents[1] / "db" / "migrations")
+                )
+        else:
+            # создаём конфиг в памяти
+            cfg = Config()
+            cfg.set_main_option(
+                "script_location",
+                str(Path(__file__).resolve().parents[1] / "db" / "migrations")
+            )
+
+        cfg.set_main_option("sqlalchemy.url", DB_URL)
+        command.upgrade(cfg, "head")
+        logging.info("Alembic migrations applied successfully")
+        return
+    except Exception as e:
+        logging.error(
+            "Can't run alembic migrations, fallback to Base.metadata.create_all: %s",
+            e,
+            exc_info=True
+        )
+
+    # 3) fallback
+    try:
+        Base.metadata.create_all(engine)
+        logging.info("Tables created via Base.metadata.create_all()")
+    except Exception as e:
+        logging.critical("Even Base.metadata.create_all() failed: %s", e, exc_info=True)
+        raise
+
+
+async def post_init(application, bot: ChatGPTTelegramBot, settings) -> None:
     commands = [
         BotCommand("start", "помощь"),
         BotCommand("help", "помощь"),
@@ -40,40 +102,28 @@ async def post_init(application, bot: ChatGPTTelegramBot, settings):
         BotCommand("list_models", "показать модели"),
         BotCommand("set_model", "выбрать модель"),
     ]
-    if settings.enable_image_generation:
+    if getattr(settings, "enable_image_generation", True):
         commands.append(BotCommand("image", "сгенерировать изображение"))
+
     await application.bot.set_my_commands(commands)
 
 
-def run_migrations():
-    logging.info("DB_URL resolved to: %s", DB_URL)
-    try:
-        # alembic.ini лежит в корне проекта
-        alembic_ini = Path(__file__).resolve().parents[2] / "alembic.ini"
-        cfg = Config(str(alembic_ini))
-        cfg.set_main_option("sqlalchemy.url", DB_URL)
-        command.upgrade(cfg, "head")
-        logging.info("Alembic migrations applied successfully")
-    except Exception as e:
-        logging.error(
-            "Can't run alembic migrations, fallback to Base.metadata.create_all: %s",
-            e,
-            exc_info=True
-        )
-        Base.metadata.create_all(engine)
+# ---------------------------
+# entrypoint
+# ---------------------------
 
-
-def main():
-    # 1) Конфиги/логи/трейсинг
+def main() -> None:
+    # 1) конфиги/логи/трейсинг
     settings = load_settings()
     setup_logging(settings.log_level)
     init_error_tracer(settings.sentry_dsn)
 
-    # 2) Миграции ДОЛЖНЫ пройти до того, как мы создадим объекты, которые могут полезть в БД
+    # 2) миграции — ДО инициализации бота/трекинга/ретривера
     run_migrations()
 
-    # 3) Инициализация OpenAI, RAG, UsageTracker, Bot
+    # 3) OpenAI / RAG / usage tracker
     plugin_manager = PluginManager(config={})
+
     openai_config = {
         "api_key": settings.openai_api_key,
         "model": settings.openai_model,
@@ -82,25 +132,31 @@ def main():
         "image_size": "1024x1024",
         "tts_model": settings.tts_model,
         "tts_voice": "alloy",
+
         "temperature": settings.openai_temperature,
         "n_choices": 1,
         "max_tokens": settings.max_tokens,
         "presence_penalty": 0,
         "frequency_penalty": 0,
+
         "assistant_prompt": "You are a helpful assistant.",
         "max_history_size": settings.max_history_size,
         "max_conversation_age_minutes": 60,
         "show_usage": True,
+
         "enable_vision_follow_up_questions": False,
         "vision_max_tokens": settings.vision_max_tokens,
         "vision_prompt": "Опиши, что на изображении.",
         "vision_detail": settings.vision_detail,
+
         "whisper_prompt": "",
         "bot_language": settings.bot_language,
         "proxy": None,
+
         "enable_image_generation": settings.enable_image_generation,
         "enable_tts_generation": settings.enable_tts_generation,
         "functions_max_consecutive_calls": settings.functions_max_consecutive_calls,
+
         "allowed_models_whitelist": settings.allowed_models_whitelist,
         "denylist_models": settings.denylist_models,
     }
@@ -108,19 +164,21 @@ def main():
     openai_helper = OpenAIHelper(config=openai_config, plugin_manager=plugin_manager)
     retriever = Retriever(top_k=settings.rag_top_k)
     ctx_manager = ContextManager()
+    usage_tracker = UsageTracker()
+
+    bot_config = {
+        "token": settings.telegram_bot_token,
+        "enable_image_generation": settings.enable_image_generation,
+        "allowed_user_ids": getattr(settings, "allowed_user_ids", []),
+        "admin_user_ids": getattr(settings, "admin_user_ids", []),
+    }
 
     bot = ChatGPTTelegramBot(
-        config={
-            "token": settings.telegram_bot_token,
-            "enable_image_generation": settings.enable_image_generation,
-            # если используешь whitelist/админов — передай их сюда
-            "allowed_user_ids": settings.allowed_user_ids,
-            "admin_user_ids": settings.admin_user_ids,
-        },
+        config=bot_config,
         openai_helper=openai_helper,
-        usage_tracker=UsageTracker(),
+        usage_tracker=usage_tracker,
         retriever=retriever,
-        ctx_manager=ctx_manager
+        ctx_manager=ctx_manager,
     )
 
     async def _post_init(app):
@@ -135,7 +193,6 @@ def main():
     )
 
     bot.register_handlers(application)
-
     application.run_polling(drop_pending_updates=True)
 
 
