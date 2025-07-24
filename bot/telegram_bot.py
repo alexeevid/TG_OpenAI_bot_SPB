@@ -78,7 +78,16 @@ class ChatGPTTelegramBot:
                  retriever: Optional[Retriever] = None, ctx_manager: Optional[ContextManager] = None):
         self.config = config
         self.openai = openai_helper
-        self.usage_tracker = usage_tracker or UsageTracker()
+        self.usage_tracker.track(
+            chat_id=chat_id,
+            user_id=update.effective_user.id if update.effective_user else None,
+            model=usage.model if hasattr(usage, "model") else self.openai.user_models.get(chat_id),
+            prompt_tokens=getattr(usage, "prompt_tokens", None),
+            completion_tokens=getattr(usage, "completion_tokens", None),
+            total_tokens=getattr(usage, "total_tokens", None),
+            cost_usd=None,
+            content=answer,
+        )
         self.retriever = retriever or Retriever()
         self.ctx_manager = ctx_manager or ContextManager()
 
