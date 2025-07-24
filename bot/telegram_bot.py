@@ -95,26 +95,16 @@ class ChatGPTTelegramBot:
     @only_allowed
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "/start, /help — помощь
-"
-            "/reset — сброс диалога
-"
-            "/kb [запрос] — показать файлы/поиск в БЗ
-"
-            "/kb_reset — сброс выбранного контекста
-"
-            "/kb_sync — синхронизировать базу знаний (админ)
-"
-            "/pdfpass <file.pdf> <password> — пароль к PDF
-"
-            "/list_models — доступные модели (с кнопками)
-"
-            "/set_model <name> — выбрать модель вручную
-"
-            "/image <prompt> — сгенерировать изображение
-"
-            "Просто пришли голос/фото/документ — я обработаю и отвечу
-"
+            "/start, /help — помощь"
+            "/reset — сброс диалога"
+            "/kb [запрос] — показать файлы/поиск в БЗ"
+            "/kb_reset — сброс выбранного контекста"
+            "/kb_sync — синхронизировать базу знаний (админ)"
+            "/pdfpass <file.pdf> <password> — пароль к PDF"
+            "/list_models — доступные модели (с кнопками)"
+            "/set_model <name> — выбрать модель вручную"
+            "/image <prompt> — сгенерировать изображение"
+            "Просто пришли голос/фото/документ — я обработаю и отвечу"
         )
 
     @only_allowed
