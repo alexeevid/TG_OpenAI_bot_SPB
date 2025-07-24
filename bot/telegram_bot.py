@@ -94,18 +94,24 @@ class ChatGPTTelegramBot:
 
     @only_allowed
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "/start, /help — помощь"
-            "/reset — сброс диалога"
-            "/kb [запрос] — показать файлы/поиск в БЗ"
-            "/kb_reset — сброс выбранного контекста"
-            "/kb_sync — синхронизировать базу знаний (админ)"
-            "/pdfpass <file.pdf> <password> — пароль к PDF"
-            "/list_models — доступные модели (с кнопками)"
-            "/set_model <name> — выбрать модель вручную"
-            "/image <prompt> — сгенерировать изображение"
-            "Просто пришли голос/фото/документ — я обработаю и отвечу"
-        )
+        await update.message.reply_text(HELP_TEXT)
+            from textwrap import dedent
+            
+            HELP_TEXT = dedent("""\
+            /start, /help — помощь
+            /reset — сброс диалога
+            /kb [запрос] — показать файлы/поиск в БЗ
+            /kb_reset — сброс выбранного контекста
+            /kb_sync — синхронизация базы знаний (админ)
+            /pdfpass <file.pdf> <password> — пароль к PDF
+            /list_models — показать доступные модели (кнопки)
+            /set_model <name> — выбрать модель вручную
+            /image <prompt> — сгенерировать изображение
+            
+            Также:
+            — Пришли голос — я транскрибирую и СРАЗУ отвечу по смыслу.
+            — Пришли фото/документ — проанализирую и отвечу.
+            """)
 
     @only_allowed
     async def reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
