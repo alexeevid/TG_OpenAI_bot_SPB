@@ -88,9 +88,6 @@ class ChatGPTTelegramBot:
     @only_allowed
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await self.help(update, context)
-
-    def post_init(self, app: Application):
-        logging.info("Post-init hook called. Nothing to initialize yet.")
     
     @only_allowed
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
