@@ -25,7 +25,9 @@ def main():
 
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
     bot.register(app)
-    app.post_init(bot.initialize)
+    if hasattr(bot, 'initialize') and callable(bot.initialize):
+        print('✅ Calling bot.initialize manually')
+        bot.initialize(app)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
