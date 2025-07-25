@@ -2,9 +2,9 @@ import asyncio
 import logging
 
 from bot.telegram_bot import ChatGPTTelegramBot
-from bot.db.session import init_db
+from bot.openai_helper import OpenAIHelper  # <-- Исправлено
 from bot.settings import settings
-from bot.openai_utils import OpenAIHelper
+from bot.db.session import init_db
 
 logging.basicConfig(level=settings.log_level)
 logger = logging.getLogger(__name__)
@@ -13,12 +13,8 @@ async def main():
     logger.info("🔄 Инициализация базы данных...")
     await init_db()
 
-    logger.info("🤖 Создание OpenAIHelper...")
-    openai_helper = OpenAIHelper(
-        api_key=settings.openai_api_key,
-        model=settings.openai_model,
-        image_model=settings.image_model
-    )
+    logger.info("⚙️ Инициализация OpenAIHelper...")
+    openai_helper = OpenAIHelper(settings)
 
     logger.info("⚙️ Инициализация Telegram-бота...")
     bot = ChatGPTTelegramBot(openai_helper)
