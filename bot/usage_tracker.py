@@ -1,7 +1,6 @@
-# bot/usage_tracker.py
-from typing import Optional
-from bot.db.session import SessionLocal
-from bot.db.models import Message
+
+import logging
+from typing import Optional, Any
 
 class UsageTracker:
     def __init__(self, enabled: bool = True):
@@ -15,19 +14,11 @@ class UsageTracker:
               completion_tokens: Optional[int],
               total_tokens: Optional[int],
               cost_usd: Optional[float] = None,
-              content: Optional[str] = None):
+              message: Optional[str] = None,
+              extra: Optional[dict[str, Any]] = None):
         if not self.enabled:
             return
-        with SessionLocal() as s:
-            s.add(Message(
-                chat_id=chat_id,
-                user_id=user_id,
-                role="assistant",
-                content=content or "",
-                tokens_prompt=prompt_tokens,
-                tokens_completion=completion_tokens,
-                total_tokens=total_tokens,
-                model=model,
-                cost_usd=cost_usd,
-            ))
-            s.commit()
+        logging.debug(
+            "USAGE: chat=%s user=%s model=%s total=%s prompt=%s completion=%s cost=%s",
+            chat_id, user_id, model, total_tokens, prompt_tokens, completion_tokens, cost_usd
+        )

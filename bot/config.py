@@ -1,46 +1,52 @@
-from pydantic import BaseModel, Field
-import os
 
-class Settings(BaseModel):
-    telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
+from pydantic import BaseSettings, Field
+from typing import List
 
-    openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
-    openai_model: str = Field("gpt-4o", alias="OPENAI_MODEL")
-    vision_model: str = Field("gpt-4o", alias="VISION_MODEL")
-    image_model: str = Field("gpt-image-1", alias="IMAGE_MODEL")
-    tts_model: str = Field("gpt-4o-mini-tts", alias="TTS_MODEL")
-    embedding_model: str = Field("text-embedding-3-large", alias="EMBEDDING_MODEL")
+class Settings(BaseSettings):
+    # Telegram / OpenAI
+    telegram_bot_token: str = Field(..., env="TELEGRAM_BOT_TOKEN")
+    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
 
-    enable_image_generation: bool = Field(True, alias="ENABLE_IMAGE_GENERATION")
-    enable_tts_generation: bool = Field(False, alias="ENABLE_TTS_GENERATION")
+    openai_model: str = Field("gpt-4o-mini", env="OPENAI_MODEL")
+    vision_model: str = Field("gpt-4o-mini", env="VISION_MODEL")
+    image_model: str = Field("dall-e-3", env="IMAGE_MODEL")
+    tts_model: str = Field("gpt-4o-mini-tts", env="TTS_MODEL")
 
-    allowed_models_whitelist: str | None = Field(None, alias="ALLOWED_MODELS_WHITELIST")
-    denylist_models: str | None = Field(None, alias="DENYLIST_MODELS")
+    openai_temperature: float = Field(0.3, env="OPENAI_TEMPERATURE")
+    max_tokens: int = Field(4096, env="MAX_TOKENS")
+    max_history_size: int = Field(30, env="MAX_HISTORY_SIZE")
+    vision_max_tokens: int = Field(1024, env="VISION_MAX_TOKENS")
+    vision_detail: str = Field("low", env="VISION_DETAIL")
+    bot_language: str = Field("ru", env="BOT_LANGUAGE")
 
-    allowed_user_ids: str | None = Field(None, alias="ALLOWED_USER_IDS")
-    admin_ids: str = Field("", alias="ADMIN_IDS")
+    enable_image_generation: bool = Field(True, env="ENABLE_IMAGE_GENERATION")
+    enable_tts_generation: bool = Field(False, env="ENABLE_TTS_GENERATION")
+    functions_max_consecutive_calls: int = Field(3, env="FUNCTIONS_MAX_CONSECUTIVE_CALLS")
 
-    yandex_disk_token: str = Field(..., alias="YANDEX_DISK_TOKEN")
-    yandex_disk_webdav_url: str = Field("https://webdav.yandex.ru", alias="YANDEX_DISK_WEBDAV_URL")
-    yandex_root_path: str = Field("/База Знаний", alias="YANDEX_ROOT_PATH")
+    rag_top_k: int = Field(5, env="RAG_TOP_K")
 
-    db_url_source: str = Field("auto", alias="DB_URL_SOURCE")
-    postgres_url: str | None = Field(None, alias="POSTGRES_URL")
+    allowed_models_whitelist: str = Field("", env="ALLOWED_MODELS_WHITELIST")
+    denylist_models: str = Field("", env="DENYLIST_MODELS")
 
-    bot_language: str = Field("ru", alias="BOT_LANGUAGE")
-    openai_temperature: float = Field(0.7, alias="OPENAI_TEMPERATURE")
-    max_history_size: int = Field(20, alias="MAX_HISTORY_SIZE")
-    max_tokens: int = Field(2048, alias="MAX_TOKENS")
-    vision_max_tokens: int = Field(1024, alias="VISION_MAX_TOKENS")
-    vision_detail: str = Field("auto", alias="VISION_DETAIL")
-    functions_max_consecutive_calls: int = Field(3, alias="FUNCTIONS_MAX_CONSECUTIVE_CALLS")
-    rag_top_k: int = Field(5, alias="RAG_TOP_K")
-    sentry_dsn: str | None = Field(None, alias="SENTRY_DSN")
-    log_level: str = Field("INFO", alias="LOG_LEVEL")
-    kb_sync_interval: int = Field(0, alias="KB_SYNC_INTERVAL")
+    # access control
+    allowed_user_ids: str = Field("", env="ALLOWED_USER_IDS")  # "123,456"
+    admin_user_ids: str = Field("", env="ADMIN_USER_IDS")
+
+    # DB
+    log_level: str = Field("INFO", env="LOG_LEVEL")
+    sentry_dsn: str = Field("", env="SENTRY_DSN")
 
     class Config:
-        populate_by_name = True
+        env_file = ".env"
+        case_sensitive = False
+
+def parse_int_list(value: str) -> List[int]:
+    if not value:
+        return []
+    return [int(x.strip()) for x in value.split(",") if x.strip()]
 
 def load_settings() -> Settings:
-    return Settings(**os.environ)
+    s = Settings()
+    s.allowed_user_ids = parse_int_list(s.allowed_user_ids)
+    s.admin_user_ids = parse_int_list(s.admin_user_ids)
+    return s

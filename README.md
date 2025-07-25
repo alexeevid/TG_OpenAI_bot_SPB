@@ -1,16 +1,28 @@
-# Telegram OpenAI RAG Bot — v3
 
-## Что нового
-- Ограничение доступа по `ALLOWED_USER_IDS`
-- Голос → транскрибация + логический ответ
-- `/list_models` — выбор модели кликом
-- Починен `/image`
-- Универсальный Postgres URL resolver (Railway public/internal/…)
-- Миграции Alembic + pgvector
+# TG OpenAI Bot (no-pgvector, no-alembic)
 
-## Быстрый старт
-1. `.env.example` → `.env`
-2. Railway: сервис + Postgres
-3. В БД: `CREATE EXTENSION IF NOT EXISTS vector;`
-4. `alembic upgrade head`
-5. Деплой → `/help`
+Быстрый минимальный билд бота для Railway без pgvector / alembic.
+
+## Установка / запуск
+
+1. Подготовьте переменные окружения (см. `.env.example`).
+2. DB_URL возьмите у Railway (Postgres service).
+3. IMAGE_MODEL используйте `dall-e-3`, чтобы не упираться в верификацию `gpt-image-1`.
+4. Деплойте (Dockerfile уже готов).
+
+## Основные команды
+
+- `/help` — справка
+- `/reset` — сброс диалога
+- `/kb`, `/kb_reset` — заглушки для БЗ
+- `/image <prompt>` — генерация изображения
+- Голосовые — транскрипция и ответ
+
+## Что отсутствует в этом минимальном билде
+
+- pgvector и быстрый ANN поиск — заменен на косинусное сходство в RAM
+- alembic миграции — таблицы создаются напрямую
+- полноценный UI выбора документов из БЗ
+- пароли к PDF (заглушка)
+
+Добавляйте по мере необходимости.

@@ -1,20 +1,25 @@
-from sqlalchemy import text
+
+import numpy as np
+from sqlalchemy import select
 from bot.db.session import SessionLocal
+from bot.db.models import DocumentChunk
 
 class Retriever:
-    def __init__(self, session_factory=SessionLocal, top_k: int = 5):
-        self.sf = session_factory
+    def __init__(self, top_k: int = 5):
         self.top_k = top_k
 
-    async def search(self, query: str, top_k: int | None = None, document_ids: list[int] | None = None):
-        k = top_k or self.top_k
-        sql = "SELECT dc.document_id, dc.text FROM document_chunks dc"
-        params = {}
-        if document_ids:
-            sql += " WHERE dc.document_id = ANY(:doc_ids)"
-            params["doc_ids"] = document_ids
-        sql += " LIMIT :k"
-        params["k"] = k
-        with self.sf() as s:
-            rows = s.execute(text(sql), params).all()
-            return [(r.document_id, r.text, 0.0) for r in rows]
+    def search(self, query_embedding):
+        q = np.array(query_embedding, dtype=np.float32).reshape(-1)
+        with SessionLocal() as s:
+            chunks = s.execute(select(DocumentChunk)).scalars().all()
+
+        q_norm = np.linalg.norm(q) + 1e-8
+        scored = []
+        for ch in chunks:
+            v = np.array(ch.embedding, dtype=np.float32).reshape(-1)
+            v_norm = np.linalg.norm(v) + 1e-8
+            score = float(np.dot(q, v) / (q_norm * v_norm))
+            scored.append((score, ch))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [c for _, c in scored[:self.top_k]]

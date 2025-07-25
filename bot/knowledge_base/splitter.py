@@ -1,7 +1,6 @@
-def split_text(text: str, chunk_size_tokens: int = 1000, overlap_tokens: int = 100) -> list[str]:
-    size = chunk_size_tokens * 4
-    step = size - overlap_tokens * 4
-    chunks = []
-    for i in range(0, len(text), step):
-        chunks.append(text[i:i+size])
-    return chunks
+
+def trim_to_token_limit(text: str, limit: int) -> str:
+    return text[:limit]
+
+def build_context_messages(docs: list[str]) -> str:
+    return "\n\n".join(docs)
