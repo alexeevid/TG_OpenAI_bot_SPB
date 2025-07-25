@@ -8,11 +8,11 @@ def main():
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
     bot = ChatGPTTelegramBot(settings)
 
-    async def start():
-        await bot.initialize(app)
-        app.run_polling()
+    # корректно инициализируем асинхронный метод
+    asyncio.run(bot.initialize(app))
 
-    asyncio.run(start())
+    # запускаем бота — не внутри event loop!
+    app.run_polling()
 
 
 if __name__ == "__main__":
