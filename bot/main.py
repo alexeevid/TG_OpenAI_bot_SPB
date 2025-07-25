@@ -11,14 +11,10 @@ def setup_logging(level: str):
 
 def main():
     settings = load_settings()
-    print("DEBUG SETTINGS:", settings.model_dump())
-
     setup_logging(settings.log_level)
 
-    # init DB
-    init_db()
+    init_db(Base)  # ← именно так!
 
-    # OpenAI helper
     oai = OpenAIHelper(
         api_key=settings.openai_api_key,
         model=settings.openai_model,
@@ -29,7 +25,7 @@ def main():
 
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
     bot.register(app)
-    app.post_init(bot.initialize)  # ← исправлено здесь
+    app.post_init(bot.initialize)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
