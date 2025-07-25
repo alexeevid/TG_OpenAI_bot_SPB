@@ -63,12 +63,10 @@ class ChatGPTTelegramBot:
         # text messages
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
     
-    async def initialize(self, app: Application):
-        # например, зарегистрировать команды:
-        await app.bot.set_my_commands([
-            BotCommand("start", "Начать работу"),
-            BotCommand("help", "Справка")
-        ])
+    async def initialize(self, app):
+        # Выполняется один раз после запуска
+        # Можно логировать старт, инициализировать что-либо, если нужно
+        logging.info("Bot initialized")
         
     async def post_init(self, app: Application):
         commands = [
@@ -88,6 +86,9 @@ class ChatGPTTelegramBot:
     @only_allowed
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await self.help(update, context)
+
+    def post_init(self, app: Application):
+        logging.info("Post-init hook called. Nothing to initialize yet.")
     
     @only_allowed
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
