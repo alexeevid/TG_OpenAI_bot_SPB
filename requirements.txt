@@ -2,3 +2,4 @@ python-telegram-bot==20.7
 openai
 sqlalchemy
 nest_asyncio
+pydantic-settings>=2.0
