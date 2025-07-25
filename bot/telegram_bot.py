@@ -64,6 +64,16 @@ class ChatGPTTelegramBot:
         application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.handle_file))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.text_message))
 
+        application.add_error_handler(self.error_handler)
+
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logging.exception("Unhandled exception while handling update: %s", update, exc_info=context.error)
+        try:
+            if update and hasattr(update, "effective_message") and update.effective_message:
+                await update.effective_message.reply_text("⚠️ Произошла ошибка. Уже чиним.")
+        except Exception:
+            pass
+
     # region Commands
 
     @only_allowed
@@ -108,9 +118,14 @@ class ChatGPTTelegramBot:
             ).scalars().all()
 
         if not docs:
-            await (update_or_query.message if hasattr(update_or_query, "message") else update_or_query.edit_message_text)(
-                "В базе знаний нет документов. Выполни /kb_sync (админ)"
-            )
+            text = "В базе знаний нет документов. Выполни /kb_sync (админ)"
+            # Разруливаем корректно Update vs CallbackQuery
+            if hasattr(update_or_query, "edit_message_text"):  # CallbackQuery
+                await update_or_query.edit_message_text(text)
+            elif hasattr(update_or_query, "message"):
+                await update_or_query.message.reply_text(text)
+            else:
+                logging.warning("Can't send message: unknown object type in _send_kb_list")
             return
 
         text_lines = [f"📚 Документы ({total} всего). Страница {page+1}:"]
@@ -129,10 +144,14 @@ class ChatGPTTelegramBot:
             kb.append(nav)
 
         text = "\n".join(text_lines)
-        if hasattr(update_or_query, "callback_query"):
-            await update_or_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        markup = InlineKeyboardMarkup(kb)
+
+        if hasattr(update_or_query, "edit_message_text"):  # CallbackQuery
+            await update_or_query.edit_message_text(text, reply_markup=markup)
+        elif hasattr(update_or_query, "message"):
+            await update_or_query.message.reply_text(text, reply_markup=markup)
         else:
-            await update_or_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+            logging.warning("Can't send message: unknown object type in _send_kb_list")
 
     async def handle_kb_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -198,7 +217,7 @@ class ChatGPTTelegramBot:
     async def kb_sync(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         admins = self.config.get("admin_user_ids") or []
-        if user_id not in admins:
+        if admins and user_id not in admins:
             await update.message.reply_text("Команда доступна только администраторам.")
             return
 

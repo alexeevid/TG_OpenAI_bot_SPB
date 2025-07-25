@@ -99,7 +99,6 @@ def main():
     )
 
     async def _post_init(app):
-        # на всякий случай прокинем в bot_data
         app.bot_data["YANDEX_DISK_TOKEN"] = os.getenv("YANDEX_DISK_TOKEN")
         app.bot_data["YANDEX_ROOT_PATH"] = os.getenv("YANDEX_ROOT_PATH", "/")
         await post_init(app, bot, settings)
