@@ -18,17 +18,26 @@ settings = load_settings()
 
 async def main():
     logger.info("🔄 Инициализация базы данных...")
-    init_db(Base)  # УБРАН await, т.к. функция синхронная
+    init_db(Base)
 
     logger.info("🔧 Инициализация OpenAI Helper...")
-    openai = OpenAIHelper(settings)
+    openai = OpenAIHelper(
+        api_key=settings.openai_api_key,
+        model=settings.openai_model,
+        image_model=settings.image_model
+    )
 
     logger.info("🤖 Запуск Telegram бота...")
     bot = ChatGPTTelegramBot(openai)
 
-    app = ApplicationBuilder().token(settings.telegram_bot_token).post_init(bot.post_init).build()
-    bot.register(app)
+    app = (
+        ApplicationBuilder()
+        .token(settings.telegram_bot_token)
+        .post_init(bot.post_init)
+        .build()
+    )
 
+    bot.register(app)
     await bot.initialize(app)
 
     logger.info("🚀 Бот запущен.")
