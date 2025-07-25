@@ -62,7 +62,12 @@ class ChatGPTTelegramBot:
 
         # text messages
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
-
+    
+    async def initialize(self, app):
+        # Выполняется один раз после запуска
+        # Можно логировать старт, инициализировать что-либо, если нужно
+        logging.info("Bot initialized")
+        
     async def post_init(self, app: Application):
         commands = [
             BotCommand("start", "помощь"),
