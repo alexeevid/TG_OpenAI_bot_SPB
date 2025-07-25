@@ -1,15 +1,12 @@
-
-import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from bot.config import load_settings
+from bot.settings import settings
 
-settings = load_settings()
-DB_URL = settings.database_url or "sqlite:///./local.sqlite3"
+DB_URL = settings.database_url
 
-engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+engine = create_engine(DB_URL, echo=True, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-def init_db(Base):
-    logging.info("Creating DB schema if not exists...")
-    Base.metadata.create_all(engine)
+def init_db():
+    from . import models
+    models.Base.metadata.create_all(bind=engine)
