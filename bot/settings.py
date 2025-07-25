@@ -1,8 +1,8 @@
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 import os
 
-load_dotenv()  # вручную подгружаем переменные из .env
+load_dotenv()
 
 class Settings(BaseSettings):
     database_url: str
