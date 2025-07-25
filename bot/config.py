@@ -1,49 +1,26 @@
-
+from pydantic_settings import BaseSettings
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
 class Settings(BaseSettings):
-    telegram_bot_token: str = Field(..., env="TELEGRAM_BOT_TOKEN")
-    openai_api_key: str = Field(..., env="OPENAI_API_KEY")
+    telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
+    openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
+    openai_model: str = Field("gpt-4o-mini", alias="OPENAI_MODEL")
+    vision_model: str = Field("gpt-4o", alias="VISION_MODEL")
+    image_model: str = Field("gpt-image-1", alias="IMAGE_MODEL")
+    tts_model: str = Field("gpt-4o-mini-tts", alias="TTS_MODEL")
+    bot_language: str = Field("ru", alias="BOT_LANGUAGE")
+    yandex_disk_token: str = Field(..., alias="YANDEX_DISK_TOKEN")
+    yandex_root_path: str = Field("/База Знаний", alias="YANDEX_ROOT_PATH")
+    database_url: str | None = Field(None, alias="DATABASE_URL")
+    admin_user_ids: List[int] = Field(default_factory=list, alias="ADMIN_USER_IDS")
+    allowed_telegram_user_ids: List[int] = Field(default_factory=list, alias="ALLOWED_TELEGRAM_USER_IDS")
+    log_level: str = Field("INFO", alias="LOG_LEVEL")
 
-    openai_model: str = Field("gpt-4o-mini", env="OPENAI_MODEL")
-    vision_model: str = Field("gpt-4o-mini", env="VISION_MODEL")
-    image_model: str = Field("dall-e-3", env="IMAGE_MODEL")
-    tts_model: str = Field("gpt-4o-mini-tts", env="TTS_MODEL")
-    embedding_model: str = Field("text-embedding-3-small", env="EMBEDDING_MODEL")
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False
 
-    openai_temperature: float = Field(0.3, env="OPENAI_TEMPERATURE")
-    max_tokens: int = Field(4096, env="MAX_TOKENS")
-    max_history_size: int = Field(30, env="MAX_HISTORY_SIZE")
-    vision_max_tokens: int = Field(1024, env="VISION_MAX_TOKENS")
-    vision_detail: str = Field("low", env="VISION_DETAIL")
-    bot_language: str = Field("ru", env="BOT_LANGUAGE")
-
-    enable_image_generation: bool = Field(True, env="ENABLE_IMAGE_GENERATION")
-    enable_tts_generation: bool = Field(False, env="ENABLE_TTS_GENERATION")
-    functions_max_consecutive_calls: int = Field(3, env="FUNCTIONS_MAX_CONSECUTIVE_CALLS")
-
-    rag_top_k: int = Field(5, env="RAG_TOP_K")
-
-    allowed_models_whitelist: str = Field("", env="ALLOWED_MODELS_WHITELIST")
-    denylist_models: str = Field("", env="DENYLIST_MODELS")
-
-    allowed_user_ids: str = Field("", env="ALLOWED_USER_IDS")
-    admin_user_ids: str = Field("", env="ADMIN_USER_IDS")
-
-    log_level: str = Field("INFO", env="LOG_LEVEL")
-    sentry_dsn: str = Field("", env="SENTRY_DSN")
-
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
-
-def parse_int_list(value: str) -> List[int]:
-    if not value:
-        return []
-    return [int(x.strip()) for x in value.split(",") if x.strip()]
-
-def load_settings() -> "Settings":
-    s = Settings()
-    s.allowed_user_ids = parse_int_list(s.allowed_user_ids)
-    s.admin_user_ids = parse_int_list(s.admin_user_ids)
-    return s
+def load_settings() -> Settings:
+    return Settings()

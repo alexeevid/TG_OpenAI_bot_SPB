@@ -1,14 +1,12 @@
-
 class ContextManager:
-    """ chat_id -> set(document_id) """
     def __init__(self):
-        self.ctx = {}
+        self.chat_docs = {}  # chat_id -> [paths]
+
+    def set_docs(self, chat_id: int, docs: list[str]):
+        self.chat_docs[chat_id] = docs
+
+    def get_docs(self, chat_id: int) -> list[str]:
+        return self.chat_docs.get(chat_id, [])
 
     def reset(self, chat_id: int):
-        self.ctx.pop(chat_id, None)
-
-    def add(self, chat_id: int, document_id: int):
-        self.ctx.setdefault(chat_id, set()).add(document_id)
-
-    def get(self, chat_id: int):
-        return list(self.ctx.get(chat_id, set()))
+        self.chat_docs.pop(chat_id, None)
