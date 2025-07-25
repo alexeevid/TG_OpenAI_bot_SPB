@@ -1,5 +1,5 @@
-
-from pydantic import BaseSettings, Field
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
 class Settings(BaseSettings):
@@ -36,16 +36,14 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", env="LOG_LEVEL")
     sentry_dsn: str = Field("", env="SENTRY_DSN")
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
 def parse_int_list(value: str) -> List[int]:
     if not value:
         return []
     return [int(x.strip()) for x in value.split(",") if x.strip()]
 
-def load_settings() -> Settings:
+def load_settings() -> "Settings":
     s = Settings()
     s.allowed_user_ids = parse_int_list(s.allowed_user_ids)
     s.admin_user_ids = parse_int_list(s.admin_user_ids)
