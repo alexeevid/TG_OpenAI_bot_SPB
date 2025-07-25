@@ -1,34 +1,24 @@
+import asyncio
 import logging
-from telegram.ext import ApplicationBuilder
-from bot.config import load_settings
-from bot.openai_helper import OpenAIHelper
+
 from bot.telegram_bot import ChatGPTTelegramBot
 from bot.db.session import init_db
-from bot.db.models import Base
+from bot.settings import settings
 
-def setup_logging(level: str):
-    logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logging.basicConfig(level=settings.log_level)
+logger = logging.getLogger(__name__)
 
-def main():
-    settings = load_settings()
-    setup_logging(settings.log_level)
+bot = ChatGPTTelegramBot()
 
-    init_db(Base)  # ← именно так!
+async def main():
+    logger.info("🔄 Инициализация базы данных...")
+    await init_db()
 
-    oai = OpenAIHelper(
-        api_key=settings.openai_api_key,
-        model=settings.openai_model,
-        image_model=settings.image_model,
-    )
+    logger.info("⚙️ Инициализация Telegram-бота...")
+    app = await bot.build_app()
 
-    bot = ChatGPTTelegramBot(openai_helper=oai)
-
-    app = ApplicationBuilder().token(settings.telegram_bot_token).build()
-    bot.register(app)
-    if hasattr(bot, 'initialize') and callable(bot.initialize):
-        print('✅ Calling bot.initialize manually')
-        bot.initialize(app)
-    app.run_polling(drop_pending_updates=True)
+    logger.info("✅ Запуск run_polling...")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
