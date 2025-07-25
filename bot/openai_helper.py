@@ -3,14 +3,12 @@ import datetime
 import logging
 import json
 import io
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, List
 
 import openai
 import httpx
 import tiktoken
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-
-from PIL import Image
 
 GPT_O_MODELS = ("o1", "o1-mini", "o1-preview")
 GPT_4O_MODELS = ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest")
@@ -24,6 +22,7 @@ def are_functions_available(model: str) -> bool:
 class OpenAIHelper:
     def __init__(self, config: dict, plugin_manager):
         self.config = config
+        self.config.setdefault("embedding_model", "text-embedding-3-small")
         self.plugin_manager = plugin_manager
         http_client = httpx.AsyncClient(proxy=config.get('proxy')) if 'proxy' in config else None
         self.client = openai.AsyncOpenAI(api_key=config['api_key'], http_client=http_client)
@@ -94,6 +93,11 @@ class OpenAIHelper:
         temp_file.write(response.read())
         temp_file.seek(0)
         return temp_file, len(text)
+
+    async def embed_texts(self, texts: List[str], model: str | None = None) -> List[List[float]]:
+        model = model or self.config.get("embedding_model", "text-embedding-3-small")
+        resp = await self.client.embeddings.create(model=model, input=texts)
+        return [item.embedding for item in resp.data]
 
     @retry(reraise=True, retry=retry_if_exception_type(openai.RateLimitError), wait=wait_fixed(20), stop=stop_after_attempt(3))
     async def _common_get_chat_response(self, chat_id: int, query: str, stream=False):

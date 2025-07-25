@@ -2,7 +2,7 @@
 import logging
 try:
     import sentry_sdk
-except Exception:  # pragma: no cover
+except Exception:
     sentry_sdk = None
 
 def init_error_tracer(dsn: str):

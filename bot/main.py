@@ -1,5 +1,6 @@
 
 import logging
+import os
 from telegram import BotCommand
 from telegram.ext import ApplicationBuilder
 
@@ -11,7 +12,6 @@ from bot.plugin_manager import PluginManager
 from bot.usage_tracker import UsageTracker
 from bot.knowledge_base.retriever import Retriever
 from bot.knowledge_base.context_manager import ContextManager
-
 from bot.db.session import DB_URL, engine
 from bot.db.models import Base
 
@@ -31,8 +31,10 @@ async def post_init(application, bot: ChatGPTTelegramBot, settings):
         BotCommand("start", "помощь"),
         BotCommand("help", "помощь"),
         BotCommand("reset", "сброс диалога"),
-        BotCommand("kb", "база знаний / поиск"),
+        BotCommand("kb", "база знаний / выбор документов"),
         BotCommand("kb_reset", "сброс выбранных документов"),
+        BotCommand("kb_search", "поиск по выбранным документам"),
+        BotCommand("kb_sync", "синхронизация БЗ (админ)"),
         BotCommand("pdfpass", "пароль к PDF"),
         BotCommand("image", "сгенерировать изображение"),
     ]
@@ -75,6 +77,7 @@ def main():
         "functions_max_consecutive_calls": settings.functions_max_consecutive_calls,
         "allowed_models_whitelist": settings.allowed_models_whitelist,
         "denylist_models": settings.denylist_models,
+        "embedding_model": settings.embedding_model,
     }
 
     openai_helper = OpenAIHelper(config=openai_config, plugin_manager=plugin_manager)
@@ -96,6 +99,9 @@ def main():
     )
 
     async def _post_init(app):
+        # на всякий случай прокинем в bot_data
+        app.bot_data["YANDEX_DISK_TOKEN"] = os.getenv("YANDEX_DISK_TOKEN")
+        app.bot_data["YANDEX_ROOT_PATH"] = os.getenv("YANDEX_ROOT_PATH", "/")
         await post_init(app, bot, settings)
 
     application = (

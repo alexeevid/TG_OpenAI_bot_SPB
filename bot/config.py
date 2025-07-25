@@ -1,9 +1,9 @@
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
 class Settings(BaseSettings):
-    # Telegram / OpenAI
     telegram_bot_token: str = Field(..., env="TELEGRAM_BOT_TOKEN")
     openai_api_key: str = Field(..., env="OPENAI_API_KEY")
 
@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     vision_model: str = Field("gpt-4o-mini", env="VISION_MODEL")
     image_model: str = Field("dall-e-3", env="IMAGE_MODEL")
     tts_model: str = Field("gpt-4o-mini-tts", env="TTS_MODEL")
+    embedding_model: str = Field("text-embedding-3-small", env="EMBEDDING_MODEL")
 
     openai_temperature: float = Field(0.3, env="OPENAI_TEMPERATURE")
     max_tokens: int = Field(4096, env="MAX_TOKENS")
@@ -28,11 +29,9 @@ class Settings(BaseSettings):
     allowed_models_whitelist: str = Field("", env="ALLOWED_MODELS_WHITELIST")
     denylist_models: str = Field("", env="DENYLIST_MODELS")
 
-    # access control
-    allowed_user_ids: str = Field("", env="ALLOWED_USER_IDS")  # "123,456"
+    allowed_user_ids: str = Field("", env="ALLOWED_USER_IDS")
     admin_user_ids: str = Field("", env="ADMIN_USER_IDS")
 
-    # DB
     log_level: str = Field("INFO", env="LOG_LEVEL")
     sentry_dsn: str = Field("", env="SENTRY_DSN")
 

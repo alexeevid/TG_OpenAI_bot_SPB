@@ -8,10 +8,13 @@ class Retriever:
     def __init__(self, top_k: int = 5):
         self.top_k = top_k
 
-    def search(self, query_embedding):
+    def search(self, query_embedding, restrict_doc_ids=None):
         q = np.array(query_embedding, dtype=np.float32).reshape(-1)
         with SessionLocal() as s:
-            chunks = s.execute(select(DocumentChunk)).scalars().all()
+            stmt = select(DocumentChunk)
+            if restrict_doc_ids:
+                stmt = stmt.where(DocumentChunk.document_id.in_(restrict_doc_ids))
+            chunks = s.execute(stmt).scalars().all()
 
         q_norm = np.linalg.norm(q) + 1e-8
         scored = []

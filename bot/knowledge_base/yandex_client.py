@@ -13,7 +13,6 @@ class YandexDiskClient:
 
     def iter_files(self, root_path: str) -> Iterator[Tuple[str, int]]:
         """Рекурсивно вернуть (remote_path, size). root_path начинается с '/' или 'disk:/'."""
-        # нормализация
         if root_path.startswith("disk:/"):
             root_path = root_path[5:]
         if not root_path.startswith("/"):
