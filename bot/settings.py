@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import Field
 from dotenv import load_dotenv
 import os
 
@@ -6,7 +7,7 @@ load_dotenv()
 
 class Settings(BaseSettings):
     database_url: str
-    log_level: str = "INFO"
+    log_level: str = Field("INFO", alias="LOG_LEVEL")
     openai_api_key: str
     openai_model: str = "gpt-4o"
     image_model: str | None = None
@@ -18,5 +19,6 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        populate_by_name = True
 
 settings = Settings()
