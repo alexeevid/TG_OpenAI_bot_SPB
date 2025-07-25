@@ -11,21 +11,25 @@ def setup_logging(level: str):
 
 def main():
     settings = load_settings()
-    print("DEBUG SETTINGS:", settings.model_dump())  # Можно также использовать .dict(), если модель на Pydantic v1
+    print("DEBUG SETTINGS:", settings.model_dump())
 
     setup_logging(settings.log_level)
 
     # init DB
-    init_db(Base)
+    init_db()
 
     # OpenAI helper
-    oai = OpenAIHelper(api_key=settings.openai_api_key, model=settings.openai_model, image_model=settings.image_model)
+    oai = OpenAIHelper(
+        api_key=settings.openai_api_key,
+        model=settings.openai_model,
+        image_model=settings.image_model,
+    )
 
     bot = ChatGPTTelegramBot(openai_helper=oai)
 
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
     bot.register(app)
-    app.post_init(bot.post_init)
+    app.post_init(bot.initialize)  # ← исправлено здесь
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
