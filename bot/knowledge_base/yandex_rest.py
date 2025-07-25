@@ -1,37 +1,36 @@
+
 import requests
-from typing import List, Dict, Any, Generator
+from typing import List, Dict, Any
 
 API_BASE = "https://cloud-api.yandex.net/v1/disk"
 
 class YandexDiskREST:
     def __init__(self, token: str):
-        self.token = token
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"OAuth {token}"})
 
-    def _get(self, path: str, **params):
-        url = f"{API_BASE}{path}"
-        r = self.session.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+    def list_all_files(self, root_path: str) -> List[Dict[str, Any]]:
+        """Recursive walk over Yandex.Disk folders via REST API""" 
+        files: List[Dict[str, Any]] = []
 
-    def list_recursive(self, root_path: str) -> Generator[Dict[str, Any], None, None]:
-        # Walk recursively using /resources?path=... and _embedded.items
-        stack = [root_path]
-        while stack:
-            current = stack.pop()
-            data = self._get("/resources", path=current, limit=1000)
-            if '_embedded' not in data:
-                continue
-            for item in data['_embedded']['items']:
-                if item['type'] == 'dir':
-                    stack.append(item['path'])
+        def walk(path: str):
+            url = f"{API_BASE}/resources?path={requests.utils.quote(path)}&limit=10000"
+            r = self.session.get(url)
+            if r.status_code == 401:
+                raise RuntimeError("401 Unauthorized (check token and scope cloud_api:disk.read)")
+            r.raise_for_status()
+            data = r.json()
+            embedded = data.get("_embedded", {})
+            items = embedded.get("items", [])
+            for it in items:
+                if it.get("type") == "dir":
+                    walk(it["path"])
                 else:
-                    yield item
+                    files.append({
+                        "path": it["path"],
+                        "name": it.get("name"),
+                        "size": it.get("size", 0),
+                    })
 
-    def download(self, path: str) -> bytes:
-        meta = self._get("/resources/download", path=path)
-        href = meta['href']
-        r = self.session.get(href)
-        r.raise_for_status()
-        return r.content
+        walk(root_path)
+        return files

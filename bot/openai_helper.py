@@ -1,41 +1,32 @@
-import openai
-import datetime
-import tiktoken
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-from typing import Dict
 
-GPT_4O_MODELS = ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest")
+import openai
+import httpx
+import logging
+from typing import List, Dict, Any
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from openai import OpenAI
 
 class OpenAIHelper:
-    def __init__(self, config: Dict):
-        self.config = config
-        openai.api_key = config['api_key']
-        self.client = openai.OpenAI(api_key=config['api_key'])
-        self.conversations = {}
-        self.last_updated = {}
-        self.user_models = {}
+    def __init__(self, api_key: str, model: str, image_model: str):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+        self.image_model = image_model
 
-    def reset_chat_history(self, chat_id: int):
-        self.conversations[chat_id] = [{"role": "system", "content": "You are a helpful assistant."}]
-
-    async def get_chat_response(self, chat_id: int, query: str):
-        if chat_id not in self.conversations:
-            self.reset_chat_history(chat_id)
-        self.conversations[chat_id].append({"role":"user","content":query})
+    @retry(reraise=True, retry=retry_if_exception_type(Exception), wait=wait_fixed(2), stop=stop_after_attempt(3))
+    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1024) -> str:
         resp = self.client.chat.completions.create(
-            model=self.config['model'],
-            messages=self.conversations[chat_id],
-            temperature=0.3,
-            max_tokens=1024
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
         )
-        answer = resp.choices[0].message.content
-        self.conversations[chat_id].append({"role":"assistant","content":answer})
-        return answer, resp.usage.total_tokens
+        return resp.choices[0].message.content
 
-    async def generate_image(self, prompt: str):
+    def generate_image(self, prompt: str, size: str = "1024x1024") -> str:
         resp = self.client.images.generate(
-            model=self.config['image_model'],
+            model=self.image_model,
             prompt=prompt,
-            size="1024x1024"
+            size=size,
+            n=1
         )
-        return resp.data[0].url, "1024x1024"
+        return resp.data[0].url
