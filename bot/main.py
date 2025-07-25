@@ -9,11 +9,9 @@ from bot.openai_helper import OpenAIHelper
 from bot.db.session import init_db
 from bot.db.models import Base
 
-# Настройка логгирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Загрузка настроек
 settings = load_settings()
 
 async def main():
@@ -44,4 +42,12 @@ async def main():
     await app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.get_event_loop().run_until_complete(main())
+    except RuntimeError as e:
+        if "already running" in str(e):
+            import nest_asyncio
+            nest_asyncio.apply()
+            asyncio.get_event_loop().run_until_complete(main())
+        else:
+            raise
