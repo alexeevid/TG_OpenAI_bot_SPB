@@ -1,4 +1,3 @@
-
 import logging
 from telegram.ext import ApplicationBuilder
 from bot.config import load_settings
@@ -12,7 +11,7 @@ def setup_logging(level: str):
 
 def main():
     settings = load_settings()
-    print("DEBUG SETTINGS:", settings.dict())
+    print("DEBUG SETTINGS:", settings.model_dump())  # Можно также использовать .dict(), если модель на Pydantic v1
 
     setup_logging(settings.log_level)
 
