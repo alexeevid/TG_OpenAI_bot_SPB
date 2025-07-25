@@ -16,5 +16,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Явно создаём event loop для совместимости с контейнерами
-    asyncio.run(main())
+    app.run_polling()
+
