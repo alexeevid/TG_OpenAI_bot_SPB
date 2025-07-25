@@ -1,32 +1,55 @@
-
-import openai
-import httpx
+import asyncio
 import logging
-from typing import List, Dict, Any
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-from openai import OpenAI
 
-class OpenAIHelper:
-    def __init__(self, api_key: str, model: str, image_model: str):
-        self.client = OpenAI(api_key=api_key)
-        self.model = model
-        self.image_model = image_model
+from telegram.ext import ApplicationBuilder
 
-    @retry(reraise=True, retry=retry_if_exception_type(Exception), wait=wait_fixed(2), stop=stop_after_attempt(3))
-    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2, max_tokens: int = 1024) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-        return resp.choices[0].message.content
+from bot.config import load_settings
+from bot.telegram_bot import ChatGPTTelegramBot
+from bot.openai_helper import OpenAIHelper
+from bot.db.session import init_db
+from bot.db.models import Base
 
-    def generate_image(self, prompt: str, size: str = "1024x1024") -> str:
-        resp = self.client.images.generate(
-            model=self.image_model,
-            prompt=prompt,
-            size=size,
-            n=1
-        )
-        return resp.data[0].url
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+settings = load_settings()
+
+async def main():
+    logger.info("🔄 Инициализация базы данных...")
+    init_db(Base)
+
+    logger.info("🔧 Инициализация OpenAI Helper...")
+    openai = OpenAIHelper(
+        api_key=settings.openai_api_key,
+        model=settings.openai_model,
+        image_model=settings.image_model
+    )
+
+    logger.info("🤖 Запуск Telegram бота...")
+    bot = ChatGPTTelegramBot(openai)
+
+    app = (
+        ApplicationBuilder()
+        .token(settings.telegram_bot_token)
+        .post_init(bot.post_init)
+        .build()
+    )
+
+    bot.register(app)
+    await bot.initialize(app)
+
+    logger.info("🚀 Бот запущен.")
+    # ВАЖНО: никаких asyncio.run и run_until_complete больше
+    await app.run_polling()
+
+# Запуск через текущий event loop
+if __name__ == "__main__":
+    try:
+        asyncio.get_event_loop().run_until_complete(main())
+    except RuntimeError as e:
+        if "already running" in str(e):
+            import nest_asyncio
+            nest_asyncio.apply()
+            asyncio.get_event_loop().run_until_complete(main())
+        else:
+            raise
