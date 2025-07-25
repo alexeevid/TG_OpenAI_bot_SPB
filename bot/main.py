@@ -1,27 +1,37 @@
 import asyncio
 import logging
 
+from telegram.ext import ApplicationBuilder
+
+from bot.config import load_settings
 from bot.telegram_bot import ChatGPTTelegramBot
-from bot.openai_helper import OpenAIHelper  # <-- Исправлено
-from bot.settings import settings
+from bot.openai_helper import OpenAIHelper
 from bot.db.session import init_db
 from bot.db.models import Base
 
-logging.basicConfig(level=settings.log_level)
+# Настройка логгирования
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Загрузка настроек
+settings = load_settings()
 
 async def main():
     logger.info("🔄 Инициализация базы данных...")
-    await init_db(Base)
+    init_db(Base)  # УБРАН await, т.к. функция синхронная
 
-    logger.info("⚙️ Инициализация OpenAIHelper...")
-    openai_helper = OpenAIHelper(settings)
+    logger.info("🔧 Инициализация OpenAI Helper...")
+    openai = OpenAIHelper(settings)
 
-    logger.info("⚙️ Инициализация Telegram-бота...")
-    bot = ChatGPTTelegramBot(openai_helper)
-    app = await bot.build_app()
+    logger.info("🤖 Запуск Telegram бота...")
+    bot = ChatGPTTelegramBot(openai)
 
-    logger.info("✅ Запуск run_polling...")
+    app = ApplicationBuilder().token(settings.telegram_bot_token).post_init(bot.post_init).build()
+    bot.register(app)
+
+    await bot.initialize(app)
+
+    logger.info("🚀 Бот запущен.")
     await app.run_polling()
 
 if __name__ == "__main__":
