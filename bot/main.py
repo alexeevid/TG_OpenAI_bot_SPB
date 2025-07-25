@@ -12,6 +12,8 @@ def setup_logging(level: str):
 
 def main():
     settings = load_settings()
+    print("DEBUG SETTINGS:", settings.dict())
+
     setup_logging(settings.log_level)
 
     # init DB
