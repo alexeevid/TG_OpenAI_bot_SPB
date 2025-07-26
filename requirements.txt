@@ -1,5 +1,11 @@
-python-telegram-bot==20.7
-openai
-sqlalchemy
-nest_asyncio
+python-telegram-bot==20.6
+openai>=1.14.3
+pydub
+python-dotenv
+pydantic>=2.0
 pydantic-settings>=2.0
+requests
+yadisk
+sqlalchemy
+psycopg2-binary>=2.9.9
+nest_asyncio
