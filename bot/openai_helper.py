@@ -1,55 +1,42 @@
-import asyncio
 import logging
-
-from telegram.ext import ApplicationBuilder
+from openai import OpenAI
 
 from bot.config import load_settings
-from bot.telegram_bot import ChatGPTTelegramBot
-from bot.openai_helper import OpenAIHelper
-from bot.db.session import init_db
-from bot.db.models import Base
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 settings = load_settings()
 
-async def main():
-    logger.info("🔄 Инициализация базы данных...")
-    init_db(Base)
 
-    logger.info("🔧 Инициализация OpenAI Helper...")
-    openai = OpenAIHelper(
-        api_key=settings.openai_api_key,
-        model=settings.openai_model,
-        image_model=settings.image_model
-    )
+class OpenAIHelper:
+    def __init__(self, api_key: str, model: str, image_model: str):
+        self.api_key = api_key
+        self.model = model
+        self.image_model = image_model
+        self.client = OpenAI(api_key=api_key)
 
-    logger.info("🤖 Запуск Telegram бота...")
-    bot = ChatGPTTelegramBot(openai)
+    async def ask_chatgpt(self, messages, functions=None):
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                functions=functions,
+                function_call="auto" if functions else None,
+            )
+            return response.choices[0].message
+        except Exception as e:
+            logger.error(f"Error in ask_chatgpt: {e}")
+            return {"role": "assistant", "content": "Произошла ошибка при обращении к OpenAI."}
 
-    app = (
-        ApplicationBuilder()
-        .token(settings.telegram_bot_token)
-        .post_init(bot.post_init)
-        .build()
-    )
-
-    bot.register(app)
-    await bot.initialize(app)
-
-    logger.info("🚀 Бот запущен.")
-    # ВАЖНО: никаких asyncio.run и run_until_complete больше
-    await app.run_polling()
-
-# Запуск через текущий event loop
-if __name__ == "__main__":
-    try:
-        asyncio.get_event_loop().run_until_complete(main())
-    except RuntimeError as e:
-        if "already running" in str(e):
-            import nest_asyncio
-            nest_asyncio.apply()
-            asyncio.get_event_loop().run_until_complete(main())
-        else:
-            raise
+    async def generate_image(self, prompt: str) -> str:
+        try:
+            response = self.client.images.generate(
+                model=self.image_model,
+                prompt=prompt,
+                size="1024x1024",
+                quality="standard",
+                n=1,
+            )
+            return response.data[0].url
+        except Exception as e:
+            logger.error(f"Image generation failed: {e}")
+            return ""
