@@ -75,9 +75,4 @@ class OpenAIHelper:
                 temperature=temperature,
                 max_tokens=max_output_tokens,
             )
-            return cc.choices[0].message.content or ""
-        except Exception as e:
-            logger.exception("OpenAI chat failed: %s", e)
-            raise
-
-    def generate_image(self, pro_
+            return cc.choices[0].message.content
