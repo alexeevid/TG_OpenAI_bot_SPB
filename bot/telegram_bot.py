@@ -529,14 +529,24 @@ class ChatGPTTelegramBot:
     async def _kb_sync_internal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         from bot.knowledge_base.indexer import sync_disk_to_db
         db = SessionLocal()
-        added = 0
+        stats = {"added": 0, "updated": 0, "deleted": 0, "unchanged": 0}
         try:
-            added = sync_disk_to_db(
-                db, self.settings.yandex_disk_token, self.settings.yandex_root_path
+            stats = sync_disk_to_db(
+                db,
+                self.settings.yandex_disk_token,
+                self.settings.yandex_root_path,
             )
-            await update.effective_chat.send_message(f"Готово. Добавлено файлов: {added}")
+            msg = (
+                "Готово.\n"
+                f"➕ Добавлено: {stats.get('added', 0)}\n"
+                f"♻️ Обновлено: {stats.get('updated', 0)}\n"
+                f"🗑️ Удалено: {stats.get('deleted', 0)}\n"
+                f"✅ Без изменений: {stats.get('unchanged', 0)}"
+            )
+            await update.effective_chat.send_message(msg)
         except Exception as e:
             await update.effective_chat.send_message(f"Ошибка синхронизации: {e}")
+            logger.exception("KB sync failed: %s", e)
         finally:
             db.close()
 
