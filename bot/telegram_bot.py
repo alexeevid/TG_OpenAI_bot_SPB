@@ -1,4 +1,6 @@
+import asyncio
 import logging
+from contextlib import suppress
 from functools import wraps
 from typing import Optional, List, Tuple, Dict
 from io import BytesIO
@@ -18,7 +20,6 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
-    ChatActionSender,
     filters,
 )
 
@@ -29,6 +30,38 @@ from bot.openai_helper import OpenAIHelper
 from bot.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Fallback для индикатора "набирает..." / "загружает фото..."
+# В некоторых версиях PTB нет telegram.ext.ChatActionSender, поэтому делаем свой.
+# Использование: async with ChatActionSender(action=..., chat_id=..., bot=context.bot): ...
+# ---------------------------------------------------------------------------
+class ChatActionSender:
+    def __init__(self, *, action: ChatAction, chat_id: int, bot, interval: float = 5.0):
+        self.action = action
+        self.chat_id = chat_id
+        self.bot = bot
+        self.interval = interval
+        self._task: Optional[asyncio.Task] = None
+
+    async def __aenter__(self):
+        async def _runner():
+            try:
+                while True:
+                    await self.bot.send_chat_action(chat_id=self.chat_id, action=self.action)
+                    await asyncio.sleep(self.interval)
+            except asyncio.CancelledError:
+                pass
+
+        self._task = asyncio.create_task(_runner())
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._task:
+            self._task.cancel()
+            with suppress(Exception):
+                await self._task
+
 
 # ---------- Access decorator ----------
 def only_allowed(func):
@@ -271,8 +304,10 @@ class ChatGPTTelegramBot:
         current = self.openai.model
 
         # Фильтрация по whitelist/denylist (если заданы)
-        allow = set(m.lower() for m in self.settings.allowed_models_whitelist) if self.settings.allowed_models_whitelist else None
-        deny = set(m.lower() for m in self.settings.denylist_models)
+        allow_list = getattr(self.settings, "allowed_models_whitelist", [])
+        deny_list = getattr(self.settings, "denylist_models", [])
+        allow = set(m.lower() for m in allow_list) if allow_list else None
+        deny = set(m.lower() for m in deny_list)
 
         def _allowed(m: str) -> bool:
             ml = m.lower()
@@ -317,7 +352,7 @@ class ChatGPTTelegramBot:
     # ---------- Images ----------
     @only_allowed
     async def on_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.settings.enable_image_generation:
+        if not getattr(self.settings, "enable_image_generation", True):
             await update.message.reply_text("Генерация изображений выключена администратором.")
             return
 
