@@ -10,7 +10,7 @@ class OpenAIHelper:
     Обёртка над OpenAI:
     - list_models() — список моделей
     - set_model() — выбрать модель для текста
-    - chat() — универсальный текстовый ответ
+    - chat() — универсальный текстовый ответ (Responses API -> fallback Chat Completions)
     - generate_image() — генерация изображения (PNG как bytes)
     """
     def __init__(self, api_key: str, default_model: str, image_model: str = "gpt-image-1"):
@@ -26,6 +26,7 @@ class OpenAIHelper:
             return names
         except Exception as e:
             logger.exception("Failed to list models: %s", e)
+            # Резервный список, если API временно недоступен
             return ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-3.5-turbo"]
 
     def set_model(self, model: str):
@@ -39,13 +40,13 @@ class OpenAIHelper:
         max_output_tokens: Optional[int] = None,
     ) -> str:
         """
-        Сначала пытаемся через Responses API (поддерживает max_output_tokens),
-        потом fallback на Chat Completions.
+        Сначала пробуем Responses API (поддерживает max_output_tokens),
+        затем fallback на Chat Completions.
         """
         temperature = 0.3 if temperature is None else temperature
         max_output_tokens = max_output_tokens or 4096  # высокий потолок
 
-        # Подготовим input_text без f-строк с \n внутри выражений
+        # Готовим input_text без f-строк с \n внутри выражений
         sys_texts = [m["content"] for m in messages if m["role"] == "system"]
         user_texts = [m["content"] for m in messages if m["role"] == "user"]
         sys_hint = "\n".join(sys_texts) if sys_texts else ""
@@ -75,4 +76,23 @@ class OpenAIHelper:
                 temperature=temperature,
                 max_tokens=max_output_tokens,
             )
-            return cc.choices[0].message.content
+            return cc.choices[0].message.content or ""
+        except Exception as e:
+            logger.exception("OpenAI chat failed: %s", e)
+            raise
+
+    def generate_image(self, prompt: str, *, size: str = "1024x1024") -> bytes:
+        """
+        Генерирует изображение и возвращает PNG-байты.
+        """
+        try:
+            res = self.client.images.generate(
+                model=self.image_model,
+                prompt=prompt,
+                size=size,
+            )
+            b64 = res.data[0].b64_json
+            return b64decode(b64)
+        except Exception as e:
+            logger.exception("Image generation failed: %s", e)
+            raise
