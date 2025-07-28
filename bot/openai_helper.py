@@ -1,105 +1,164 @@
-from typing import List, Dict, Optional
-from openai import OpenAI
 import logging
+from typing import List, Dict, Any, Optional, Tuple
 from base64 import b64decode
+
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
+
 class OpenAIHelper:
     """
-    Обёртка над OpenAI:
-    - list_models() — список моделей
-    - set_model() — выбрать модель для текста
-    - chat() — универсальный текстовый ответ (Responses API -> fallback Chat Completions)
-    - generate_image() — генерация изображения (PNG как bytes)
+    Обёртка над OpenAI SDK.
+
+    - Текст: через Responses API.
+    - Изображения: через Images API (generate), с управлением моделью из ENV (IMAGE_MODEL).
     """
-    def __init__(self, api_key: str, default_model: str, image_model: str = "gpt-image-1"):
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        image_model: Optional[str] = None,
+        settings: Optional[object] = None,  # допускаем передачу Settings для удобства
+    ):
+        # Развязываем параметры, если передали settings
+        if settings is not None:
+            api_key = api_key or getattr(settings, "openai_api_key", None)
+            model = model or getattr(settings, "openai_model", None)
+            # image_model допускается None (тогда fallback ниже)
+            if image_model is None:
+                image_model = getattr(settings, "image_model", None)
+
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required")
+
         self.client = OpenAI(api_key=api_key)
-        self.model = default_model
-        self.image_model = image_model or "gpt-image-1"
+        self.model = model or "gpt-4o-mini"
+        # Если есть IMAGE_MODEL — используем её, иначе будем пробовать gpt-image-1 -> dall-e-3
+        self.image_model = image_model
+
+    # -------------------- Text --------------------
+    def set_model(self, name: str) -> None:
+        self.model = name
 
     def list_models(self) -> List[str]:
         try:
-            models = self.client.models.list()
-            names = [m.id for m in models.data]
-            names.sort()
-            return names
+            res = self.client.models.list()
+            items = [m.id for m in getattr(res, "data", [])]
+            return sorted(items)
         except Exception as e:
             logger.exception("Failed to list models: %s", e)
-            # Резервный список, если API временно недоступен
-            return ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-3.5-turbo"]
-
-    def set_model(self, model: str):
-        self.model = model
+            return [self.model]
 
     def chat(
         self,
         messages: List[Dict[str, str]],
         *,
-        temperature: Optional[float] = None,
-        max_output_tokens: Optional[int] = None,
+        temperature: float = 0.3,
+        max_output_tokens: int = 2048,
     ) -> str:
         """
-        Сначала пробуем Responses API (поддерживает max_output_tokens),
-        затем fallback на Chat Completions.
+        Unified chat через Responses API.
+        messages: [{"role": "system"/"user"/"assistant", "content": "..."}]
         """
-        temperature = 0.3 if temperature is None else temperature
-        max_output_tokens = max_output_tokens or 4096  # высокий потолок
-
-        # Готовим input_text без f-строк с \n внутри выражений
-        sys_texts = [m["content"] for m in messages if m["role"] == "system"]
-        user_texts = [m["content"] for m in messages if m["role"] == "user"]
-        sys_hint = "\n".join(sys_texts) if sys_texts else ""
-        usr = user_texts[-1] if user_texts else ""
-        prefix = "[SYSTEM]\n" + sys_hint + "\n\n" if sys_hint else ""
-        input_text = prefix + usr
-
-        # Responses API
         try:
             resp = self.client.responses.create(
                 model=self.model,
-                input=input_text,
+                messages=messages,
                 temperature=temperature,
                 max_output_tokens=max_output_tokens,
             )
-            text = getattr(resp, "output_text", "") or ""
-            if text.strip():
-                return text
-        except Exception as e:
-            logger.warning("Responses API failed, fallback to Chat Completions: %s", e)
-
-        # Fallback: Chat Completions
-        try:
-            cc = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_output_tokens,
-            )
-            return cc.choices[0].message.content or ""
+            # Современное свойство SDK
+            if hasattr(resp, "output_text"):
+                return resp.output_text or ""
+            # fallback на явный парсинг
+            ch = getattr(resp, "choices", [])
+            if ch:
+                msg = getattr(ch[0], "message", None)
+                if msg is not None:
+                    # message.content может быть str или list of parts
+                    content = getattr(msg, "content", "")
+                    if isinstance(content, list) and content:
+                        # берём текстовые части
+                        parts = []
+                        for p in content:
+                            # на всякий случай вытаскиваем .text, .content и пр.
+                            if isinstance(p, str):
+                                parts.append(p)
+                            else:
+                                t = getattr(p, "text", None) or getattr(p, "content", None) or ""
+                                if t:
+                                    parts.append(t)
+                        return "\n".join([p for p in parts if p]) or ""
+                    if isinstance(content, str):
+                        return content
+            return ""
         except Exception as e:
             logger.exception("OpenAI chat failed: %s", e)
             raise
 
-    def generate_image(self, prompt: str, *, size: str = "1024x1024") -> bytes:
+    # -------------------- Images --------------------
+    def generate_image(self, prompt: str, *, size: str = "1024x1024") -> Tuple[bytes, str, str]:
         """
-        Генерирует изображение и возвращает PNG-байты.
-        Сначала пробуем self.image_model (например, gpt-image-1),
-        при любой ошибке — безусловный fallback на 'dall-e-3'.
+        Генерирует изображение.
+        Возвращает: (png_bytes, used_prompt, used_model).
+
+        Приоритет:
+        1) Если self.image_model задана (например, 'dall-e-3') — используем её.
+        2) Иначе пробуем 'gpt-image-1', при ошибке прав — fallback на 'dall-e-3'.
         """
-        def _call(model: str) -> bytes:
-            res = self.client.images.generate(model=model, prompt=prompt, size=size)
-            b64 = res.data[0].b64_json
-            return b64decode(b64)
-    
-        primary = self.image_model or "gpt-image-1"
+        used_prompt = (prompt or "").strip()
+        # 1) Если IMAGE_MODEL задана — строго используем её
+        if self.image_model:
+            png = self._images_generate(self.image_model, used_prompt, size)
+            return png, used_prompt, self.image_model
+
+        # 2) Иначе пробуем gpt-image-1 -> dall-e-3
+        primary = "gpt-image-1"
         try:
-            return _call(primary)
+            png = self._images_generate(primary, used_prompt, size)
+            return png, used_prompt, primary
         except Exception as e1:
-            logger.warning("Primary image model '%s' failed: %s. Trying 'dall-e-3' fallback...", primary, e1)
-            try:
-                return _call("dall-e-3")
-            except Exception as e2:
-                logger.exception("Image generation failed even with fallback: %s", e2)
-                # пробрасываем последнее исключение, чтобы наверху показать пользователю
-                raise
+            logger.warning(
+                "Primary image model '%s' failed: %s. Trying 'dall-e-3' fallback...",
+                primary, e1
+            )
+            png = self._images_generate("dall-e-3", used_prompt, size)
+            return png, used_prompt, "dall-e-3"
+
+    def _images_generate(self, model: str, prompt: str, size: str) -> bytes:
+        """
+        Вызов Images API с аккуратной обработкой формата ответа.
+        Сначала просим b64, если вдруг придёт URL — скачаем.
+        """
+        res = self.client.images.generate(
+            model=model,
+            prompt=prompt,
+            size=size,
+            response_format="b64_json",   # явное требование base64
+        )
+        if not getattr(res, "data", None):
+            raise RuntimeError("Empty image response")
+
+        datum = res.data[0]
+        # В объектах SDK поля доступны и как атрибуты, и как dict-ключи
+        b64 = getattr(datum, "b64_json", None)
+        if b64 is None and isinstance(datum, dict):
+            b64 = datum.get("b64_json")
+
+        if b64:
+            return b64decode(b64)
+
+        # Если по какой-то причине пришёл URL — докачаем.
+        url = getattr(datum, "url", None)
+        if url is None and isinstance(datum, dict):
+            url = datum.get("url")
+        if url:
+            # Скачиваем синхронно — снаружи этот метод вызывается через asyncio.to_thread
+            import httpx
+            r = httpx.get(url, timeout=30.0)
+            r.raise_for_status()
+            return r.content
+
+        raise RuntimeError("Image API returned neither b64_json nor url")
