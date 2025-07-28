@@ -84,15 +84,22 @@ class OpenAIHelper:
     def generate_image(self, prompt: str, *, size: str = "1024x1024") -> bytes:
         """
         Генерирует изображение и возвращает PNG-байты.
+        Сначала пробуем self.image_model (например, gpt-image-1),
+        при любой ошибке — безусловный fallback на 'dall-e-3'.
         """
-        try:
-            res = self.client.images.generate(
-                model=self.image_model,
-                prompt=prompt,
-                size=size,
-            )
+        def _call(model: str) -> bytes:
+            res = self.client.images.generate(model=model, prompt=prompt, size=size)
             b64 = res.data[0].b64_json
             return b64decode(b64)
-        except Exception as e:
-            logger.exception("Image generation failed: %s", e)
-            raise
+    
+        primary = self.image_model or "gpt-image-1"
+        try:
+            return _call(primary)
+        except Exception as e1:
+            logger.warning("Primary image model '%s' failed: %s. Trying 'dall-e-3' fallback...", primary, e1)
+            try:
+                return _call("dall-e-3")
+            except Exception as e2:
+                logger.exception("Image generation failed even with fallback: %s", e2)
+                # пробрасываем последнее исключение, чтобы наверху показать пользователю
+                raise
