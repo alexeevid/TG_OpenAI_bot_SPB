@@ -1,23 +1,20 @@
-
-import logging
-from typing import List, Dict
-from sqlalchemy import select
-from bot.db.session import SessionLocal
+from typing import List
+from sqlalchemy.orm import Session
 from bot.db.models import Document
-from .yandex_rest import YandexDiskREST
+from bot.knowledge_base.yandex_rest import YandexDiskREST
 
-def sync_disk_to_db(token: str, root_path: str) -> int:
-    yd = YandexDiskREST(token)
-    files: List[Dict] = yd.list_all_files(root_path)
-
-    with SessionLocal() as s:
-        existing = {d.path: d for d in s.scalars(select(Document)).all()}
-        added = 0
-        for f in files:
-            if f["path"] not in existing:
-                doc = Document(path=f["path"], size=f["size"])
-                s.add(doc)
-                added += 1
-        s.commit()
-    logging.info("Synced %s files from Yandex Disk", len(files))
+def sync_disk_to_db(db: Session, token: str, root_path: str) -> int:
+    client = YandexDiskREST(token)
+    items = client.list_all_files(root_path)
+    added = 0
+    for it in items:
+        path = it['path']
+        title = it.get('name') or path.split('/')[-1]
+        mime = it.get('mime_type')
+        size = it.get('size')
+        exists = db.query(Document).filter_by(path=path).first()
+        if not exists:
+            db.add(Document(path=path, title=title, mime=mime, size=size))
+            added += 1
+    db.commit()
     return added

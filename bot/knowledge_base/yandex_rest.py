@@ -1,4 +1,3 @@
-
 import requests
 from typing import List, Dict, Any
 
@@ -10,7 +9,6 @@ class YandexDiskREST:
         self.session.headers.update({"Authorization": f"OAuth {token}"})
 
     def list_all_files(self, root_path: str) -> List[Dict[str, Any]]:
-        """Recursive walk over Yandex.Disk folders via REST API""" 
         files: List[Dict[str, Any]] = []
 
         def walk(path: str):
@@ -20,16 +18,16 @@ class YandexDiskREST:
                 raise RuntimeError("401 Unauthorized (check token and scope cloud_api:disk.read)")
             r.raise_for_status()
             data = r.json()
-            embedded = data.get("_embedded", {})
-            items = embedded.get("items", [])
-            for it in items:
-                if it.get("type") == "dir":
-                    walk(it["path"])
+            embedded = data.get('_embedded', {}).get('items', [])
+            for item in embedded:
+                if item.get('type') == 'dir':
+                    walk(item.get('path'))
                 else:
                     files.append({
-                        "path": it["path"],
-                        "name": it.get("name"),
-                        "size": it.get("size", 0),
+                        "path": item.get('path'),
+                        "name": item.get('name'),
+                        "mime_type": item.get('mime_type'),
+                        "size": item.get('size'),
                     })
 
         walk(root_path)

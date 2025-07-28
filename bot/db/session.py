@@ -1,12 +1,11 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from bot.settings import settings
+from bot.settings import Settings
 
-DB_URL = settings.database_url
+settings = Settings()
+engine = create_engine(settings.database_url, echo=False, pool_pre_ping=True)
 
-engine = create_engine(DB_URL, echo=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db(Base):
-    from . import models
-    models.Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=engine)

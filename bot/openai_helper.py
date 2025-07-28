@@ -1,42 +1,46 @@
-import logging
+from typing import List, Dict, Any, Optional
 from openai import OpenAI
-
-from bot.config import load_settings
+import logging
 
 logger = logging.getLogger(__name__)
-settings = load_settings()
-
 
 class OpenAIHelper:
-    def __init__(self, api_key: str, model: str, image_model: str):
-        self.api_key = api_key
-        self.model = model
-        self.image_model = image_model
+    def __init__(self, api_key: str, default_model: str):
         self.client = OpenAI(api_key=api_key)
+        self.model = default_model
 
-    async def ask_chatgpt(self, messages, functions=None):
+    def list_models(self) -> List[str]:
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                functions=functions,
-                function_call="auto" if functions else None,
-            )
-            return response.choices[0].message
+            models = self.client.models.list()
+            names = [m.id for m in models.data]
+            # Prefer sorted by 'gpt'
+            names.sort()
+            return names
         except Exception as e:
-            logger.error(f"Error in ask_chatgpt: {e}")
-            return {"role": "assistant", "content": "Произошла ошибка при обращении к OpenAI."}
+            logger.exception("Failed to list models: %s", e)
+            # Fallback shortlist
+            return ["gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-3.5-turbo"]
 
-    async def generate_image(self, prompt: str) -> str:
+    def set_model(self, model: str):
+        self.model = model
+
+    def chat(self, messages: List[Dict[str, str]]) -> str:
+        """Try Responses API first; fall back to chat.completions."""
+        # Responses API
         try:
-            response = self.client.images.generate(
-                model=self.image_model,
-                prompt=prompt,
-                size="1024x1024",
-                quality="standard",
-                n=1,
-            )
-            return response.data[0].url
+            resp = self.client.responses.create(model=self.model, input={"role": "user", "content": messages[-1]['content']})
+            # Extract text
+            for out in resp.output_text.split("\n\n"):
+                if out.strip():
+                    return resp.output_text
+            return resp.output_text or ""
+        except Exception:
+            pass
+
+        # Fallback: Chat Completions
+        try:
+            cc = self.client.chat.completions.create(model=self.model, messages=messages)
+            return cc.choices[0].message.content or ""
         except Exception as e:
-            logger.error(f"Image generation failed: {e}")
-            return ""
+            logger.exception("OpenAI chat failed: %s", e)
+            raise
