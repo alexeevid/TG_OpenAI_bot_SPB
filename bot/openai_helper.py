@@ -1,6 +1,7 @@
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 from base64 import b64decode
+import httpx
 
 from openai import OpenAI
 
@@ -11,8 +12,8 @@ class OpenAIHelper:
     """
     Обёртка над OpenAI SDK.
 
-    - Текст: через Responses API.
-    - Изображения: через Images API (generate), с управлением моделью из ENV (IMAGE_MODEL).
+    - Текст: прежде всего через Chat Completions API; Responses — как fallback.
+    - Изображения: Images API (generate), модель берём из ENV (IMAGE_MODEL).
     """
 
     def __init__(
@@ -20,13 +21,11 @@ class OpenAIHelper:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         image_model: Optional[str] = None,
-        settings: Optional[object] = None,  # допускаем передачу Settings для удобства
+        settings: Optional[object] = None,
     ):
-        # Развязываем параметры, если передали settings
         if settings is not None:
             api_key = api_key or getattr(settings, "openai_api_key", None)
             model = model or getattr(settings, "openai_model", None)
-            # image_model допускается None (тогда fallback ниже)
             if image_model is None:
                 image_model = getattr(settings, "image_model", None)
 
@@ -35,8 +34,7 @@ class OpenAIHelper:
 
         self.client = OpenAI(api_key=api_key)
         self.model = model or "gpt-4o-mini"
-        # Если есть IMAGE_MODEL — используем её, иначе будем пробовать gpt-image-1 -> dall-e-3
-        self.image_model = image_model
+        self.image_model = image_model  # может быть None → fallback в generate_image
 
     # -------------------- Text --------------------
     def set_model(self, name: str) -> None:
@@ -59,90 +57,94 @@ class OpenAIHelper:
         max_output_tokens: int = 2048,
     ) -> str:
         """
-        Unified chat через Responses API.
-        messages: [{"role": "system"/"user"/"assistant", "content": "..."}]
+        Основной путь — Chat Completions (messages). Если не выйдет — пробуем Responses(input).
         """
+        # 1) Chat Completions
         try:
-            resp = self.client.responses.create(
+            resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=temperature,
+                max_tokens=max_output_tokens,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e1:
+            logger.warning("chat.completions failed: %s; trying responses API…", e1)
+
+        # 2) Responses API (строим input из messages)
+        try:
+            sys_parts, usr_parts = [], []
+            for m in messages:
+                role = m.get("role")
+                c = m.get("content", "")
+                if role == "system":
+                    sys_parts.append(c)
+                elif role == "user":
+                    usr_parts.append(c)
+                elif role == "assistant":
+                    # чуть контекста тоже добавим
+                    usr_parts.append(f"[ASSISTANT]\n{c}")
+
+            sys_hint = "\n".join(sys_parts).strip()
+            usr = "\n\n".join(usr_parts).strip()
+            input_text = f"[SYSTEM]\n{sys_hint}\n\n{usr}" if sys_hint else usr
+
+            resp2 = self.client.responses.create(
+                model=self.model,
+                input=input_text,
+                temperature=temperature,
                 max_output_tokens=max_output_tokens,
             )
-            # Современное свойство SDK
-            if hasattr(resp, "output_text"):
-                return resp.output_text or ""
-            # fallback на явный парсинг
-            ch = getattr(resp, "choices", [])
+            if hasattr(resp2, "output_text"):
+                return resp2.output_text or ""
+            ch = getattr(resp2, "choices", [])
             if ch:
                 msg = getattr(ch[0], "message", None)
-                if msg is not None:
-                    # message.content может быть str или list of parts
-                    content = getattr(msg, "content", "")
-                    if isinstance(content, list) and content:
-                        # берём текстовые части
-                        parts = []
-                        for p in content:
-                            # на всякий случай вытаскиваем .text, .content и пр.
-                            if isinstance(p, str):
-                                parts.append(p)
-                            else:
-                                t = getattr(p, "text", None) or getattr(p, "content", None) or ""
-                                if t:
-                                    parts.append(t)
-                        return "\n".join([p for p in parts if p]) or ""
-                    if isinstance(content, str):
-                        return content
+                if msg and isinstance(msg, dict):
+                    return (msg.get("content") or "").strip()
             return ""
-        except Exception as e:
-            logger.exception("OpenAI chat failed: %s", e)
+        except Exception as e2:
+            logger.exception("OpenAI chat failed (both APIs): %s", e2)
             raise
 
     # -------------------- Images --------------------
     def generate_image(self, prompt: str, *, size: str = "1024x1024") -> Tuple[bytes, str, str]:
         """
-        Генерирует изображение.
         Возвращает: (png_bytes, used_prompt, used_model).
 
         Приоритет:
         1) Если self.image_model задана (например, 'dall-e-3') — используем её.
-        2) Иначе пробуем 'gpt-image-1', при ошибке прав — fallback на 'dall-e-3'.
+        2) Иначе пробуем 'gpt-image-1', при ошибке прав — fallback 'dall-e-3'.
         """
         used_prompt = (prompt or "").strip()
-        # 1) Если IMAGE_MODEL задана — строго используем её
+
         if self.image_model:
             png = self._images_generate(self.image_model, used_prompt, size)
             return png, used_prompt, self.image_model
 
-        # 2) Иначе пробуем gpt-image-1 -> dall-e-3
         primary = "gpt-image-1"
         try:
             png = self._images_generate(primary, used_prompt, size)
             return png, used_prompt, primary
         except Exception as e1:
-            logger.warning(
-                "Primary image model '%s' failed: %s. Trying 'dall-e-3' fallback...",
-                primary, e1
-            )
+            logger.warning("Primary image model '%s' failed: %s. Trying 'dall-e-3'…", primary, e1)
             png = self._images_generate("dall-e-3", used_prompt, size)
             return png, used_prompt, "dall-e-3"
 
     def _images_generate(self, model: str, prompt: str, size: str) -> bytes:
         """
-        Вызов Images API с аккуратной обработкой формата ответа.
-        Сначала просим b64, если вдруг придёт URL — скачаем.
+        Явно просим base64; если придёт URL — скачаем.
         """
         res = self.client.images.generate(
             model=model,
             prompt=prompt,
             size=size,
-            response_format="b64_json",   # явное требование base64
+            response_format="b64_json",
         )
         if not getattr(res, "data", None):
             raise RuntimeError("Empty image response")
 
         datum = res.data[0]
-        # В объектах SDK поля доступны и как атрибуты, и как dict-ключи
         b64 = getattr(datum, "b64_json", None)
         if b64 is None and isinstance(datum, dict):
             b64 = datum.get("b64_json")
@@ -150,13 +152,10 @@ class OpenAIHelper:
         if b64:
             return b64decode(b64)
 
-        # Если по какой-то причине пришёл URL — докачаем.
         url = getattr(datum, "url", None)
         if url is None and isinstance(datum, dict):
             url = datum.get("url")
         if url:
-            # Скачиваем синхронно — снаружи этот метод вызывается через asyncio.to_thread
-            import httpx
             r = httpx.get(url, timeout=30.0)
             r.raise_for_status()
             return r.content
