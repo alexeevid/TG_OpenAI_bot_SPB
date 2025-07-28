@@ -32,12 +32,13 @@ from bot.settings import Settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fallback для индикатора "набирает..." / "загружает фото..."
-# В некоторых версиях PTB нет telegram.ext.ChatActionSender, поэтому делаем свой.
-# Использование: async with ChatActionSender(action=..., chat_id=..., bot=context.bot): ...
+# Индикатор «набирает… / загружает фото…» (fallback для любых версий PTB v20)
+# Использование:
+#   async with ChatActionSender(action=ChatAction.TYPING, chat_id=..., bot=context.bot):
+#       ... любая долгая операция ...
 # ---------------------------------------------------------------------------
 class ChatActionSender:
-    def __init__(self, *, action: ChatAction, chat_id: int, bot, interval: float = 5.0):
+    def __init__(self, *, action: ChatAction, chat_id: int, bot, interval: float = 4.0):
         self.action = action
         self.chat_id = chat_id
         self.bot = bot
@@ -130,7 +131,7 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("dialogs", self.on_dialogs))
         app.add_handler(CommandHandler("dialog", self.on_dialog_select))
 
-        # New features
+        # Новые фичи
         app.add_handler(CommandHandler("mode", self.on_mode))
         app.add_handler(CommandHandler("img", self.on_img))
         app.add_handler(CommandHandler("cancelpass", self.on_cancel_pass))
@@ -138,7 +139,7 @@ class ChatGPTTelegramBot:
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
-        # Команды меню
+        # Команды меню (post_init колбэк)
         app.post_init = self._post_init_commands
 
     async def _post_init_commands(self, app: Application):
@@ -284,7 +285,7 @@ class ChatGPTTelegramBot:
             mark = "✅" if d.id in selected else "➕"
             rows.append([InlineKeyboardButton(f"{mark} {d.title}", callback_data=f"kb_toggle:{d.id}")])
 
-        # Admin-only sync button
+        # Админская кнопка синка
         if update.effective_user and update.effective_user.id in self.admins:
             rows.append([InlineKeyboardButton("🔄 Синхронизировать с Я.Диском", callback_data="kb_sync")])
 
@@ -300,7 +301,7 @@ class ChatGPTTelegramBot:
     # ---------- Models ----------
     @only_allowed
     async def on_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        models = self.openai.list_models()
+        models_all = self.openai.list_models()
         current = self.openai.model
 
         # Фильтрация по whitelist/denylist (если заданы)
@@ -317,11 +318,23 @@ class ChatGPTTelegramBot:
                 return False
             return True
 
-        models = [m for m in models if _allowed(m)]
+        models = [m for m in models_all if _allowed(m)]
 
-        prefer = [m for m in models if any(x in m for x in ["gpt-4o", "gpt-4.1", "gpt-4", "gpt-3.5"])]
-        items = prefer[:30] if prefer else models[:30]
+        # Расширенный набор «предпочтительных»
+        prefer_keywords = ["gpt-4o", "gpt-4.1", "gpt-4", "gpt-3.5", "o4", "o3"]
+        prefer = [m for m in models if any(k in m for k in prefer_keywords)]
 
+        # Берём prefer + остаток, без дубликатов, максимум 30
+        combined = []
+        seen = set()
+        for m in prefer + models:
+            if m not in seen:
+                seen.add(m)
+                combined.append(m)
+            if len(combined) >= 30:
+                break
+
+        items = combined or models[:30]
         if not items:
             await update.message.reply_text("Список моделей пуст — проверьте фильтры (whitelist/denylist).")
             return
@@ -373,7 +386,7 @@ class ChatGPTTelegramBot:
                 chat_id=update.effective_chat.id,
                 bot=context.bot,
             ):
-                png = self.openai.generate_image(prompt, size="1024x1024")
+                png = await asyncio.to_thread(self.openai.generate_image, prompt, size="1024x1024")
             bio = BytesIO(png)
             bio.name = "image.png"
             bio.seek(0)
@@ -533,7 +546,7 @@ class ChatGPTTelegramBot:
         chat_id = update.effective_chat.id
         conv = self._get_active_conv(chat_id, db)
 
-        # 1) Обработка режима ввода пароля
+        # 1) Режим ввода пароля
         awaiting: Optional[int] = context.user_data.get("await_password_for")
         if awaiting is not None:
             pwd = (update.message.text or "").strip()
@@ -552,9 +565,7 @@ class ChatGPTTelegramBot:
         selected_ids = context.user_data.get("kb_selected_ids", set())
         selected_docs: List[Document] = []
         if kb_enabled and selected_ids:
-            selected_docs = (
-                db.query(Document).filter(Document.id.in_(list(selected_ids))).all()
-            )
+            selected_docs = db.query(Document).filter(Document.id.in_(list(selected_ids))).all()
 
         style = context.user_data.get("style", "pro")
         sys_hint, temp = style_system_hint(style)
@@ -567,7 +578,7 @@ class ChatGPTTelegramBot:
         # 3) Обновим заголовок диалога
         self._ensure_conv_title(conv, update.message.text or "", db)
 
-        # 4) Запрос к OpenAI
+        # 4) Запрос к OpenAI — уводим в поток, чтобы не блокировать event loop
         prompt = (update.message.text or "").strip()
         messages = [
             {"role": "system", "content": (sys_hint + kb_hint).strip()},
@@ -580,7 +591,12 @@ class ChatGPTTelegramBot:
                 chat_id=update.effective_chat.id,
                 bot=context.bot,
             ):
-                ans = self.openai.chat(messages, temperature=temp, max_output_tokens=4096)
+                ans = await asyncio.to_thread(
+                    self.openai.chat,
+                    messages,
+                    temperature=temp,
+                    max_output_tokens=4096,
+                )
         except Exception as e:
             await update.message.reply_text(f"Ошибка обращения к OpenAI: {e}")
             return
