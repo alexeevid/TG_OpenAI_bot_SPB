@@ -43,11 +43,25 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.get_event_loop().run_until_complete(main())
+        try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "already running" in str(e):
+            loop = asyncio.get_event_loop()
+            loop.create_task(main())
+        else:
+            raise
     except RuntimeError as e:
         if "already running" in str(e):
             import nest_asyncio
             nest_asyncio.apply()
-            asyncio.get_event_loop().run_until_complete(main())
+            try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        if "already running" in str(e):
+            loop = asyncio.get_event_loop()
+            loop.create_task(main())
+        else:
+            raise
         else:
             raise

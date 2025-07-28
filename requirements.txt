@@ -9,4 +9,3 @@ yadisk
 sqlalchemy
 psycopg2-binary>=2.9.9
 nest_asyncio
-psycopg
