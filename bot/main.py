@@ -35,7 +35,7 @@ def build_application():
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
 
     # OpenAI + Бот
-    openai = OpenAIHelper(api_key=settings.openai_api_key, default_model=settings.openai_model)
+    openai = OpenAIHelper(settings=settings)
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
 
     # Если у бота есть install(app) — используем её
