@@ -12,6 +12,10 @@ from telegram import (
     InlineKeyboardButton,
     BotCommand,
     InputFile,
+    # Для обновления меню во всех областях
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -117,12 +121,13 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("mode", self.on_mode))
         app.add_handler(CommandHandler("img", self.on_img))
         app.add_handler(CommandHandler("cancelpass", self.on_cancel_pass))
-        app.add_handler(CommandHandler("del", self.on_delete_dialogs))           # <<< Удаление диалогов
+        app.add_handler(CommandHandler("del", self.on_delete_dialogs))
+        app.add_handler(CommandHandler("reload_menu", self.on_reload_menu))  # обновление меню у всех
 
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
-        # Команды меню
+        # Команды меню во всех scopes/языках — поставим на инициализации приложения
         app.post_init = self._post_init_commands
 
     async def _post_init_commands(self, app: Application):
@@ -136,12 +141,31 @@ class ChatGPTTelegramBot:
             BotCommand("dialogs", "Список диалогов"),
             BotCommand("img", "Сгенерировать изображение"),
             BotCommand("mode", "Стиль ответов"),
-            BotCommand("del", "Удалить диалоги"),        # <<< новое
+            BotCommand("del", "Удалить диалоги"),
+            BotCommand("reload_menu", "Обновить меню у всех"),
         ]
-        try:
-            await app.bot.set_my_commands(cmds)
-        except Exception as e:
-            logger.warning("Failed to set commands: %s", e)
+        await self._set_all_scopes_commands(app, cmds)
+
+    async def _set_all_scopes_commands(self, app: Application, cmds: List[BotCommand]):
+        scopes = [
+            None,
+            BotCommandScopeAllPrivateChats(),
+            BotCommandScopeAllGroupChats(),
+            BotCommandScopeAllChatAdministrators(),
+        ]
+        langs = [None, "ru", "en"]
+
+        # Чистим старые команды
+        for sc in scopes:
+            for lang in langs:
+                with suppress(Exception):
+                    await app.bot.delete_my_commands(scope=sc, language_code=lang)
+
+        # Ставим новые
+        for sc in scopes:
+            for lang in langs:
+                with suppress(Exception):
+                    await app.bot.set_my_commands(commands=cmds, scope=sc, language_code=lang)
 
     # ---------- DB helpers ----------
     def _get_db(self) -> Session:
@@ -189,7 +213,7 @@ class ChatGPTTelegramBot:
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Привет! Я готов к работе.\n"
-            "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode, /del"
+            "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode, /del, /reload_menu"
         )
 
     @only_allowed
@@ -202,7 +226,8 @@ class ChatGPTTelegramBot:
             "/mode — стиль ответов (Профессиональный/Экспертный/Пользовательский/СЕО)\n"
             "/dialogs — список диалогов, /dialog <id> — вернуться\n"
             "/img <описание> — сгенерировать изображение\n"
-            "/del — удалить диалоги"
+            "/del — удалить диалоги\n"
+            "/reload_menu — обновить меню у всех"
         )
 
     @only_allowed
@@ -434,6 +459,20 @@ class ChatGPTTelegramBot:
         db.commit()
         await update.message.reply_text(f"✅ Активирован диалог #{c.id} ({c.title}).")
 
+    # ---------- Reload menu (для обновления у всех пользователей) ----------
+    @only_allowed
+    async def on_reload_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Разрешаем всем, если список админов пуст; иначе — только админам
+        if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
+            await update.message.reply_text("⛔ Доступно только администратору.")
+            return
+        await self._post_init_commands(context.application)
+        await update.message.reply_text(
+            "✅ Меню обновлено для всех чатов и языков.\n"
+            "Если изменения не видны, попросите пользователя закрыть и заново открыть чат с ботом "
+            "или потянуть список команд вниз для обновления кэша."
+        )
+
     # ---------- Callbacks ----------
     @only_allowed
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -529,7 +568,6 @@ class ChatGPTTelegramBot:
         elif data.startswith("do_del_all"):
             db = self._get_db()
             chat_id = update.effective_chat.id
-            # считаем, сколько удалим
             to_del = db.query(Conversation).filter_by(chat_id=chat_id, is_active=False).all()
             n = len(to_del)
             for c in to_del:
@@ -567,7 +605,6 @@ class ChatGPTTelegramBot:
             db.delete(c)
             db.commit()
 
-            # Если удалили активный — активируем ближайший по дате
             if was_active:
                 next_conv = (
                     db.query(Conversation)
@@ -580,7 +617,6 @@ class ChatGPTTelegramBot:
                     db.commit()
                     await q.edit_message_text(f"🗑️ Диалог #{cid} удалён. Активирован диалог #{next_conv.id} ({next_conv.title}).")
                 else:
-                    # создаём пустой
                     nc = Conversation(chat_id=chat_id, title="Диалог", is_active=True)
                     db.add(nc)
                     db.commit()
