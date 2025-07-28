@@ -1,14 +1,31 @@
 import logging
 from telegram.ext import ApplicationBuilder, MessageHandler, filters
+from sqlalchemy import text
 
 from bot.config import load_settings
 from bot.telegram_bot import ChatGPTTelegramBot
 from bot.openai_helper import OpenAIHelper
-from bot.db.session import init_db
+from bot.db.session import init_db, engine  # <- берем engine для advisory-lock
 from bot.db.models import Base
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+LOCK_KEY = 751234567890123456  # любой фиксированный bigint < 9.22e18
+
+def ensure_singleton_or_exit():
+    """Гарантируем запуск только одного инстанса через pg_try_advisory_lock."""
+    try:
+        with engine.begin() as conn:
+            got = conn.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": LOCK_KEY})
+            if not got:
+                logger.error("🛑 Найден другой запущенный инстанс (advisory-lock). Завершение.")
+                raise SystemExit(0)
+        logger.info("🔒 Advisory-lock получен. Запускаем бота.")
+    except Exception as e:
+        logger.error(f"Ошибка при попытке захватить advisory-lock: {e}")
+        # На всякий случай завершаем, чтобы не плодить дубли
+        raise SystemExit(1)
 
 def build_application():
     settings = load_settings()
@@ -25,29 +42,15 @@ def build_application():
     try:
         bot.install(app)  # внутри должны регистрироваться все handlers
     except AttributeError:
-        # Фолбэк: хотя бы базовый обработчик текста
+        # Фолбэк: базовый обработчик текста
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
-
-    # (Необязательно) Пример установки команд через post_init — только если хотите меню сразу:
-    # async def _post_init(app_):
-    #     from telegram import BotCommand
-    #     await app_.bot.set_my_commands([
-    #         BotCommand("start", "Запуск и меню"),
-    #         BotCommand("help", "Помощь"),
-    #         BotCommand("reset", "Сброс контекста"),
-    #         BotCommand("stats", "Статистика"),
-    #         BotCommand("kb", "База знаний"),
-    #         BotCommand("model", "Выбор модели"),
-    #         BotCommand("dialogs", "Список диалогов / возврат"),
-    #     ])
-    # app.post_init(_post_init)
 
     return app
 
 def main():
+    ensure_singleton_or_exit()
     app = build_application()
     logger.info("🚀 Бот запускается (run_polling)...")
-    # Синхронный запуск — без asyncio.run и без await
     app.run_polling(allowed_updates=None)
 
 if __name__ == "__main__":
