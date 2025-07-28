@@ -275,26 +275,27 @@ class ChatGPTTelegramBot:
         db = self._get_db()
         chat_id = update.effective_chat.id
         self._get_active_conv(chat_id, db)  # ensure exists
-
+    
         kb_enabled = context.user_data.get("kb_enabled", True)
         selected = context.user_data.get("kb_selected_ids", set())
         docs = db.query(Document).order_by(Document.id.asc()).limit(30).all()
-
+    
         rows = []
         for d in docs:
             mark = "✅" if d.id in selected else "➕"
             rows.append([InlineKeyboardButton(f"{mark} {d.title}", callback_data=f"kb_toggle:{d.id}")])
-
-        # Админская кнопка синка
-        if update.effective_user and update.effective_user.id in self.admins:
-            rows.append([InlineKeyboardButton("🔄 Синхронизировать с Я.Диском", callback_data="kb_sync")])
-
+    
+        # Кнопка синхронизации показывается всем разрешённым пользователям,
+        # а право запуска проверим в callback (админ/пустой список админов).
+        rows.append([InlineKeyboardButton("🔄 Синхронизировать с Я.Диском", callback_data="kb_sync")])
+    
         rows.append([InlineKeyboardButton(("🔕 Отключить БЗ" if kb_enabled else "🔔 Включить БЗ"), callback_data="kb_toggle_enabled")])
         rows.append([InlineKeyboardButton("🔐 Указать пароли для выбранных", callback_data="kb_pass_menu")])
-
+    
         await update.message.reply_text(
             f"База знаний: {'включена' if kb_enabled else 'выключена'}.\n"
-            "Выберите документы для контекста (до 30 показано).",
+            "• Нажмите на документ, чтобы включить/исключить его из контекста.\n"
+            "• Для документов с паролями используйте «🔐 Указать пароли для выбранных».",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
@@ -468,7 +469,9 @@ class ChatGPTTelegramBot:
             )
 
         elif data == "kb_sync":
-            if update.effective_user and update.effective_user.id in self.admins:
+            is_admin = bool(self.admins) and (update.effective_user and update.effective_user.id in self.admins)
+            # если список админов пуст -> считаем что синк разрешён
+            if not self.admins or is_admin:
                 await q.edit_message_text("Запускаю синхронизацию…")
                 await self._kb_sync_internal(update, context)
             else:
