@@ -32,10 +32,7 @@ from bot.settings import Settings
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Индикатор «набирает… / загружает фото…» (fallback для любых версий PTB v20)
-# Использование:
-#   async with ChatActionSender(action=ChatAction.TYPING, chat_id=..., bot=context.bot):
-#       ... любая долгая операция ...
+# Индикатор «набирает… / загружает фото…» (совместимо с PTB v20)
 # ---------------------------------------------------------------------------
 class ChatActionSender:
     def __init__(self, *, action: ChatAction, chat_id: int, bot, interval: float = 4.0):
@@ -69,7 +66,7 @@ def only_allowed(func):
     @wraps(func)
     async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else None
-        # Если allowed пустой — считаем, что доступ всем
+        # Если allowed пустой — доступ всем
         if self.allowed and uid not in self.allowed:
             await update.effective_message.reply_text("⛔ Доступ ограничен.")
             return
@@ -86,30 +83,15 @@ STYLE_LABELS = {
 }
 
 def style_system_hint(style: str) -> Tuple[str, float]:
-    """
-    Возвращает (system_prompt, temperature) для выбранного стиля.
-    """
     s = (style or "pro").lower()
     if s == "pro":
-        return (
-            "Отвечай как высокопрофессиональный консультант. Максимально точно, лаконично, по делу, без воды.",
-            0.2,
-        )
+        return ("Отвечай как высокопрофессиональный консультант. Максимально точно, лаконично, по делу, без воды.", 0.2)
     if s == "expert":
-        return (
-            "Отвечай как эксперт-практик с глубокими знаниями темы. Приводи точные формулировки и причинно-следственные связи.",
-            0.3,
-        )
+        return ("Отвечай как эксперт-практик с глубокими знаниями темы. Приводи точные формулировки и причинно-следственные связи.", 0.3)
     if s == "user":
-        return (
-            "Объясняй просто, как обычный опытный пользователь. Можешь давать примеры и чуть более разговорный стиль.",
-            0.6,
-        )
+        return ("Объясняй просто, как обычный опытный пользователь. Можешь давать примеры и чуть более разговорный стиль.", 0.6)
     if s == "ceo":
-        return (
-            "Отвечай как собственник бизнеса (EMBA/DBA): стратегия, ROI, риски, ресурсы, влияние на оргдизайн и культуру.",
-            0.25,
-        )
+        return ("Отвечай как собственник бизнеса (EMBA/DBA): стратегия, ROI, риски, ресурсы, влияние на оргдизайн и культуру.", 0.25)
     return ("Отвечай профессионально и по делу.", 0.3)
 
 
@@ -135,11 +117,12 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("mode", self.on_mode))
         app.add_handler(CommandHandler("img", self.on_img))
         app.add_handler(CommandHandler("cancelpass", self.on_cancel_pass))
+        app.add_handler(CommandHandler("del", self.on_delete_dialogs))           # <<< Удаление диалогов
 
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
-        # Команды меню (post_init колбэк)
+        # Команды меню
         app.post_init = self._post_init_commands
 
     async def _post_init_commands(self, app: Application):
@@ -153,6 +136,7 @@ class ChatGPTTelegramBot:
             BotCommand("dialogs", "Список диалогов"),
             BotCommand("img", "Сгенерировать изображение"),
             BotCommand("mode", "Стиль ответов"),
+            BotCommand("del", "Удалить диалоги"),        # <<< новое
         ]
         try:
             await app.bot.set_my_commands(cmds)
@@ -185,10 +169,6 @@ class ChatGPTTelegramBot:
         return (base[:limit] + "…") if len(base) > limit else base
 
     def _ensure_conv_title(self, conv: Conversation, first_user_text: str, db: Session):
-        """
-        Если заголовок стандартный — автоименуем по первым словам + дата.
-        На каждое сообщение обновляем метку 'upd'.
-        """
         base = conv.title or "Диалог"
         created = conv.created_at.strftime("%Y-%m-%d")
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
@@ -209,7 +189,7 @@ class ChatGPTTelegramBot:
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Привет! Я готов к работе.\n"
-            "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode"
+            "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode, /del"
         )
 
     @only_allowed
@@ -221,7 +201,8 @@ class ChatGPTTelegramBot:
             "/model — выбор модели OpenAI\n"
             "/mode — стиль ответов (Профессиональный/Экспертный/Пользовательский/СЕО)\n"
             "/dialogs — список диалогов, /dialog <id> — вернуться\n"
-            "/img <описание> — сгенерировать изображение"
+            "/img <описание> — сгенерировать изображение\n"
+            "/del — удалить диалоги"
         )
 
     @only_allowed
@@ -234,7 +215,7 @@ class ChatGPTTelegramBot:
         db.add(newc)
         db.commit()
         await update.message.reply_text("🔄 Новый диалог создан. Контекст очищен.")
-        # Сбросим только стиль/парольные состояния; выбранные документы не трогаем
+        # Сбрасываем только стиль/парольные состояния; выбранные документы не трогаем
         context.user_data.pop("await_password_for", None)
         context.user_data.pop("style", None)
 
@@ -275,23 +256,21 @@ class ChatGPTTelegramBot:
         db = self._get_db()
         chat_id = update.effective_chat.id
         self._get_active_conv(chat_id, db)  # ensure exists
-    
+
         kb_enabled = context.user_data.get("kb_enabled", True)
         selected = context.user_data.get("kb_selected_ids", set())
         docs = db.query(Document).order_by(Document.id.asc()).limit(30).all()
-    
+
         rows = []
         for d in docs:
             mark = "✅" if d.id in selected else "➕"
             rows.append([InlineKeyboardButton(f"{mark} {d.title}", callback_data=f"kb_toggle:{d.id}")])
-    
-        # Кнопка синхронизации показывается всем разрешённым пользователям,
-        # а право запуска проверим в callback (админ/пустой список админов).
+
+        # Синхронизация показывается всем; доступ проверим в callback
         rows.append([InlineKeyboardButton("🔄 Синхронизировать с Я.Диском", callback_data="kb_sync")])
-    
         rows.append([InlineKeyboardButton(("🔕 Отключить БЗ" if kb_enabled else "🔔 Включить БЗ"), callback_data="kb_toggle_enabled")])
         rows.append([InlineKeyboardButton("🔐 Указать пароли для выбранных", callback_data="kb_pass_menu")])
-    
+
         await update.message.reply_text(
             f"База знаний: {'включена' if kb_enabled else 'выключена'}.\n"
             "• Нажмите на документ, чтобы включить/исключить его из контекста.\n"
@@ -305,7 +284,6 @@ class ChatGPTTelegramBot:
         models_all = self.openai.list_models()
         current = self.openai.model
 
-        # Фильтрация по whitelist/denylist (если заданы)
         allow_list = getattr(self.settings, "allowed_models_whitelist", [])
         deny_list = getattr(self.settings, "denylist_models", [])
         allow = set(m.lower() for m in allow_list) if allow_list else None
@@ -320,12 +298,9 @@ class ChatGPTTelegramBot:
             return True
 
         models = [m for m in models_all if _allowed(m)]
-
-        # Расширенный набор «предпочтительных»
         prefer_keywords = ["gpt-4o", "gpt-4.1", "gpt-4", "gpt-3.5", "o4", "o3"]
         prefer = [m for m in models if any(k in m for k in prefer_keywords)]
 
-        # Берём prefer + остаток, без дубликатов, максимум 30
         combined = []
         seen = set()
         for m in prefer + models:
@@ -340,7 +315,6 @@ class ChatGPTTelegramBot:
             await update.message.reply_text("Список моделей пуст — проверьте фильтры (whitelist/denylist).")
             return
 
-        # Текущую модель — первой
         if current in items:
             items = [current] + [m for m in items if m != current]
 
@@ -365,12 +339,11 @@ class ChatGPTTelegramBot:
 
     # ---------- Images ----------
     @only_allowed
-    @only_allowed
     async def on_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not getattr(self.settings, "enable_image_generation", True):
             await update.message.reply_text("Генерация изображений выключена администратором.")
             return
-    
+
         prompt = " ".join(context.args) if context.args else ""
         if not prompt and update.message and update.message.reply_to_message:
             prompt = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
@@ -381,7 +354,7 @@ class ChatGPTTelegramBot:
                 parse_mode="Markdown",
             )
             return
-    
+
         try:
             async with ChatActionSender(
                 action=ChatAction.UPLOAD_PHOTO,
@@ -414,11 +387,29 @@ class ChatGPTTelegramBot:
         if not items:
             await update.message.reply_text("Нет сохранённых диалогов.")
             return
-        rows = [
-            [InlineKeyboardButton(f"#{c.id} {c.title}", callback_data=f"goto_dialog:{c.id}")]
-            for c in items
-        ]
+        rows = [[InlineKeyboardButton(f"#{c.id} {c.title}", callback_data=f"goto_dialog:{c.id}")] for c in items]
         await update.message.reply_text("Выберите диалог:", reply_markup=InlineKeyboardMarkup(rows))
+
+    @only_allowed
+    async def on_delete_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает список диалогов для удаления."""
+        db = self._get_db()
+        chat_id = update.effective_chat.id
+        items = (
+            db.query(Conversation)
+            .filter_by(chat_id=chat_id)
+            .order_by(Conversation.id.desc())
+            .limit(15)
+            .all()
+        )
+        if not items:
+            await update.message.reply_text("Нет сохранённых диалогов.")
+            return
+
+        rows = [[InlineKeyboardButton(f"🗑️ #{c.id} {c.title}", callback_data=f"ask_del:{c.id}")] for c in items]
+        # Кнопка удалить все неактивные
+        rows.append([InlineKeyboardButton("🧹 Удалить все неактивные", callback_data="ask_del_all")])
+        await update.message.reply_text("Выберите диалог для удаления:", reply_markup=InlineKeyboardMarkup(rows))
 
     @only_allowed
     async def on_dialog_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -450,6 +441,7 @@ class ChatGPTTelegramBot:
         await q.answer()
         data = q.data or ""
 
+        # --- KB toggles ---
         if data.startswith("kb_toggle:"):
             doc_id = int(data.split(":")[1])
             selected = context.user_data.get("kb_selected_ids", set())
@@ -470,7 +462,6 @@ class ChatGPTTelegramBot:
 
         elif data == "kb_sync":
             is_admin = bool(self.admins) and (update.effective_user and update.effective_user.id in self.admins)
-            # если список админов пуст -> считаем что синк разрешён
             if not self.admins or is_admin:
                 await q.edit_message_text("Запускаю синхронизацию…")
                 await self._kb_sync_internal(update, context)
@@ -497,6 +488,7 @@ class ChatGPTTelegramBot:
             context.user_data.pop("await_password_for", None)
             await q.edit_message_text("Ввод пароля отменён.")
 
+        # --- Models / Modes / Dialog navigation ---
         elif data.startswith("set_model:"):
             m = data.split(":", 1)[1]
             self.openai.set_model(m)
@@ -525,6 +517,79 @@ class ChatGPTTelegramBot:
             mode = data.split(":", 1)[1]
             context.user_data["style"] = mode
             await q.edit_message_text(f"Стиль установлен: {STYLE_LABELS.get(mode, 'Профессиональный')}")
+
+        # --- Delete dialogs ---
+        elif data.startswith("ask_del_all"):
+            rows = [
+                [InlineKeyboardButton("✅ Да, удалить все неактивные", callback_data="do_del_all")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_del")],
+            ]
+            await q.edit_message_text("Подтвердите удаление всех НЕактивных диалогов:", reply_markup=InlineKeyboardMarkup(rows))
+
+        elif data.startswith("do_del_all"):
+            db = self._get_db()
+            chat_id = update.effective_chat.id
+            # считаем, сколько удалим
+            to_del = db.query(Conversation).filter_by(chat_id=chat_id, is_active=False).all()
+            n = len(to_del)
+            for c in to_del:
+                db.delete(c)
+            db.commit()
+            await q.edit_message_text(f"🧹 Удалено неактивных диалогов: {n}")
+
+        elif data.startswith("ask_del:"):
+            try:
+                cid = int(data.split(":")[1])
+            except ValueError:
+                await q.edit_message_text("Некорректный id диалога.")
+                return
+            rows = [
+                [InlineKeyboardButton("✅ Да, удалить", callback_data=f"do_del:{cid}")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_del")],
+            ]
+            await q.edit_message_text(f"Удалить диалог #{cid}?", reply_markup=InlineKeyboardMarkup(rows))
+
+        elif data.startswith("do_del:"):
+            try:
+                cid = int(data.split(":")[1])
+            except ValueError:
+                await q.edit_message_text("Некорректный id диалога.")
+                return
+
+            db = self._get_db()
+            chat_id = update.effective_chat.id
+            c = db.query(Conversation).filter_by(chat_id=chat_id, id=cid).first()
+            if not c:
+                await q.edit_message_text("Диалог не найден.")
+                return
+
+            was_active = bool(getattr(c, "is_active", False))
+            db.delete(c)
+            db.commit()
+
+            # Если удалили активный — активируем ближайший по дате
+            if was_active:
+                next_conv = (
+                    db.query(Conversation)
+                    .filter_by(chat_id=chat_id)
+                    .order_by(Conversation.id.desc())
+                    .first()
+                )
+                if next_conv:
+                    next_conv.is_active = True
+                    db.commit()
+                    await q.edit_message_text(f"🗑️ Диалог #{cid} удалён. Активирован диалог #{next_conv.id} ({next_conv.title}).")
+                else:
+                    # создаём пустой
+                    nc = Conversation(chat_id=chat_id, title="Диалог", is_active=True)
+                    db.add(nc)
+                    db.commit()
+                    await q.edit_message_text(f"🗑️ Диалог #{cid} удалён. Создан новый пустой диалог.")
+            else:
+                await q.edit_message_text(f"🗑️ Диалог #{cid} удалён.")
+
+        elif data == "cancel_del":
+            await q.edit_message_text("Удаление отменено.")
 
     async def _kb_sync_internal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         from bot.knowledge_base.indexer import sync_disk_to_db
@@ -595,7 +660,7 @@ class ChatGPTTelegramBot:
         # 3) Обновим заголовок диалога
         self._ensure_conv_title(conv, update.message.text or "", db)
 
-        # 4) Запрос к OpenAI — уводим в поток, чтобы не блокировать event loop
+        # 4) Запрос к OpenAI — в поток (не блокируем event loop)
         prompt = (update.message.text or "").strip()
         messages = [
             {"role": "system", "content": (sys_hint + kb_hint).strip()},
