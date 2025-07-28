@@ -364,11 +364,12 @@ class ChatGPTTelegramBot:
 
     # ---------- Images ----------
     @only_allowed
+    @only_allowed
     async def on_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not getattr(self.settings, "enable_image_generation", True):
             await update.message.reply_text("Генерация изображений выключена администратором.")
             return
-
+    
         prompt = " ".join(context.args) if context.args else ""
         if not prompt and update.message and update.message.reply_to_message:
             prompt = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
@@ -379,18 +380,21 @@ class ChatGPTTelegramBot:
                 parse_mode="Markdown",
             )
             return
-
+    
         try:
             async with ChatActionSender(
                 action=ChatAction.UPLOAD_PHOTO,
                 chat_id=update.effective_chat.id,
                 bot=context.bot,
             ):
-                png = await asyncio.to_thread(self.openai.generate_image, prompt, size="1024x1024")
+                png, used_prompt, used_model = await asyncio.to_thread(
+                    self.openai.generate_image, prompt, size="1024x1024"
+                )
             bio = BytesIO(png)
             bio.name = "image.png"
             bio.seek(0)
-            await update.message.reply_photo(photo=InputFile(bio, filename="image.png"), caption=prompt)
+            caption = f"🖼️ Модель: {used_model}\n📝 Промпт: {used_prompt}"
+            await update.message.reply_photo(photo=InputFile(bio, filename="image.png"), caption=caption)
         except Exception as e:
             await update.message.reply_text(f"Ошибка генерации изображения: {e}")
 
