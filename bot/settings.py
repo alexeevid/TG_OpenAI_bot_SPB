@@ -1,11 +1,12 @@
 from typing import List, Optional
 from pydantic_settings import BaseSettings
-from pydantic import Field, AliasChoices
+from pydantic import Field, AliasChoices, PrivateAttr
+import json
 
 # ----------------- helpers -----------------
 def _split_ints(v: Optional[str]) -> List[int]:
     """
-    Парсер CSV/SSV -> List[int], устойчив к мусору.
+    CSV/SSV -> List[int], устойчив к мусору.
     Примеры: "1,2,3" / "1; 2 ; 3" -> [1,2,3]
     """
     if not v:
@@ -22,7 +23,7 @@ def _split_ints(v: Optional[str]) -> List[int]:
 
 def _split_strs(v: Optional[str]) -> List[str]:
     """
-    Парсер CSV/SSV или JSON-массива -> List[str].
+    CSV/SSV или JSON-массив -> List[str].
     Примеры:
       "gpt-4o,gpt-4o-mini" -> ["gpt-4o","gpt-4o-mini"]
       '["gpt-4o","gpt-4o-mini"]' -> ["gpt-4o","gpt-4o-mini"]
@@ -33,7 +34,6 @@ def _split_strs(v: Optional[str]) -> List[str]:
     # пробуем как JSON-массив
     if s.startswith("[") and s.endswith("]"):
         try:
-            import json
             data = json.loads(s)
             if isinstance(data, list):
                 return [str(x).strip() for x in data if str(x).strip()]
@@ -72,45 +72,12 @@ class Settings(BaseSettings):
     allowed_models_whitelist_env: Optional[str] = Field(None, alias="ALLOWED_MODELS_WHITELIST")
     denylist_models_env: Optional[str] = Field(None, alias="DENYLIST_MODELS")
 
-    # ---------- Распарсенные (храним во внутренних полях; НЕ читаются из ENV напрямую) ----------
-    _admin_set: List[int] = Field(default_factory=list)
-    _allowed_set: List[int] = Field(default_factory=list)
-    _allowed_models_whitelist: List[str] = Field(default_factory=list)
-    _denylist_models: List[str] = Field(default_factory=list)
+    # ---------- Приватные распарсенные значения (НЕ читаются из ENV напрямую) ----------
+    _admin_set: List[int] = PrivateAttr(default_factory=list)
+    _allowed_set: List[int] = PrivateAttr(default_factory=list)
+    _allowed_models_whitelist: List[str] = PrivateAttr(default_factory=list)
+    _denylist_models: List[str] = PrivateAttr(default_factory=list)
 
     # Yandex Disk
     yandex_disk_token: str = Field("", alias="YANDEX_DISK_TOKEN")
-    yandex_root_path: str = Field("/База Знаний", alias="YANDEX_ROOT_PATH")
-
-    # Фичи
-    enable_image_generation: bool = Field(True, alias="ENABLE_IMAGE_GENERATION")
-
-    # ---------- post-init: парсим строки в списки ----------
-    def model_post_init(self, __context) -> None:
-        self._admin_set = _split_ints(self.admin_user_ids_env)
-        self._allowed_set = _split_ints(self.allowed_user_ids_env)
-        self._allowed_models_whitelist = _split_strs(self.allowed_models_whitelist_env)
-        self._denylist_models = _split_strs(self.denylist_models_env)
-
-    # ---------- публичные свойства для использования в коде ----------
-    @property
-    def admin_set(self) -> List[int]:
-        return list(self._admin_set)
-
-    @property
-    def allowed_set(self) -> List[int]:
-        # Пустой список трактуем как "доступ всем"
-        return list(self._allowed_set)
-
-    @property
-    def allowed_models_whitelist(self) -> List[str]:
-        return list(self._allowed_models_whitelist)
-
-    @property
-    def denylist_models(self) -> List[str]:
-        return list(self._denylist_models)
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        populate_by_name = True
+    yandex_root_path: str
