@@ -1,6 +1,6 @@
 from typing import List, Optional
 from pydantic_settings import BaseSettings
-from pydantic import Field, AliasChoices, PrivateAttr
+from pydantic import Field, AliasChoices, PrivateAttr, computed_field
 import json
 
 # ----------------- helpers -----------------
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     allowed_models_whitelist_env: Optional[str] = Field(None, alias="ALLOWED_MODELS_WHITELIST")
     denylist_models_env: Optional[str] = Field(None, alias="DENYLIST_MODELS")
 
-    # ---------- Приватные распарсенные значения (НЕ читаются из ENV напрямую) ----------
+    # ---------- Приватные распарсенные значения ----------
     _admin_set: List[int] = PrivateAttr(default_factory=list)
     _allowed_set: List[int] = PrivateAttr(default_factory=list)
     _allowed_models_whitelist: List[str] = PrivateAttr(default_factory=list)
@@ -80,4 +80,41 @@ class Settings(BaseSettings):
 
     # Yandex Disk
     yandex_disk_token: str = Field("", alias="YANDEX_DISK_TOKEN")
-    yandex_root_path: str
+    yandex_root_path: str = Field("/База Знаний", alias="YANDEX_ROOT_PATH")
+
+    # Фичи
+    enable_image_generation: bool = Field(True, alias="ENABLE_IMAGE_GENERATION")
+
+    # ---------- post-init: парсим строки в списки ----------
+    def model_post_init(self, __context) -> None:
+        self._admin_set = _split_ints(self.admin_user_ids_env)
+        self._allowed_set = _split_ints(self.allowed_user_ids_env)
+        self._allowed_models_whitelist = _split_strs(self.allowed_models_whitelist_env)
+        self._denylist_models = _split_strs(self.denylist_models_env)
+
+    # ---------- публичные вычисляемые поля (совместимо с pydantic v2) ----------
+    @computed_field  # type: ignore[misc]
+    @property
+    def admin_set(self) -> List[int]:
+        return list(self._admin_set)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def allowed_set(self) -> List[int]:
+        # Пустой список трактуем как "доступ всем"
+        return list(self._allowed_set)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def allowed_models_whitelist(self) -> List[str]:
+        return list(self._allowed_models_whitelist)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def denylist_models(self) -> List[str]:
+        return list(self._denylist_models)
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        populate_by_name = True
