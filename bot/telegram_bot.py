@@ -53,7 +53,8 @@ class ChatGPTTelegramBot:
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
         # Commands menu
-        app.post_init(self._post_init_commands)
+        # Commands menu
+        app.post_init = self._post_init_commands
 
     async def _post_init_commands(self, app: Application):
         cmds = [
