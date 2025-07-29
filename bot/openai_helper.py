@@ -1,193 +1,174 @@
+# bot/openai_helper.py
+from __future__ import annotations
+
 import logging
-from typing import List, Optional, Tuple, Dict, Any
-from base64 import b64decode, b64encode
+from base64 import b64decode
+from typing import Dict, List, Optional, Tuple
 
 from openai import OpenAI
-from openai import APIError, APIConnectionError, BadRequestError, PermissionDeniedError
+from openai.types import ImagesResponse
 
 logger = logging.getLogger(__name__)
 
 
+def _extract_text_from_responses(resp) -> str:
+    """
+    Универсальный парсер текста из OpenAI Responses API (v1).
+    Собираем все content.output_text из message-чанков.
+    """
+    chunks: List[str] = []
+
+    # Новые клиенты возвращают объект со списком output-элементов
+    for out in getattr(resp, "output", []) or []:
+        if getattr(out, "type", None) == "message":
+            for c in getattr(out, "content", []) or []:
+                if getattr(c, "type", None) == "output_text" and getattr(c, "text", None):
+                    chunks.append(c.text)
+
+    # На всякий случай — некоторые клиенты кладут первичный текст прямо в resp.output_text
+    if not chunks and getattr(resp, "output_text", None):
+        chunks.append(resp.output_text)
+
+    text = "\n".join(chunks).strip()
+    return text
+
+
 class OpenAIHelper:
     """
-    Обёртка над OpenAI SDK.
-    Поддерживает:
-      - chat()                — диалог (Chat Completions)
-      - list_models()         — список моделей
-      - generate_image()      — генерация изображений (gpt-image-1 / dall-e-3)
-      - transcribe()          — STT (Speech-to-Text)
-      - analyze_image()       — Vision-анализ фото/изображений
-      - answer_with_web()     — Responses API + web_search
+    Обёртка над OpenAI SDK (client v1.*) с:
+      - chat()   — текстовые ответы через Responses API,
+      - transcribe() — распознавание аудио Whisper,
+      - generate_image() — генерация изображений (с fallback),
+      - answer_with_web() — вызов web_search tool + возврат ссылок.
     """
 
     def __init__(
         self,
         api_key: str,
         model: Optional[str] = None,
-        image_primary: Optional[str] = None,
-        image_fallback: Optional[str] = None,
-        stt_model: Optional[str] = None,
-        **kwargs,
+        image_model: Optional[str] = None,
+        temperature: float = 0.2,
+        enable_image_generation: bool = True,
     ):
-        """
-        Параметры можно передать из Settings:
-          - model: основной текстовый (например, "gpt-4o")
-          - image_primary: модель генерации изображений (например, "gpt-image-1")
-          - image_fallback: запасная ("dall-e-3")
-          - stt_model: модель распознавания (например, "gpt-4o-mini-transcribe")
-        """
         self.client = OpenAI(api_key=api_key)
-        self.model = model or kwargs.get("default_model") or kwargs.get("openai_model") or "gpt-4o"
-        self.image_primary = image_primary or kwargs.get("image_model") or "gpt-image-1"
-        self.image_fallback = image_fallback or "dall-e-3"
-        self.stt_model = stt_model or "gpt-4o-mini-transcribe"
+        self.model = model or "gpt-4o"
+        self.image_model = image_model or "dall-e-3"
+        self.temperature = temperature
+        self.enable_image_generation = enable_image_generation
 
-    # -------- Models --------
-    def list_models(self) -> List[str]:
-        try:
-            data = self.client.models.list()
-            ids = [m.id for m in getattr(data, "data", [])]
-            # приоритизируем «часто используемые»
-            prefer = ["gpt-4o", "gpt-4.1", "gpt-4", "gpt-3.5", "o4", "o3"]
-            ids_sorted = sorted(
-                ids,
-                key=lambda i: (0 if any(k in i for k in prefer) else 1, i),
-            )
-            return ids_sorted
-        except Exception as e:
-            logger.exception("list_models failed: %s", e)
-            return [self.model]
-
-    # -------- Chat --------
-    def set_model(self, m: str):
-        self.model = m
+    # ---------- Text / Chat ----------
 
     def chat(
         self,
         messages: List[Dict[str, str]],
         *,
-        temperature: float = 0.2,
-        max_output_tokens: int = 4096,
         model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
     ) -> str:
         """
-        Простая обёртка над Chat Completions. Возвращает text content первого выбора.
+        messages: [{"role": "system"|"user"|"assistant", "content": "..."}]
+        Используем Responses API с одним input (склеиваем system + user/assistant).
         """
         use_model = model or self.model
-        try:
-            resp = self.client.chat.completions.create(
-                model=use_model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_output_tokens,
-            )
-            choice = resp.choices[0]
-            return choice.message.content or ""
-        except Exception as e:
-            logger.exception("chat() failed: %s", e)
-            raise
+        temp = self.temperature if temperature is None else temperature
 
-    # -------- Images --------
-    def generate_image(self, prompt: str, *, size: str = "1024x1024") -> Tuple[bytes, str, str]:
+        sys_buf: List[str] = []
+        conv_buf: List[str] = []
+
+        for m in messages:
+            role = (m.get("role") or "").lower()
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "system":
+                sys_buf.append(content)
+            elif role == "user":
+                conv_buf.append(f"[USER]\n{content}")
+            elif role == "assistant":
+                conv_buf.append(f"[ASSISTANT]\n{content}")
+
+        system_block = ""
+        if sys_buf:
+            # ВАЖНО: не использовать f-выражения с обратными слешами внутри {} — были SyntaxError
+            system_block = "[SYSTEM]\n" + "\n\n".join(sys_buf) + "\n\n"
+
+        prompt = system_block + "\n\n".join(conv_buf).strip()
+
+        resp = self.client.responses.create(
+            model=use_model,
+            input=prompt,
+            temperature=temp,
+            max_output_tokens=max_output_tokens,
+        )
+        return _extract_text_from_responses(resp)
+
+    # ---------- Audio ----------
+
+    def transcribe(self, audio_path: str) -> str:
         """
-        Возвращает (png_bytes, used_prompt, used_model).
-        Пытается сначала image_primary, затем fallback.
+        Распознавание речи (Whisper). Возвращает текст.
         """
-        def _call(model_name: str) -> Tuple[bytes, str, str]:
-            res = self.client.images.generate(
-                model=model_name,
+        with open(audio_path, "rb") as f:
+            tr = self.client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                # язык не фиксируем — пусть автоопределяет; можно добавить: language="ru"
+            )
+        return (getattr(tr, "text", None) or "").strip()
+
+    # ---------- Images ----------
+
+    def generate_image(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        size: str = "1024x1024",
+        fallback_to_dalle3: bool = True,
+    ) -> bytes:
+        """
+        Генерация изображения. Возвращает бинарные PNG-данные.
+        Если выбран 'gpt-image-1' и нет верификации — откатываемся на 'dall-e-3' (если разрешено).
+        """
+        if not self.enable_image_generation:
+            raise RuntimeError("Image generation is disabled by configuration.")
+
+        primary = model or self.image_model or "dall-e-3"
+
+        def _call(m: str) -> bytes:
+            res: ImagesResponse = self.client.images.generate(
+                model=m,
                 prompt=prompt,
                 size=size,
-                response_format="b64_json",
             )
-            data = getattr(res, "data", None) or []
-            b64 = data[0].b64_json if data else None
+            data = (res.data or [])
+            if not data:
+                raise RuntimeError("Images API returned empty data.")
+            b64 = getattr(data[0], "b64_json", None)
             if not b64:
-                raise ValueError("Empty image data returned")
-            return b64decode(b64), prompt, model_name
+                raise RuntimeError("Images API did not return base64 image.")
+            return b64decode(b64)
 
         try:
-            return _call(self.image_primary)
-        except PermissionDeniedError as e:
-            logger.warning(
-                "Primary image model '%s' failed: %s. Trying '%s' fallback...",
-                self.image_primary, e, self.image_fallback
-            )
-            return _call(self.image_fallback)
+            return _call(primary)
         except Exception as e:
-            logger.exception("Image generation failed: %s", e)
+            logger.warning("Primary image model '%s' failed: %s", primary, e)
+            # Специальный кейс: частая 403 при gpt-image-1 (нужна верификация организации)
+            if fallback_to_dalle3 and primary != "dall-e-3":
+                try:
+                    return _call("dall-e-3")
+                except Exception as e2:
+                    logger.error("Image generation failed even with fallback: %s", e2)
+                    raise
             raise
 
-    # -------- Speech-to-Text --------
-    def transcribe(self, file_path: str) -> str:
-        """
-        Распознаёт речь из аудиофайла (mp3/m4a/wav/webm/ogg*) и возвращает текст.
-        """
-        try:
-            with open(file_path, "rb") as f:
-                tr = self.client.audio.transcriptions.create(
-                    model=self.stt_model,
-                    file=f,
-                )
-            text = getattr(tr, "text", None)
-            if not text:
-                raise ValueError("Empty transcription result")
-            return text
-        except Exception as e:
-            logger.exception("STT failed: %s", e)
-            raise
+    # ---------- Web ----------
 
-    # -------- Vision: анализ изображения --------
-    def analyze_image(
-        self,
-        file_path: str,
-        *,
-        prompt: Optional[str] = None,
-        model: Optional[str] = None,
-        detail: Optional[str] = None,          # 'low' | 'high' (если указано)
-        max_tokens: int = 600,
-    ) -> str:
-        """
-        Анализ изображения через Responses API.
-        Возвращает текстовое описание/резюме.
-        """
-        use_model = model or self.model or "gpt-4o"
-        try:
-            with open(file_path, "rb") as f:
-                b64 = b64encode(f.read()).decode("ascii")
-
-            img_obj: Dict[str, Any] = {"type": "input_image", "image_data": b64}
-            if detail:
-                img_obj["detail"] = detail  # поддерживается не всеми моделями; если нет — тихо игнорится
-
-            content = [
-                img_obj,
-                {"type": "text", "text": prompt or "Опиши изображение, выдели ключевые объекты, текст и возможные риски/аномалии."},
-            ]
-
-            resp = self.client.responses.create(
-                model=use_model,
-                input=[{"role": "user", "content": content}],
-                max_output_tokens=max_tokens,
-            )
-
-            # Соберём текст из output
-            chunks: List[str] = []
-            for out in getattr(resp, "output", []) or []:
-                if getattr(out, "type", None) == "message":
-                    for c in getattr(out, "content", []) or []:
-                        if getattr(c, "type", None) == "output_text" and getattr(c, "text", None):
-                            chunks.append(c.text)
-            return "\n".join(chunks).strip() or "Описание недоступно."
-        except Exception as e:
-            logger.exception("analyze_image failed: %s", e)
-            return f"Не удалось проанализировать изображение: {e}"
-
-    # -------- Responses + Web Search --------
     def answer_with_web(self, prompt: str, *, model: Optional[str] = None) -> Tuple[str, List[Dict[str, str]]]:
         """
-        Выполняет запрос с включенным web_search tool и возвращает (text, citations[]).
-        citations: список словарей {title, url}
+        Выполняет запрос с включенным web_search tool.
+        Возвращает: (текст ответа, список цитат [{title,url}, ...]).
         """
         use_model = model or self.model or "gpt-4o"
         try:
@@ -197,33 +178,68 @@ class OpenAIHelper:
                 tools=[{"type": "web_search"}],
             )
 
-            text_chunks: List[str] = []
+            text = _extract_text_from_responses(resp)
             citations: List[Dict[str, str]] = []
 
-            # Структура output: список шагов (сообщения, tool_calls и т.д.)
+            # 1) Пытаемся достать url_citation из annotations
             for out in getattr(resp, "output", []) or []:
                 if getattr(out, "type", None) == "message":
                     for c in getattr(out, "content", []) or []:
-                        if getattr(c, "type", None) == "output_text" and getattr(c, "text", None):
-                            text_chunks.append(c.text)
-                        # аннотации со ссылками (если есть)
                         for ann in (getattr(c, "annotations", []) or []):
                             if getattr(ann, "type", None) == "url_citation":
-                                title = getattr(ann, "title", None)
                                 url = getattr(ann, "url", None)
+                                title = getattr(ann, "title", None)
                                 if url:
                                     citations.append({"title": title or url, "url": url})
 
-            text = "\n".join(text_chunks).strip() or "Ничего не найдено."
-            # Убираем дубликаты ссылок
+            # 2) Если инструмент вернул список результатов — тоже соберём
+            for out in getattr(resp, "output", []) or []:
+                if getattr(out, "type", None) == "tool_result":
+                    name = (getattr(out, "tool_name", None) or getattr(out, "name", None) or "").lower()
+                    if name == "web_search":
+                        data = getattr(out, "content", None) or getattr(out, "result", None)
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, dict) and item.get("url"):
+                                    citations.append({"title": item.get("title") or item["url"], "url": item["url"]})
+
+            # Уникализируем по URL
             seen = set()
-            uniq = []
+            uniq: List[Dict[str, str]] = []
             for it in citations:
                 if it["url"] not in seen:
                     uniq.append(it)
                     seen.add(it["url"])
-            return text, uniq
+
+            return (text or "Ничего не найдено.").strip(), uniq
 
         except Exception as e:
             logger.exception("Web search failed: %s", e)
             return f"Ошибка web‑поиска: {e}", []
+
+    # ---------- Models ----------
+
+    def list_models(
+        self,
+        *,
+        whitelist: Optional[List[str]] = None,
+        denylist: Optional[List[str]] = None,
+    ) -> List[str]:
+        """
+        Возвращает список доступных моделей (с учётом опциональных белого/чёрного списков).
+        """
+        try:
+            mlist = self.client.models.list()
+            ids = [m.id for m in getattr(mlist, "data", [])]
+            if whitelist:
+                ids = [m for m in ids if m in set(whitelist)]
+            if denylist:
+                d = set(denylist)
+                ids = [m for m in ids if m not in d]
+            # упорядочим: «умные» модели наверх
+            prefer = ["o4", "o4-mini", "gpt-4.1", "gpt-4o", "gpt-4"]
+            ids = sorted(ids, key=lambda x: (0 if any(x.startswith(p) for p in prefer) else 1, x))
+            return ids
+        except Exception as e:
+            logger.exception("Failed to list models: %s", e)
+            return []
