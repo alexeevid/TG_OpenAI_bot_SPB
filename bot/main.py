@@ -1,95 +1,81 @@
-# bot/main.py
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import sys
+from contextlib import asynccontextmanager
 
-# Advisory-lock для защиты от второго процесса
-try:
-    import fcntl  # недоступен на Windows, но Railway на Linux
-except Exception:  # pragma: no cover
-    fcntl = None
-
-from telegram.ext import Application
+from telegram.ext import ApplicationBuilder
 
 from bot.config import load_settings
+from bot.db.session import init_db
 from bot.openai_helper import OpenAIHelper
 from bot.telegram_bot import ChatGPTTelegramBot
-from bot.db.session import init_db
-from bot.db.models import Base
 
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(levelname)s:%(name)s:%(message)s",
-)
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
+LOCK_FILE = "/tmp/tg_bot.lock"
 
-def _acquire_advisory_lock() -> None:
+@asynccontextmanager
+async def advisory_lock(path: str):
     """
-    Простой advisory-lock на файловой системе, чтобы гарантировать, что
-    не запустится второй экземпляр бота (иначе 409 Conflict от getUpdates).
+    Простейший advisory-lock на уровне файловой системы, чтобы на Railway не запустились
+    два poller'а одновременно (иначе будут конфликты getUpdates 409/Conflict).
     """
-    if fcntl is None:
-        logger.warning("fcntl недоступен — пропускаю advisory-lock (OK для локального запуска)")
-        return
-    lock_path = "/tmp/tg_openai_bot.lock"
-    lock_file = open(lock_path, "w")
+    if os.path.exists(path):
+        logger.info("🔒 Advisory-lock уже существует. Второй процесс завершен.")
+        raise SystemExit(0)
+    with open(path, "w") as f:
+        f.write(str(os.getpid()))
     try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        logger.info("🔒 Advisory-lock получен. Запускаем бота.")
-    except OSError:
-        logger.error("🚫 Уже запущен другой экземпляр бота (lock %s). Завершаюсь.", lock_path)
-        sys.exit(1)
+        yield
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
-
-def build_application() -> Application:
-    """
-    Инициализация настроек, БД, OpenAI-хелпера и Telegram-приложения.
-    """
+def build_application():
     settings = load_settings()
 
-    # Инициализация БД (обязательно перед запуском приложения)
-    init_db(Base)
+    # 1) Инициализация БД (создаем таблицы, если их ещё нет)
+    init_db()
 
-    # OpenAI helper. ВАЖНО: используем 'default_model' и 'temperature'.
+    # 2) OpenAI helper
     openai = OpenAIHelper(
         api_key=settings.openai_api_key,
-        default_model=getattr(settings, "openai_model", None),
+        model=getattr(settings, "openai_model", None),
         image_model=getattr(settings, "image_model", None),
-        temperature=float(getattr(settings, "openai_temperature", 0.2)),
+        temperature=getattr(settings, "openai_temperature", 0.2),
         enable_image_generation=bool(getattr(settings, "enable_image_generation", True)),
-        settings=settings,  # чтобы работали whitelist/denylist и др.
     )
 
-    # Telegram app
-    app = Application.builder().token(settings.telegram_bot_token).build()
-
-    # Устанавливаем все handlers и сервисы
+    # 3) Telegram bot (handlers + колбэк post_init)
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
+
+    # 4) PTB Application + правильная регистрация post_init ЧЕРЕЗ BUILDER!
+    app = (
+        ApplicationBuilder()
+        .token(settings.telegram_bot_token)
+        .post_init(bot._post_init)  # ВАЖНО: post_init задаётся на BUILDER, а не вызывается у Application!
+        .concurrent_updates(True)
+        .build()
+    )
+
+    # 5) Регистрируем все хэндлеры
     bot.install(app)
 
     return app
 
-
-def main() -> None:
-    _acquire_advisory_lock()
-
-    app = build_application()
-
-    logger.info("🚀 Бот запускается (run_polling)...")
-    # run_polling — синхронный метод-обёртка, сам управляет asyncio-циклом
-    app.run_polling(
-        allowed_updates=None,  # можно ограничить типы апдейтов при необходимости
-        stop_signals=None,     # используем дефолтную обработку сигналов
-        poll_interval=1.0,
-        timeout=10,
-        drop_pending_updates=False,
-    )
-
+def main():
+    logger.info("🔒 Advisory-lock получен. Запускаем бота.")
+    async def _run():
+        async with advisory_lock(LOCK_FILE):
+            app = build_application()
+            logger.info("🚀 Бот запускается (run_polling)...")
+            await app.run_polling(allowed_updates=["message", "edited_message", "callback_query"])
+    asyncio.run(_run())
 
 if __name__ == "__main__":
     main()
