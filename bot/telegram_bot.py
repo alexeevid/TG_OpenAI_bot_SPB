@@ -73,7 +73,7 @@ def only_allowed(func):
     @wraps(func)
     async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else None
-        # Если allowed пустой — доступ всем
+        # Если allowed пуст — доступ всем
         if self.allowed and uid not in self.allowed:
             await update.effective_message.reply_text("⛔ Доступ ограничен.")
             return
@@ -92,13 +92,33 @@ STYLE_LABELS = {
 def style_system_hint(style: str):
     s = (style or "pro").lower()
     if s == "pro":
-        return ("Отвечай как высокопрофессиональный консультант. Максимально точно, лаконично, по делу, без воды.", 0.2)
+        return (
+            "Роль: консультант уровня Principal (15+ лет практики). "
+            "Отвечай кратко и структурно: 1) контекст; 2) ключевые выводы; 3) чёткие шаги; 4) риски и зависимости. "
+            "Избегай воды и общих слов. Если есть недостаток данных — уточни 1–3 конкретных вопроса.",
+            0.2,
+        )
     if s == "expert":
-        return ("Отвечай как эксперт-практик с глубокими знаниями темы. Приводи точные формулировки и причинно-следственные связи.", 0.3)
+        return (
+            "Роль: эксперт-практик по теме. "
+            "Дай глубокое объяснение: механики, формулы, примеры применения, ограничения. "
+            "Построй причинно-следственную логику, перечисли подводные камни, предложи альтернативы.",
+            0.3,
+        )
     if s == "user":
-        return ("Объясняй просто, как обычный опытный пользователь. Можешь давать примеры и чуть более разговорный стиль.", 0.6)
+        return (
+            "Роль: продвинутый пользователь. "
+            "Объясняй просто и понятно, без профессионального жаргона. "
+            "Используй аналогии и короткие примеры. Цель — чтобы понял человек без спецподготовки.",
+            0.6,
+        )
     if s == "ceo":
-        return ("Отвечай как собственник бизнеса (EMBA/DBA): стратегия, ROI, риски, ресурсы, влияние на оргдизайн и культуру.", 0.25)
+        return (
+            "Роль: собственник бизнеса (уровень EMBA/DBA). "
+            "Фокус: стратегия, юнит-экономика, ROI/IRR, ресурсные ограничения, оргдизайн, риски и приоритеты. "
+            "Ответ формулируй как управленческое решение: цель → метрики → план → риски → контрольные точки.",
+            0.25,
+        )
     return ("Отвечай профессионально и по делу.", 0.3)
 
 
@@ -106,8 +126,17 @@ class ChatGPTTelegramBot:
     def __init__(self, openai: OpenAIHelper, settings: Settings):
         self.openai = openai
         self.settings = settings
-        self.allowed = set(settings.allowed_set) if settings.allowed_set else set()
-        self.admins = set(settings.admin_set) if settings.admin_set else set()
+        # Поддерживаем оба варианта имён полей (как в вашем окружении)
+        self.allowed = set(
+            getattr(settings, "allowed_set", None)
+            or getattr(settings, "allowed_user_ids", None)
+            or []
+        )
+        self.admins = set(
+            getattr(settings, "admin_set", None)
+            or getattr(settings, "admin_user_ids", None)
+            or []
+        )
 
     # ---------- Wiring ----------
     def install(self, app: Application):
@@ -224,6 +253,9 @@ class ChatGPTTelegramBot:
             "Привет! Я готов к работе.\n"
             "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode, /web, /del, /reload_menu"
         )
+        # сбросим возможные флаги режимов
+        context.user_data.pop("await_kb_upload", None)
+        context.user_data.pop("incoming_locals", None)
 
     @only_allowed
     async def on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -253,6 +285,8 @@ class ChatGPTTelegramBot:
         await update.message.reply_text("🔄 Новый диалог создан. Контекст очищен.")
         # Сбрасываем только временные состояния; выбранные документы и персональную модель НЕ трогаем
         context.user_data.pop("await_password_for", None)
+        context.user_data.pop("await_kb_upload", None)
+        context.user_data.pop("incoming_locals", None)
 
     @only_allowed
     async def on_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -325,6 +359,7 @@ class ChatGPTTelegramBot:
         models_all = self.openai.list_models()
         current = context.user_data.get("model", self.openai.model)
 
+        # у вас в окружении: ALLOWED_MODELS_WHITELIST, DENYLIST_MODELS
         allow_list = getattr(self.settings, "allowed_models_whitelist", [])
         deny_list = getattr(self.settings, "denylist_models", [])
         allow = set(m.lower() for m in allow_list) if allow_list else None
@@ -602,6 +637,40 @@ class ChatGPTTelegramBot:
                 "Команда для выхода: /cancelupload"
             )
 
+        elif data.startswith("kb_upload_local:"):
+            # Загрузка конкретного только что присланного файла в БЗ по кнопке
+            if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
+                await q.edit_message_text("⛔ Доступно только администратору.")
+                return
+            stash_key = data.split(":", 1)[1]
+            stash = context.user_data.get("incoming_locals", {}) or {}
+            item = stash.get(stash_key)
+            if not item:
+                await q.edit_message_text("Файл не найден в локальном буфере. Отправьте его ещё раз.")
+                return
+            local = item.get("path")
+            filename = (item.get("filename") or os.path.basename(local) or "file.bin")
+            try:
+                # Загрузка на Диск
+                y = yadisk.YaDisk(token=self.settings.yandex_disk_token)
+                root = self.settings.yandex_root_path.strip()
+                if not root.startswith("/"):
+                    root = "/" + root
+                remote = f"disk:{root}/{filename}"
+                y.upload(local_path=local, path=remote, overwrite=True)
+                await q.edit_message_text(f"📥 Загружено в БЗ: {remote}\nЗапускаю синхронизацию…")
+                await self._kb_sync_internal(update, context)
+            except Exception as e:
+                await q.edit_message_text(f"Ошибка загрузки в БЗ: {e}")
+                logger.exception("KB upload(local) failed: %s", e)
+                return
+            finally:
+                with suppress(Exception):
+                    os.unlink(local)
+                with suppress(Exception):
+                    stash.pop(stash_key, None)
+                    context.user_data["incoming_locals"] = stash
+
         # --- Models / Modes / Dialog navigation ---
         elif data.startswith("set_model:"):
             m = data.split(":", 1)[1]
@@ -774,65 +843,61 @@ class ChatGPTTelegramBot:
         voice = update.message.voice
         if not voice:
             return
-        file = await context.bot.get_file(voice.file_id)
 
-        # Сохраняем во временный .ogg (Telegram voice = OGG/Opus)
+        # 1) Скачиваем voice как .ogg
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tf:
             tmp_ogg = tf.name
         try:
+            file = await context.bot.get_file(voice.file_id)
             await file.download_to_drive(custom_path=tmp_ogg)
         except Exception as e:
             await update.message.reply_text(f"Не удалось скачать голосовое: {e}")
+            with suppress(Exception):
+                os.unlink(tmp_ogg)
             return
 
-        # Пытаемся распознать
-        text: Optional[str] = None
+        # 2) Распознаём (показываем «печатает…», НЕ «записывает голос»)
         try:
             async with ChatActionSender(
-                action=ChatAction.RECORD_VOICE,
+                action=ChatAction.TYPING,
                 chat_id=update.effective_chat.id,
                 bot=context.bot,
             ):
                 text = await asyncio.to_thread(self.openai.transcribe, tmp_ogg)
-        except Exception:
-            # fallback: mp3 через pydub (требует ffmpeg)
-            try:
-                from pydub import AudioSegment
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf2:
-                    tmp_mp3 = tf2.name
-                audio = AudioSegment.from_file(tmp_ogg)
-                audio.export(tmp_mp3, format="mp3")
-                async with ChatActionSender(
-                    action=ChatAction.RECORD_VOICE,
-                    chat_id=update.effective_chat.id,
-                    bot=context.bot,
-                ):
-                    text = await asyncio.to_thread(self.openai.transcribe, tmp_mp3)
-                os.unlink(tmp_mp3)
-            except Exception as e2:
-                await update.message.reply_text(
-                    "Не удалось распознать голосовое. "
-                    "Попробуйте прислать файл в формате mp3/m4a/wav или установите ffmpeg в образ."
-                )
-                logger.exception("Voice STT failed: %s", e2)
-                with suppress(Exception):
-                    os.unlink(tmp_ogg)
-                return
+        except Exception as e:
+            await update.message.reply_text(
+                "Не удалось распознать голосовое. "
+                "Попробуйте прислать файл в формате mp3/m4a/wav. "
+                f"Техническая деталь: {e}"
+            )
+            with suppress(Exception):
+                os.unlink(tmp_ogg)
+            return
+        finally:
+            with suppress(Exception):
+                os.unlink(tmp_ogg)
 
-        with suppress(Exception):
-            os.unlink(tmp_ogg)
+        # 3) Показать, что распознали
+        await update.message.reply_text(f"🗣️ Вы сказали:\n{(text or '').strip()}")
 
-        if text:
-            update.message.text = text
-            await self.on_text(update, context)
+        # 4) Сгенерировать ответ как на обычный текст
+        update.message.text = text or ""
+        await self.on_text(update, context)
 
     # ---------- Photos/Documents ----------
     @only_allowed
     async def on_file_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Если активирован режим загрузки в БЗ — принимаем файлы
-        awaiting_upload = context.user_data.get("await_kb_upload")
+        """
+        Поведение:
+        - Если включён режим "📥 Добавить из чата" и пользователь — админ: загружаем на Я.Диск и синхронизируем БЗ.
+        - Иначе:
+            • Для фото: делаем краткий анализ (Vision) и показываем результат.
+            • Для документов: показываем метаданные (имя, тип, размер) + предлагаем кнопкой добавить в БЗ (только админам).
+        """
         is_admin = (not self.admins) or (update.effective_user and update.effective_user.id in self.admins)
+        awaiting_upload = bool(context.user_data.get("await_kb_upload"))
 
+        # --- Ветка явной загрузки в БЗ ---
         if awaiting_upload and is_admin:
             try:
                 saved, remote = await self._save_incoming_to_yadisk(update, context)
@@ -843,8 +908,82 @@ class ChatGPTTelegramBot:
                 logger.exception("KB upload failed: %s", e)
             return
 
-        tip = "Чтобы добавить в БЗ, откройте /kb → «📥 Добавить из чата» (доступно администратору)."
-        await update.message.reply_text(tip)
+        # --- Аналитика (no-upload mode) ---
+        # ФОТО → Vision-анализ
+        if update.message.photo:
+            # скачиваем фото локально
+            ph = update.message.photo[-1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
+                local = tf.name
+            try:
+                file = await context.bot.get_file(ph.file_id)
+                await file.download_to_drive(custom_path=local)
+
+                detail = getattr(self.settings, "vision_detail", None) or None
+                model = getattr(self.settings, "vision_model", None) or self.openai.model
+
+                async with ChatActionSender(
+                    action=ChatAction.TYPING,
+                    chat_id=update.effective_chat.id,
+                    bot=context.bot,
+                ):
+                    analysis = await asyncio.to_thread(
+                        self.openai.analyze_image,
+                        local,
+                        prompt="Суммаризируй, что на фото: ключевые объекты, текст (если есть), возможные риски/аномалии.",
+                        model=model,
+                        detail=detail,
+                        max_tokens=int(getattr(self.settings, "vision_max_tokens", 600) or 600),
+                    )
+                await update.message.reply_text(f"🖼️ Анализ изображения:\n{analysis}")
+            except Exception as e:
+                await update.message.reply_text(f"Не удалось проанализировать фото: {e}")
+            finally:
+                with suppress(Exception):
+                    os.unlink(local)
+            return
+
+        # ДОКУМЕНТЫ → показать метаданные + предложить добавить в БЗ (кнопкой)
+        if update.message.document:
+            doc = update.message.document
+            size_mb = (doc.file_size or 0) / (1024 * 1024.0)
+            info = (
+                f"Документ получен:\n"
+                f"• Название: {doc.file_name or '(без имени)'}\n"
+                f"• Тип: {doc.mime_type or 'unknown'}\n"
+                f"• Размер: {size_mb:.2f} МБ"
+            )
+
+            # Скачаем локально, чтобы при желании можно было загрузить в БЗ по кнопке
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(doc.file_name or '')[1] or ".bin") as tf:
+                local = tf.name
+            try:
+                file = await context.bot.get_file(doc.file_id)
+                await file.download_to_drive(custom_path=local)
+            except Exception as e:
+                await update.message.reply_text(info + f"\n\n(Не удалось скачать для дальнейших действий: {e})")
+                with suppress(Exception):
+                    os.unlink(local)
+                return
+
+            # Сохраним путь во временное хранилище пользователя, чтобы кнопка могла его использовать
+            stash = context.user_data.get("incoming_locals", {})
+            stash_key = doc.file_unique_id
+            stash[stash_key] = {"path": local, "filename": doc.file_name}
+            context.user_data["incoming_locals"] = stash
+
+            # Кнопка "Добавить в БЗ" показывается только админу
+            if is_admin:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📥 Добавить в БЗ", callback_data=f"kb_upload_local:{stash_key}")],
+                ])
+                await update.message.reply_text(info + "\n\nДобавить файл в БЗ?", reply_markup=kb)
+            else:
+                await update.message.reply_text(info + "\n\nЧтобы добавить файл в БЗ, обратитесь к администратору или используйте /kb.")
+            return
+
+        # Иное вложение
+        await update.message.reply_text("Вложение получено. Чтобы добавить в БЗ — откройте /kb → «📥 Добавить из чата».")
 
     async def _save_incoming_to_yadisk(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
         """
