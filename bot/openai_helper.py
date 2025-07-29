@@ -48,7 +48,7 @@ class OpenAIHelper:
       - chat (Responses API)
       - transcribe (whisper-1)
       - image generation (gpt-image-1 / dall-e-3)
-      - простой web_search (DuckDuckGo HTML с парсингом ссылок)
+      - web_search (DuckDuckGo HTML)
       - хранение текущей модели и стиля per-chat
     """
 
@@ -75,13 +75,47 @@ class OpenAIHelper:
     # ---------- MODELS ----------
 
     def list_models_with_current(self, chat_id: int) -> Tuple[List[str], str]:
+        """
+        Возвращает (список доступных моделей, текущая).
+        Пытаемся получить «все» с API и отфильтровать под чат.
+        Применяем ALLOWED/DENY из окружения, если заданы.
+        """
         allow = _json_list_from_env("ALLOWED_MODELS_WHITELIST", [])
         deny = set(_json_list_from_env("DENYLIST_MODELS", []))
         current = self.get_current_model(chat_id)
-        # если whitelist пуст — даём несколько адекватных дефолтов
-        base = allow or ["gpt-4o", "gpt-4o-mini", "gpt-4", "o4-mini", "gpt-4.1-mini"]
-        models = [m for m in base if m not in deny]
-        return models, current
+
+        names: List[str] = []
+        try:
+            resp = self.client.models.list()
+            # resp.data — список объектов с полем id
+            for m in getattr(resp, "data", []) or []:
+                mid = getattr(m, "id", "")
+                if not mid:
+                    continue
+                low = mid.lower()
+                # отсекаем нечатовые и служебные
+                if any(x in low for x in ["embedding", "whisper", "tts", "audio", "omni-moderation", "clip"]):
+                    continue
+                # оставляем семейства чатовых
+                if any(x in low for x in ["gpt-4", "gpt-4o", "gpt-4.1", "o1", "o3", "o4"]):
+                    names.append(mid)
+            # сортируем по имени
+            names = sorted(set(names))
+        except Exception:
+            names = []
+
+        if not names:
+            # Фоллбек, если API моделей недоступен
+            base = allow or ["gpt-4o", "gpt-4o-mini", "gpt-4", "o4-mini", "o3-mini", "o1-mini"]
+            models = [m for m in base if m not in deny]
+            return models, current
+
+        # применим allow/deny при наличии
+        if allow:
+            names = [n for n in names if n in allow]
+        names = [n for n in names if n not in deny]
+
+        return names, current
 
     def set_current_model(self, chat_id: int, model: str) -> None:
         self._per_chat_model[chat_id] = model
@@ -154,14 +188,12 @@ class OpenAIHelper:
             input=prompt,
             temperature=self.default_temperature,
         )
-        # В SDK 1.x ответ лежит в content[0].text
         try:
-            return cc.output_text  # у unified responses есть это свойство
+            return cc.output_text
         except Exception:
             pass
 
         try:
-            # на всякий
             if cc and cc.output and len(cc.output) > 0:
                 block = cc.output[0]
                 if getattr(block, "content", None):
@@ -169,7 +201,6 @@ class OpenAIHelper:
         except Exception:
             pass
 
-        # более общий разбор
         try:
             if cc and cc.choices and len(cc.choices) > 0:
                 msg = cc.choices[0].message
@@ -186,7 +217,6 @@ class OpenAIHelper:
         """
         Whisper-1 транскрипция.
         """
-        # Записываем во временный файл, чтобы SDK корректно понял mimetype
         with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename_hint)[-1] or ".ogg") as f:
             f.write(audio_bytes)
             f.flush()
@@ -196,7 +226,6 @@ class OpenAIHelper:
                 file=f,
                 response_format="text",
             )
-        # SDK 1.x может вернуть str
         return str(tr)
 
     # ---------- IMAGES ----------
@@ -219,12 +248,10 @@ class OpenAIHelper:
                 return None, prompt
 
             item = res.data[0]
-            # base64?
             b64 = getattr(item, "b64_json", None)
             if b64:
                 return base64.b64decode(b64), prompt
 
-            # url?
             url = getattr(item, "url", None)
             if url:
                 bx = httpx.get(url, timeout=60.0)
@@ -238,7 +265,6 @@ class OpenAIHelper:
             if img:
                 return GenImageResult(img, pr, primary)
         except Exception:
-            # пробуем fallback
             pass
 
         img, pr = _call(fallback)
@@ -251,25 +277,30 @@ class OpenAIHelper:
     def web_search(self, query: str, limit: int = 3) -> List[Dict[str, str]]:
         """
         Простая выдача ссылок через DuckDuckGo HTML без ключей.
-        Парсинг по regex — без внешних зависимостей.
+        Исправлен 302 редирект (html.duckduckgo.com) + User-Agent.
         """
-        url = "https://duckduckgo.com/html"
-        r = httpx.get(url, params={"q": query}, timeout=20.0)
+        url = "https://html.duckduckgo.com/html"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        }
+        r = httpx.get(
+            url,
+            params={"q": query},
+            headers=headers,
+            timeout=20.0,
+            follow_redirects=True,
+        )
         r.raise_for_status()
         html = r.text
 
-        # Ищем блоки результатов <a class="result__a" href="...">Title</a>
-        # DDG может менять разметку, поэтому держим это как best-effort
+        # duckduckgo html: <a class="result__a" href="...">Title</a>
         pat = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
         results: List[Dict[str, str]] = []
         for m in pat.finditer(html):
             href = m.group(1)
             title = re.sub("<.*?>", "", m.group(2))  # вычищаем теги
-            # Сниппет возьмём из соседнего result__snippet, если найдём
-            # (упрощённо, без тяжёлых парсеров)
-            snippet = ""
-            # ограничимся ссылкой и заголовком
-            results.append({"title": title.strip(), "url": href, "snippet": snippet})
+            results.append({"title": title.strip(), "url": href, "snippet": ""})
             if len(results) >= limit:
                 break
         return results
