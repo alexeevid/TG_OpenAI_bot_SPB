@@ -1,63 +1,55 @@
+# bot/main.py
+from __future__ import annotations
+
 import logging
-from telegram.ext import ApplicationBuilder, MessageHandler, filters
-from sqlalchemy import text
+
+from telegram import Update
+from telegram.ext import Application
 
 from bot.config import load_settings
-from bot.telegram_bot import ChatGPTTelegramBot
 from bot.openai_helper import OpenAIHelper
-from bot.db.session import init_db, engine  # <- берем engine для advisory-lock
-from bot.db.models import Base
+from bot.telegram_bot import ChatGPTTelegramBot
 
-logging.basicConfig(level=logging.INFO)
+
 logger = logging.getLogger(__name__)
 
-LOCK_KEY = 751234567890123456  # любой фиксированный bigint < 9.22e18
 
-def ensure_singleton_or_exit():
-    """Гарантируем запуск только одного инстанса через pg_try_advisory_lock."""
-    try:
-        with engine.begin() as conn:
-            got = conn.scalar(text("SELECT pg_try_advisory_lock(:k)"), {"k": LOCK_KEY})
-            if not got:
-                logger.error("🛑 Найден другой запущенный инстанс (advisory-lock). Завершение.")
-                raise SystemExit(0)
-        logger.info("🔒 Advisory-lock получен. Запускаем бота.")
-    except Exception as e:
-        logger.error(f"Ошибка при попытке захватить advisory-lock: {e}")
-        # На всякий случай завершаем, чтобы не плодить дубли
-        raise SystemExit(1)
-
-def build_application():
+def build_application() -> Application:
     settings = load_settings()
-    # Инициализация схемы БД (создаст таблицы при первом запуске)
-    init_db(Base)
 
-    app = ApplicationBuilder().token(settings.telegram_bot_token).build()
-
-    # OpenAI + Бот
+    # Создаём OpenAI helper с новыми именами параметров.
     openai = OpenAIHelper(
         api_key=settings.openai_api_key,
-        model=settings.openai_model,                 # дефолтная текстовая модель (например, "gpt-4o")
-        image_primary=settings.image_model,          # дефолт для /img (например, "gpt-image-1")
-        image_fallback="dall-e-3",                   # запасная на случай 403/нет доступа
-        stt_model=getattr(settings, "stt_model", "gpt-4o-mini-transcribe"),  # для голосовых
+        model=getattr(settings, "openai_model", None),
+        image_model=getattr(settings, "image_model", None),  # вместо image_primary
+        temperature=getattr(settings, "openai_temperature", 0.2),
+        enable_image_generation=bool(getattr(settings, "enable_image_generation", True)),
     )
+
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
 
-    # Если у бота есть install(app) — используем её
-    try:
-        bot.install(app)  # внутри должны регистрироваться все handlers
-    except AttributeError:
-        # Фолбэк: базовый обработчик текста
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
+    app = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .concurrent_updates(True)
+        .build()
+    )
 
+    bot.install(app)
     return app
 
+
 def main():
-    ensure_singleton_or_exit()
+    logging.basicConfig(
+        level=getattr(logging, "INFO", logging.INFO),
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
+    logger.info("🔒 Advisory-lock получен. Запускаем бота.")
     app = build_application()
     logger.info("🚀 Бот запускается (run_polling)...")
-    app.run_polling(allowed_updates=None)
+    # allowed_updates=Update.ALL_TYPES — чтобы обрабатывать voice/photo/docs
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
