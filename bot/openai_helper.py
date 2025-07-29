@@ -1,6 +1,6 @@
 import logging
 from typing import List, Optional, Tuple, Dict, Any
-from base64 import b64decode
+from base64 import b64decode, b64encode
 
 from openai import OpenAI
 from openai import APIError, APIConnectionError, BadRequestError, PermissionDeniedError
@@ -12,11 +12,12 @@ class OpenAIHelper:
     """
     Обёртка над OpenAI SDK.
     Поддерживает:
-      - chat (Chat Completions)
-      - list_models()
-      - generate_image()  — генерация изображений (gpt-image-1 / dall-e-3)
-      - transcribe()      — STT (Speech-to-Text)
-      - answer_with_web() — Responses API + web_search
+      - chat()                — диалог (Chat Completions)
+      - list_models()         — список моделей
+      - generate_image()      — генерация изображений (gpt-image-1 / dall-e-3)
+      - transcribe()          — STT (Speech-to-Text)
+      - analyze_image()       — Vision-анализ фото/изображений
+      - answer_with_web()     — Responses API + web_search
     """
 
     def __init__(
@@ -135,6 +136,52 @@ class OpenAIHelper:
         except Exception as e:
             logger.exception("STT failed: %s", e)
             raise
+
+    # -------- Vision: анализ изображения --------
+    def analyze_image(
+        self,
+        file_path: str,
+        *,
+        prompt: Optional[str] = None,
+        model: Optional[str] = None,
+        detail: Optional[str] = None,          # 'low' | 'high' (если указано)
+        max_tokens: int = 600,
+    ) -> str:
+        """
+        Анализ изображения через Responses API.
+        Возвращает текстовое описание/резюме.
+        """
+        use_model = model or self.model or "gpt-4o"
+        try:
+            with open(file_path, "rb") as f:
+                b64 = b64encode(f.read()).decode("ascii")
+
+            img_obj: Dict[str, Any] = {"type": "input_image", "image_data": b64}
+            if detail:
+                img_obj["detail"] = detail  # поддерживается не всеми моделями; если нет — тихо игнорится
+
+            content = [
+                img_obj,
+                {"type": "text", "text": prompt or "Опиши изображение, выдели ключевые объекты, текст и возможные риски/аномалии."},
+            ]
+
+            resp = self.client.responses.create(
+                model=use_model,
+                input=[{"role": "user", "content": content}],
+                max_output_tokens=max_tokens,
+            )
+
+            # Соберём текст из output
+            chunks: List[str] = []
+            for out in getattr(resp, "output", []) or []:
+                if getattr(out, "type", None) == "message":
+                    for c in getattr(out, "content", []) or []:
+                        if getattr(c, "type", None) == "output_text" and getattr(c, "text", None):
+                            chunks.append(c.text)
+            return "\n".join(chunks).strip() or "Описание недоступно."
+        except Exception as e:
+            logger.exception("analyze_image failed: %s", e)
+            return f"Не удалось проанализировать изображение: {e}"
 
     # -------- Responses + Web Search --------
     def answer_with_web(self, prompt: str, *, model: Optional[str] = None) -> Tuple[str, List[Dict[str, str]]]:
