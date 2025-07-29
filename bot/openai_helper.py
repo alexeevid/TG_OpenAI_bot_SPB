@@ -1,306 +1,426 @@
+# bot/openai_helper.py
 from __future__ import annotations
 
 import base64
-import io
+import json
+import logging
+import mimetypes
 import os
 import re
-import tempfile
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse, urljoin, unquote
 
 import httpx
+from openai import OpenAI
 
-try:
-    # OpenAI SDK v1.x
-    from openai import OpenAI
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+logger = logging.getLogger(__name__)
 
 
-def _json_list_from_env(name: str, default: Optional[List[str]] = None) -> List[str]:
-    """
-    Безопасный парсер JSON-массивов из переменных окружения.
-    Допускает пустые/невалидные значения → возвращает default или [].
-    """
-    import json
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return list(default or [])
-    try:
-        val = json.loads(raw)
-        if isinstance(val, list):
-            return [str(x) for x in val]
-        return list(default or [])
-    except Exception:
-        return list(default or [])
-
+# ----------------------------- Вспомогательные типы ---------------------------
 
 @dataclass
-class GenImageResult:
-    image_bytes: bytes
-    final_prompt: str
-    model_used: str
+class SettingsLike:
+    """Мини-интерфейс для настроек. Реальный Settings может содержать больше полей."""
+    openai_api_key: str
+    openai_model: Optional[str] = None
+    image_model: Optional[str] = None
+    openai_temperature: float = 0.2
+    enable_image_generation: bool = True
+    allowed_models_whitelist: Optional[List[str]] = None
+    denylist_models: Optional[List[str]] = None
 
+
+# ------------------------------- Основной хелпер ------------------------------
 
 class OpenAIHelper:
     """
-    Единая обёртка поверх OpenAI:
-      - chat (Responses API)
-      - transcribe (whisper-1)
-      - image generation (gpt-image-1 / dall-e-3)
-      - web_search (DuckDuckGo HTML)
-      - хранение текущей модели и стиля per-chat
+    Утилита работы с OpenAI и внешними функциями (поиск, транскрибация, т.п.)
+    Совместима с openai==1.x.
+
+    Важно: чат реализован через Chat Completions API, чтобы избежать ошибок Responses API
+    вида 'got an unexpected keyword argument "messages"'.
     """
 
     def __init__(
         self,
-        api_key: str,
-        default_model: str = "gpt-4o",
-        default_temperature: float = 0.2,
-        image_primary: str = "gpt-image-1",
-        image_fallback: str = "dall-e-3",
-    ):
-        if OpenAI is None:
-            raise RuntimeError("OpenAI SDK не установлен.")
-        self.client = OpenAI(api_key=api_key)
-        self.default_model = default_model
-        self.default_temperature = default_temperature
-        self.image_primary = image_primary
-        self.image_fallback = image_fallback
+        api_key: Optional[str] = None,
+        default_model: Optional[str] = None,
+        image_model: Optional[str] = None,
+        temperature: float = 0.2,
+        enable_image_generation: bool = True,
+        settings: Optional[SettingsLike] = None,
+    ) -> None:
+        # Источник параметров: явные аргументы имеют приоритет, затем settings, затем ENV
+        if settings is not None and not api_key:
+            api_key = getattr(settings, "openai_api_key", None)
 
-        # per-chat настройки
-        self._per_chat_model: Dict[int, str] = {}
-        self._per_chat_style: Dict[int, str] = {}  # pro|expert|user|ceo
+        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
 
-    # ---------- MODELS ----------
+        self.default_model: str = (
+            default_model
+            or (getattr(settings, "openai_model", None) if settings else None)
+            or os.getenv("OPENAI_MODEL")
+            or "gpt-4o"
+        )
+        self.default_image_model: str = (
+            image_model
+            or (getattr(settings, "image_model", None) if settings else None)
+            or os.getenv("IMAGE_MODEL")
+            or "dall-e-3"
+        )
+        self.temperature: float = (
+            temperature
+            if temperature is not None
+            else (getattr(settings, "openai_temperature", 0.2) if settings else 0.2)
+        )
+        self.enable_image_generation: bool = (
+            enable_image_generation
+            if enable_image_generation is not None
+            else bool(getattr(settings, "enable_image_generation", True) if settings else True)
+        )
 
-    def list_models_with_current(self, chat_id: int) -> Tuple[List[str], str]:
-        """
-        Возвращает (список доступных моделей, текущая).
-        Пытаемся получить «все» с API и отфильтровать под чат.
-        Применяем ALLOWED/DENY из окружения, если заданы.
-        """
-        allow = _json_list_from_env("ALLOWED_MODELS_WHITELIST", [])
-        deny = set(_json_list_from_env("DENYLIST_MODELS", []))
-        current = self.get_current_model(chat_id)
+        self.allowed_models_whitelist: Optional[List[str]] = (
+            getattr(settings, "allowed_models_whitelist", None) if settings else None
+        )
+        self.denylist_models: Optional[List[str]] = (
+            getattr(settings, "denylist_models", None) if settings else None
+        )
 
-        names: List[str] = []
+        # Пользовательские модели на уровне пользователя (переключение через /model)
+        self._user_models: Dict[int, str] = {}
+
+    # ------------------------------- Модели -----------------------------------
+
+    def list_models_for_user(self, user_id: int) -> List[str]:
+        """Вернёт список моделей с учётом whitelist/denylist (если заданы)."""
         try:
-            resp = self.client.models.list()
-            # resp.data — список объектов с полем id
-            for m in getattr(resp, "data", []) or []:
-                mid = getattr(m, "id", "")
-                if not mid:
-                    continue
-                low = mid.lower()
-                # отсекаем нечатовые и служебные
-                if any(x in low for x in ["embedding", "whisper", "tts", "audio", "omni-moderation", "clip"]):
-                    continue
-                # оставляем семейства чатовых
-                if any(x in low for x in ["gpt-4", "gpt-4o", "gpt-4.1", "o1", "o3", "o4"]):
-                    names.append(mid)
-            # сортируем по имени
-            names = sorted(set(names))
-        except Exception:
-            names = []
+            models = [m.id for m in self.client.models.list().data]
+        except Exception as e:
+            logger.warning("Не удалось получить список моделей у OpenAI: %s", e)
+            # Фолбэк на разумный набор
+            models = [
+                "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini",
+                "o3-mini", "o1-mini", "o4-mini",
+            ]
 
-        if not names:
-            # Фоллбек, если API моделей недоступен
-            base = allow or ["gpt-4o", "gpt-4o-mini", "gpt-4", "o4-mini", "o3-mini", "o1-mini"]
-            models = [m for m in base if m not in deny]
-            return models, current
+        # Фильтруем по whitelist/denylist
+        if self.allowed_models_whitelist:
+            allowed_set = set(self.allowed_models_whitelist)
+            models = [m for m in models if m in allowed_set]
+        if self.denylist_models:
+            deny = set(self.denylist_models)
+            models = [m for m in models if m not in deny]
 
-        # применим allow/deny при наличии
-        if allow:
-            names = [n for n in names if n in allow]
-        names = [n for n in names if n not in deny]
+        # Оставляем только чатовые/универсальные
+        keep_keywords = ("gpt", "o1", "o3", "o4")
+        models = [m for m in models if any(k in m for k in keep_keywords)]
 
-        return names, current
+        # Упорядочим поверхностно (чтобы дефолтная оказалась первой)
+        def _score(mid: str) -> int:
+            return 0 if mid == self.default_model else 1
+        models.sort(key=_score)
 
-    def set_current_model(self, chat_id: int, model: str) -> None:
-        self._per_chat_model[chat_id] = model
+        # И уберём дубликаты, сохраняя порядок
+        seen = set()
+        unique: List[str] = []
+        for m in models:
+            if m not in seen:
+                unique.append(m)
+                seen.add(m)
+        return unique[:40]  # не раздуваем инлайн‑клавиатуру
 
-    def get_current_model(self, chat_id: int) -> str:
-        return self._per_chat_model.get(chat_id, self.default_model)
+    def set_user_model(self, user_id: int, model: str) -> None:
+        self._user_models[user_id] = model
 
-    # ---------- STYLES ----------
+    def get_user_model(self, user_id: int) -> Optional[str]:
+        return self._user_models.get(user_id)
 
-    STYLES_SYS_PROMPT: Dict[str, str] = {
-        "pro": (
-            "Отвечай как высококвалифицированный профессионал с большим опытом. "
-            "Пиши кратко, точно, выверенно, без воды, с ясной структурой."
-        ),
-        "expert": (
-            "Отвечай как эксперт с глубокими знаниями предметной области. "
-            "Давай развернутые объяснения, сравнения, аргументацию, упоминания методик и терминов."
-        ),
-        "user": (
-            "Отвечай простым, человечным языком, избегай сложных терминов. "
-            "Представь, что объясняешь другу-пользователю без спецподготовки."
-        ),
-        "ceo": (
-            "Отвечай как собственник бизнеса уровня EMBA/DBA. "
-            "Фокусируйся на стратегии, рисках, экономике и эффектах для бизнеса."
-        ),
-    }
+    def get_image_model(self) -> str:
+        return self.default_image_model
 
-    def set_style(self, chat_id: int, style: str) -> None:
-        style = style.lower()
-        if style not in self.STYLES_SYS_PROMPT:
-            style = "pro"
-        self._per_chat_style[chat_id] = style
+    # -------------------------------- Чат ------------------------------------
 
-    def get_style(self, chat_id: int) -> str:
-        return self._per_chat_style.get(chat_id, "pro")
-
-    # ---------- CHAT ----------
-
-    def _compose_input(self, sys_hint: Optional[str], user_text: str) -> str:
-        """
-        Responses API принимает plain input. Формируем "префикс" для system.
-        """
-        if sys_hint:
-            return f"[SYSTEM]\n{sys_hint}\n\n{user_text}"
-        return user_text
+    def _style_to_system(self, style: str) -> str:
+        style = (style or "Pro").lower()
+        if style == "pro":
+            return (
+                "Отвечай как высококвалифицированный профессионал. Пиши кратко, точно, "
+                "по делу, с акцентом на практические выводы и корректные термины."
+            )
+        if style == "expert":
+            return (
+                "Отвечай как эксперт с глубокими знаниями в теме. Объясняй детали, "
+                "приводи аргументацию, указывай ограничения и нюансы."
+            )
+        if style == "user":
+            return (
+                "Отвечай просто и понятно, как обычный опытный пользователь. "
+                "Избегай перегруза терминами, делай ответ дружелюбным."
+            )
+        if style == "ceo":
+            return (
+                "Отвечай голосом собственника бизнеса (уровень EMBA/DBA): акцент на стратегию, "
+                "ценность, риски, метрики, влияние на прибыль и организацию."
+            )
+        return "Будь полезным и точным."
 
     def chat(
         self,
-        chat_id: int,
-        text: str,
-        kb_snippets: Optional[str] = None,
+        user_id: int,
+        dialog_id: int,
+        user_text: str,
+        model: Optional[str] = None,
+        style: str = "Pro",
+        kb: Optional[Iterable[Tuple[int, str]]] = None,
     ) -> str:
         """
-        Генерация ответа. Если есть сниппеты БЗ — подмешиваем в system.
+        Основной диалог. Если переданы kb, добавляет выдержки в системный контекст.
         """
-        model = self.get_current_model(chat_id)
-        style = self.get_style(chat_id)
-        sys_hint = self.STYLES_SYS_PROMPT.get(style, "")
+        use_model = model or self.get_user_model(user_id) or self.default_model
 
-        if kb_snippets:
-            sys_hint = (sys_hint + "\n\n"
-                        "Учитывай следующие выдержки из документов базы знаний:\n"
-                        f"{kb_snippets}").strip()
+        system_parts = [self._style_to_system(style)]
+        if kb:
+            # Сформируем короткий контекст из БЗ (ограничим размер)
+            ctx_parts: List[str] = []
+            budget = 2500  # символов на БЗ
+            for _, chunk in kb:
+                if budget <= 0:
+                    break
+                add = chunk[: min(len(chunk), budget)]
+                ctx_parts.append(add)
+                budget -= len(add)
+            kb_text = "\n\n".join(ctx_parts)
+            if kb_text:
+                system_parts.append(
+                    "Используй приведённые выдержки из базы знаний как главный источник фактов. "
+                    "Если информация отсутствует — отвечай по общим знаниям, но явно пометь это."
+                )
+                system_parts.append(f"Выдержки БЗ:\n{kb_text}")
 
-        prompt = self._compose_input(sys_hint, text)
-
-        cc = self.client.responses.create(
-            model=model,
-            input=prompt,
-            temperature=self.default_temperature,
-        )
-        try:
-            return cc.output_text
-        except Exception:
-            pass
-
-        try:
-            if cc and cc.output and len(cc.output) > 0:
-                block = cc.output[0]
-                if getattr(block, "content", None):
-                    return "".join([getattr(p, "text", "") for p in block.content if getattr(p, "type", "") == "output_text"])
-        except Exception:
-            pass
+        system_prompt = "\n\n".join(system_parts)
 
         try:
-            if cc and cc.choices and len(cc.choices) > 0:
-                msg = cc.choices[0].message
-                if hasattr(msg, "content"):
-                    return str(msg.content)
-        except Exception:
-            pass
-
-        return "Не удалось получить ответ от модели."
-
-    # ---------- TRANSCRIBE ----------
-
-    def transcribe(self, audio_bytes: bytes, filename_hint: str = "audio.ogg") -> str:
-        """
-        Whisper-1 транскрипция.
-        """
-        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename_hint)[-1] or ".ogg") as f:
-            f.write(audio_bytes)
-            f.flush()
-            f.seek(0)
-            tr = self.client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="text",
+            resp = self.client.chat.completions.create(
+                model=use_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=self.temperature,
             )
-        return str(tr)
+            return resp.choices[0].message.content or "…"
+        except Exception as e:
+            logger.exception("Chat error: %s", e)
+            raise
 
-    # ---------- IMAGES ----------
+    # ---------------------------- Генерация изображений ----------------------
 
-    def generate_image(self, prompt: str, model: Optional[str] = None, size: str = "1024x1024") -> GenImageResult:
+    def _image_b64_or_raise(self, res) -> bytes:
         """
-        Возвращает bytes изображения + итоговый промпт + модель.
-        Делает fallback и поддерживает как base64, так и URL.
+        Приводим ответ Images API к bytes. Требуем b64_json.
         """
-        primary = model or self.image_primary
-        fallback = self.image_fallback
+        try:
+            data0 = res.data[0]
+        except Exception:
+            raise RuntimeError("Images API returned empty response.")
 
-        def _call(m: str) -> Tuple[Optional[bytes], str]:
+        b64 = getattr(data0, "b64_json", None)
+        if not b64:
+            # Иногда возвращают url, но мы принудительно просим b64_json — если его нет, считаем ошибкой
+            raise RuntimeError("Images API did not return base64 image.")
+        return base64.b64decode(b64)
+
+    def generate_image(self, prompt: str, model: Optional[str] = None) -> Tuple[bytes, str]:
+        """
+        Возвращает (image_bytes, used_prompt). Делает попытку на primary модели, затем fallback.
+        """
+        if not self.enable_image_generation:
+            raise RuntimeError("Генерация изображений отключена настройками.")
+
+        primary = model or self.default_image_model or "dall-e-3"
+        fallbacks = ["gpt-image-1", "dall-e-3"] if primary != "gpt-image-1" else ["dall-e-3"]
+
+        def _call(m: str) -> bytes:
             res = self.client.images.generate(
                 model=m,
                 prompt=prompt,
-                size=size,
+                size="1024x1024",
+                response_format="b64_json",
+                quality="standard",
             )
-            if not res or not getattr(res, "data", None):
-                return None, prompt
+            return self._image_b64_or_raise(res)
 
-            item = res.data[0]
-            b64 = getattr(item, "b64_json", None)
-            if b64:
-                return base64.b64decode(b64), prompt
-
-            url = getattr(item, "url", None)
-            if url:
-                bx = httpx.get(url, timeout=60.0)
-                bx.raise_for_status()
-                return bx.content, prompt
-
-            return None, prompt
-
+        # 1) primary
         try:
-            img, pr = _call(primary)
-            if img:
-                return GenImageResult(img, pr, primary)
-        except Exception:
-            pass
+            return _call(primary), prompt
+        except Exception as e1:
+            logger.warning("Primary image model '%s' failed: %s. Trying fallback...", primary, e1)
 
-        img, pr = _call(fallback)
-        if not img:
-            raise RuntimeError("Images API не вернуло изображение (ни base64, ни URL).")
-        return GenImageResult(img, pr, fallback)
+        # 2) fallbacks
+        last_err: Optional[Exception] = None
+        for fb in fallbacks:
+            try:
+                return _call(fb), prompt
+            except Exception as e2:
+                last_err = e2
+                logger.error("Fallback image model '%s' failed: %s", fb, e2)
 
-    # ---------- WEB SEARCH ----------
+        raise RuntimeError(str(last_err) if last_err else "Image generation failed.")
 
-    def web_search(self, query: str, limit: int = 3) -> List[Dict[str, str]]:
-        """
-        Простая выдача ссылок через DuckDuckGo HTML без ключей.
-        Исправлен 302 редирект (html.duckduckgo.com) + User-Agent.
-        """
-        url = "https://html.duckduckgo.com/html"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-        }
-        r = httpx.get(
-            url,
-            params={"q": query},
-            headers=headers,
-            timeout=20.0,
-            follow_redirects=True,
-        )
-        r.raise_for_status()
-        html = r.text
+    # --------------------------------- Веб‑поиск ------------------------------
 
-        # duckduckgo html: <a class="result__a" href="...">Title</a>
-        pat = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
-        results: List[Dict[str, str]] = []
-        for m in pat.finditer(html):
-            href = m.group(1)
-            title = re.sub("<.*?>", "", m.group(2))  # вычищаем теги
-            results.append({"title": title.strip(), "url": href, "snippet": ""})
-            if len(results) >= limit:
+    _DDG_HTML = "https://duckduckgo.com/html/"
+
+    def _extract_ddg_results(self, html: str) -> List[Tuple[str, str, str]]:
+        """Парсинг простого HTML DDG: (title, url, snippet)."""
+        results: List[Tuple[str, str, str]] = []
+        # Результаты в ссылках вида <a class="result__a" href="/l/?kh=...&uddg=<ENC_URL>">Title</a>
+        # Возьмём пары блоков заголовок+сниппет
+        # Заголовок:
+        for blk in re.findall(
+            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+            html,
+            flags=re.S | re.I,
+        ):
+            raw_href, raw_title, raw_snippet = blk
+            # Декодируем uddg
+            url = raw_href
+            try:
+                parsed = urlparse(raw_href)
+                qs = parse_qs(parsed.query)
+                uddg = qs.get("uddg", [""])[0]
+                if uddg:
+                    url = unquote(uddg)
+                else:
+                    # если сразу абсолютная ссылка
+                    if raw_href.startswith("/"):
+                        url = urljoin(self._DDG_HTML, raw_href)
+                    else:
+                        url = raw_href
+            except Exception:
+                url = raw_href
+
+            # Уберём HTML-теги в тексте
+            title = re.sub(r"<[^>]+>", "", raw_title).strip()
+            snippet = re.sub(r"<[^>]+>", "", raw_snippet).strip()
+            if title and url:
+                results.append((title, url, snippet))
+            if len(results) >= 8:
                 break
         return results
+
+    def web_search(self, query: str) -> Tuple[str, List[str]]:
+        """
+        Возвращает (краткий ответ, список ссылок).
+        Мы не обходим сайты, используем сниппеты DDG и просим модель сделать ответ.
+        """
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        }
+        try:
+            with httpx.Client(follow_redirects=True, timeout=15.0, headers=headers) as cli:
+                r = cli.get(self._DDG_HTML, params={"q": query})
+                r.raise_for_status()
+                results = self._extract_ddg_results(r.text)
+        except httpx.HTTPStatusError as e:
+            logger.exception("HTTP error DDG: %s", e)
+            raise RuntimeError(str(e))
+        except Exception as e:
+            logger.exception("DDG fetch error: %s", e)
+            raise RuntimeError(str(e))
+
+        links = [u for _, u, _ in results][:8]
+        # Подготовим контекст для модели
+        snippets_text = "\n\n".join([f"{i+1}. {t}\n{u}\n{s}" for i, (t, u, s) in enumerate(results[:6])])
+        sys = (
+            "Ты помощник с функцией веб‑поиска. На основе предоставленных сниппетов поисковой выдачи "
+            "сформируй краткий и точный ответ на запрос пользователя. Когда уместно, упоминай источники "
+            "(достаточно списка ссылок в конце). Если сниппеты не отвечают на вопрос — скажи об этом."
+        )
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.default_model,
+                messages=[
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": f"Запрос: {query}\n\nСниппеты:\n{snippets_text}"},
+                ],
+                temperature=min(self.temperature, 0.5),
+            )
+            answer = resp.choices[0].message.content or ""
+        except Exception as e:
+            logger.exception("OpenAI summarize for web failed: %s", e)
+            answer = "Не удалось сформировать сводку по результатам поиска."
+
+        return answer, links
+
+    # --------------------------------- STT / TTS ------------------------------
+
+    def transcribe(self, file_path: str, model: Optional[str] = None) -> str:
+        """
+        Транскрибация аудио. По умолчанию — whisper-1.
+        """
+        use_model = model or os.getenv("STT_MODEL") or "whisper-1"
+        try:
+            with open(file_path, "rb") as f:
+                res = self.client.audio.transcriptions.create(
+                    model=use_model,
+                    file=f,
+                )
+            # openai==1.x возвращает text в res.text (или res.text в data)
+            text = getattr(res, "text", None) or getattr(res, "text", "")
+            if not text and hasattr(res, "segments"):
+                # на всякий — собрать сегменты
+                text = " ".join(getattr(seg, "text", "") for seg in res.segments or [])
+            return text or ""
+        except Exception as e:
+            logger.exception("Transcribe failed: %s", e)
+            raise
+
+    # ------------------------------ Анализ файлов -----------------------------
+
+    def describe_file(self, file_path: str) -> str:
+        """
+        Быстрый анализ файла для ответа в чате:
+        - Для изображений используем vision (base64 Data URL + короткое описание).
+        - Для прочих типов даём краткую справку.
+        """
+        try:
+            size = os.path.getsize(file_path)
+        except Exception:
+            size = 0
+        name = os.path.basename(file_path)
+        mime, _ = mimetypes.guess_type(file_path)
+        mime = mime or "application/octet-stream"
+
+        # Изображение — подключим vision
+        if mime.startswith("image/"):
+            try:
+                with open(file_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                data_url = f"data:{mime};base64,{b64}"
+                resp = self.client.chat.completions.create(
+                    model=self.default_model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Дай краткое описание изображения и ключевые детали."},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    }],
+                    temperature=0.2,
+                )
+                desc = resp.choices[0].message.content or ""
+            except Exception as e:
+                logger.warning("Vision describe failed: %s", e)
+                desc = "Не удалось распознать изображение."
+            return f"Файл: {name}\nТип: {mime}\nРазмер: {size} байт\n\n{desc}"
+
+        # Для документов пока без извлечения текста — дадим аккуратное резюме
+        return (
+            f"Файл: {name}\n"
+            f"Тип: {mime}\n"
+            f"Размер: {size} байт\n\n"
+            "Краткий анализ: файл получен. Подробное извлечение текста и индексация доступны через команду Базы знаний."
+        )
