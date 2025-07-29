@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import tempfile
-import mimetypes
 from contextlib import suppress
 from functools import wraps
 from typing import Optional, List, Tuple, Dict
@@ -90,7 +89,7 @@ STYLE_LABELS = {
     "ceo": "СЕО",
 }
 
-def style_system_hint(style: str) -> Tuple[str, float]:
+def style_system_hint(style: str):
     s = (style or "pro").lower()
     if s == "pro":
         return ("Отвечай как высокопрофессиональный консультант. Максимально точно, лаконично, по делу, без воды.", 0.2)
@@ -127,6 +126,7 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("del", self.on_delete_dialogs))
         app.add_handler(CommandHandler("reload_menu", self.on_reload_menu))
         app.add_handler(CommandHandler("cancelupload", self.on_cancel_upload))
+        app.add_handler(CommandHandler("web", self.cmd_web))  # новый web-поиск
 
         # Callback-и
         app.add_handler(CallbackQueryHandler(self.on_callback))
@@ -136,7 +136,7 @@ class ChatGPTTelegramBot:
         app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_message))  # фото/документы
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))  # обычный текст
 
-        # Меню команд
+        # Меню команд для всех скоупов
         app.post_init = self._post_init_commands
 
     async def _post_init_commands(self, app: Application):
@@ -150,6 +150,7 @@ class ChatGPTTelegramBot:
             BotCommand("dialogs", "Список диалогов"),
             BotCommand("img", "Сгенерировать изображение"),
             BotCommand("mode", "Стиль ответов"),
+            BotCommand("web", "Поиск в интернете"),
             BotCommand("del", "Удалить диалоги"),
             BotCommand("reload_menu", "Обновить меню у всех"),
             BotCommand("cancelupload", "Выйти из режима загрузки в БЗ"),
@@ -210,7 +211,7 @@ class ChatGPTTelegramBot:
         else:
             parts = base.split(" · ")
             if len(parts) >= 2:
-                conv.title = " · ".join(parts[:2] + [f"upd {now}"])
+                conv.title = " ".join(parts[:2]) + f" · upd {now}"
             else:
                 conv.title = f"{base} · upd {now}"
         db.add(conv)
@@ -221,7 +222,7 @@ class ChatGPTTelegramBot:
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Привет! Я готов к работе.\n"
-            "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode, /del, /reload_menu"
+            "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode, /web, /del, /reload_menu"
         )
 
     @only_allowed
@@ -234,6 +235,7 @@ class ChatGPTTelegramBot:
             "/mode — стиль ответов (Профессиональный/Экспертный/Пользовательский/СЕО)\n"
             "/dialogs — список диалогов, /dialog <id> — вернуться\n"
             "/img <описание> — сгенерировать изображение\n"
+            "/web <запрос> — поиск в интернете\n"
             "/del — удалить диалоги\n"
             "/reload_menu — обновить меню у всех\n"
             "/cancelupload — выйти из режима загрузки в БЗ"
@@ -249,10 +251,8 @@ class ChatGPTTelegramBot:
         db.add(newc)
         db.commit()
         await update.message.reply_text("🔄 Новый диалог создан. Контекст очищен.")
-        # Сбрасываем только стиль/парольные состояния; выбранные документы и персональную модель НЕ трогаем
+        # Сбрасываем только временные состояния; выбранные документы и персональную модель НЕ трогаем
         context.user_data.pop("await_password_for", None)
-        # context.user_data["model"] сохраняем
-        # context.user_data["kb_selected_ids"] сохраняем
 
     @only_allowed
     async def on_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -413,6 +413,36 @@ class ChatGPTTelegramBot:
         except Exception as e:
             await update.message.reply_text(f"Ошибка генерации изображения: {e}")
 
+    # ---------- /web (Responses + web_search) ----------
+    @only_allowed
+    async def cmd_web(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """ /web <запрос> — поиск в интернете через OpenAI web_search tool. """
+        q = (update.message.text or "").split(maxsplit=1)
+        query = q[1].strip() if len(q) > 1 else ""
+        if not query:
+            await update.message.reply_text("Использование: /web <запрос>\nНапример: /web последние новости по ИИ")
+            return
+
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        except Exception:
+            pass
+
+        user_model = context.user_data.get("model", self.openai.model)
+        text, cites = await asyncio.to_thread(self.openai.answer_with_web, query, model=user_model)
+
+        if cites:
+            bullets = []
+            for i, c in enumerate(cites[:8], 1):
+                title = c.get("title") or "Источник"
+                url = c.get("url")
+                bullets.append(f"{i}. {title}\n{url}")
+            tail = "\n\nИсточники:\n" + "\n".join(bullets)
+        else:
+            tail = ""
+
+        await update.message.reply_text(f"🔎 *Результаты по запросу:* {query}\n\n{text}{tail}", parse_mode="Markdown")
+
     # ---------- Dialogs ----------
     @only_allowed
     async def on_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -495,12 +525,35 @@ class ChatGPTTelegramBot:
         if data.startswith("kb_toggle:"):
             doc_id = int(data.split(":")[1])
             selected = context.user_data.get("kb_selected_ids", set())
-            if doc_id in selected:
-                selected.remove(doc_id)
-            else:
+            adding = doc_id not in selected
+
+            if adding:
                 selected.add(doc_id)
+            else:
+                selected.remove(doc_id)
+
             context.user_data["kb_selected_ids"] = selected
             await q.edit_message_reply_markup(reply_markup=None)
+
+            # Если документ только что ДОБАВЛЕН — проверим, нужно ли спросить пароль
+            if adding:
+                db = self._get_db()
+                try:
+                    doc = db.query(Document).filter_by(id=doc_id).first()
+                    if doc:
+                        kb_passwords: Dict[int, str] = context.user_data.get("kb_passwords", {}) or {}
+                        if doc_id not in kb_passwords and await self._needs_password_for_doc(doc):
+                            context.user_data["await_password_for"] = doc_id
+                            await q.message.reply_text(
+                                f"Документ «{doc.title}» защищён паролем.\n"
+                                f"Пожалуйста, введите пароль одним сообщением.\n"
+                                f"Команда для отмены: /cancelpass"
+                            )
+                            return
+                finally:
+                    with suppress(Exception):
+                        db.close()
+
             await q.message.reply_text("Изменения применены. Нажмите /kb, чтобы обновить список.")
 
         elif data == "kb_toggle_enabled":
@@ -674,6 +727,35 @@ class ChatGPTTelegramBot:
         finally:
             db.close()
 
+    # ---------- Проверка: нужен ли пароль для PDF ----------
+    async def _needs_password_for_doc(self, doc: Document) -> bool:
+        """
+        Возвращает True, если документ – PDF и похоже зашифрован.
+        Проверка без внешних зависимостей: ищем маркер '/Encrypt' в первых ~2 МБ.
+        """
+        try:
+            mime = (doc.mime or "").lower()
+            if mime != "application/pdf":
+                return False
+
+            import tempfile
+            y = yadisk.YaDisk(token=self.settings.yandex_disk_token)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
+                tmp = tf.name
+            try:
+                y.download(doc.path, tmp)
+                with open(tmp, "rb") as f:
+                    head = f.read(2_000_000)
+                return b"/Encrypt" in head
+            finally:
+                with suppress(Exception):
+                    os.unlink(tmp)
+        except Exception as e:
+            logger.warning("Не удалось проверить шифрование PDF (%s): %s", getattr(doc, "path", "?"), e)
+            # Если не смогли проверить — не блокируем пользователя запросом пароля
+            return False
+
     # ---------- Cancel KB upload ----------
     @only_allowed
     async def on_cancel_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,7 +785,7 @@ class ChatGPTTelegramBot:
             await update.message.reply_text(f"Не удалось скачать голосовое: {e}")
             return
 
-        # Пытаемся сразу распознать (многие аккаунты принимают .ogg)
+        # Пытаемся распознать
         text: Optional[str] = None
         try:
             async with ChatActionSender(
@@ -713,9 +795,9 @@ class ChatGPTTelegramBot:
             ):
                 text = await asyncio.to_thread(self.openai.transcribe, tmp_ogg)
         except Exception:
-            # fallback: попробуем перекодировать в mp3, если установлен ffmpeg
+            # fallback: mp3 через pydub (требует ffmpeg)
             try:
-                from pydub import AudioSegment  # требует ffmpeg в контейнере
+                from pydub import AudioSegment
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf2:
                     tmp_mp3 = tf2.name
                 audio = AudioSegment.from_file(tmp_ogg)
@@ -740,7 +822,6 @@ class ChatGPTTelegramBot:
         with suppress(Exception):
             os.unlink(tmp_ogg)
 
-        # Если распознали, продолжим как обычный текстовый запрос
         if text:
             update.message.text = text
             await self.on_text(update, context)
@@ -762,7 +843,6 @@ class ChatGPTTelegramBot:
                 logger.exception("KB upload failed: %s", e)
             return
 
-        # Иначе просто информируем, что сделать
         tip = "Чтобы добавить в БЗ, откройте /kb → «📥 Добавить из чата» (доступно администратору)."
         await update.message.reply_text(tip)
 
@@ -773,7 +853,6 @@ class ChatGPTTelegramBot:
         """
         y = yadisk.YaDisk(token=self.settings.yandex_disk_token)
 
-        # Определяем, что пришло
         if update.message.document:
             doc = update.message.document
             file = await context.bot.get_file(doc.file_id)
@@ -793,13 +872,11 @@ class ChatGPTTelegramBot:
         else:
             raise ValueError("Нет поддерживаемого вложения")
 
-        # Куда кладём на Диске
         root = self.settings.yandex_root_path.strip()
         if not root.startswith("/"):
             root = "/" + root
         remote = f"disk:{root}/{filename}"
 
-        # Загрузка
         y.upload(local_path=local, path=remote, overwrite=True)
 
         return local, remote
@@ -864,7 +941,7 @@ class ChatGPTTelegramBot:
                     messages,
                     temperature=temp,
                     max_output_tokens=4096,
-                    model=user_model,  # << персонально
+                    model=user_model,
                 )
         except Exception as e:
             await update.message.reply_text(f"Ошибка обращения к OpenAI: {e}")
