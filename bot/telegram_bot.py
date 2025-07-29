@@ -143,6 +143,7 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("del", self.cmd_del))
         app.add_handler(CommandHandler("img", self.cmd_img))
         app.add_handler(CommandHandler("web", self.cmd_web))
+        app.add_handler(CommandHandler("new", self.cmd_new))
 
         # кнопки
         app.add_handler(CallbackQueryHandler(self.on_model_select, pattern=r"^model:"))
@@ -172,6 +173,7 @@ class ChatGPTTelegramBot:
                     ("del", "Удалить текущий диалог"),
                     ("img", "Сгенерировать изображение"),
                     ("web", "Веб-поиск"),
+                    ("new", "Новый диалог"),
                 ]
                 if KB_AVAILABLE:
                     # /kb добавляем только если модуль реально доступен
@@ -210,6 +212,7 @@ class ChatGPTTelegramBot:
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         base = [
             "/help — справка",
+            "/new — новый диалог",
             "/reset — сброс контекста",
             "/stats — статистика",
             "/model — выбор модели",
@@ -220,11 +223,16 @@ class ChatGPTTelegramBot:
             "/web <запрос> — веб‑поиск со ссылками",
         ]
         if KB_AVAILABLE:
-            base.insert(3, "/kb — база знаний (включить/исключить документы)")
-        await update.message.reply_text("Привет! Я готов к работе.\nКоманды:\n" + "\n".join(base))
+            # Показываем /kb только если модуль БЗ реально в сборке
+            base.insert(4, "/kb — база знаний (включить/исключить документы)")
+    
+        await update.message.reply_text(
+            "Привет! Я готов к работе.\nКоманды:\n" + "\n".join(base)
+        )
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [
+            "/new — новый диалог",
             "/reset — сброс контекста",
             "/stats — статистика",
         ]
@@ -238,8 +246,10 @@ class ChatGPTTelegramBot:
             "/img <описание> — сгенерировать изображение",
             "/web <запрос> — веб‑поиск со ссылками",
         ])
+    
         if not KB_AVAILABLE:
             lines.append("\n⚠️ База знаний недоступна: модуль не включён в сборку.\n" + KB_MISSING_REASON)
+    
         await update.message.reply_text("\n".join(lines))
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -286,6 +296,20 @@ class ChatGPTTelegramBot:
             lines.append(f"- В контексте: {', '.join(doc_titles)}")
         await update.message.reply_text("\n".join(lines))
 
+    async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Явно создаёт новый пустой диалог и делает его текущим."""
+        chat_id = update.effective_chat.id
+        st = self._get_chat(chat_id)
+        dlg_id = int(time.time() * 1000)
+        st.dialogs[dlg_id] = DialogState(
+            id=dlg_id,
+            title="Диалог",
+            created_at=time.time(),
+            updated_at=time.time(),
+        )
+        st.current_id = dlg_id
+        await update.message.reply_text("🆕 Создан и выбран новый диалог. Можете писать сообщение.")
+    
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         models, current = self.openai.list_models_with_current(chat_id)
@@ -401,41 +425,74 @@ class ChatGPTTelegramBot:
         st = self._get_chat(chat_id)
         if not st.dialogs:
             self._ensure_current_dialog(chat_id)
-
+    
         rows: List[List[InlineKeyboardButton]] = []
+    
+        # Первая строка — явная кнопка "Новый диалог"
+        rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")])
+    
+        # Далее — по диалогу: 1-я строка широкая "Открыть", 2-я — узкая "✖ Удалить"
         items = sorted(st.dialogs.values(), key=lambda d: d.updated_at, reverse=True)
         for d in items:
             mark = " 🟢" if d.id == st.current_id else ""
             title = f"{d.title}{mark}\nсозд: {_ts_fmt(d.created_at)} • изм: {_ts_fmt(d.updated_at)}"
-            rows.append([
-                InlineKeyboardButton(f"↪️ {title}", callback_data=f"dlg:open:{d.id}"),
-                InlineKeyboardButton("🗑 Удалить", callback_data=f"dlg:del:{d.id}"),
-            ])
-
+            # ОТДЕЛЬНОЙ строкой — открытие (широкая кнопка, не режет название)
+            rows.append([InlineKeyboardButton(f"↪️ {title}", callback_data=f"dlg:open:{d.id}")])
+            # Следующей строкой — маленькая удалялка (узкий символ ✖)
+            rows.append([InlineKeyboardButton("✖ Удалить", callback_data=f"dlg:del:{d.id}")])
+    
         await update.message.reply_text("Диалоги:", reply_markup=InlineKeyboardMarkup(rows))
 
     async def on_dialog_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        _, action, ident = q.data.split(":", 2)
+        parts = q.data.split(":", 2)
+        if len(parts) < 2:
+            return
+        _, action = parts[0], parts[1]
         chat_id = update.effective_chat.id
         st = self._get_chat(chat_id)
-
-        try:
-            dlg_id = int(ident)
-        except Exception:
-            await q.answer("Некорректный идентификатор диалога.")
+    
+        # ➕ Создать новый
+        if action == "new":
+            dlg_id = int(time.time() * 1000)
+            st.dialogs[dlg_id] = DialogState(
+                id=dlg_id,
+                title="Диалог",
+                created_at=time.time(),
+                updated_at=time.time(),
+            )
+            st.current_id = dlg_id
+            await q.edit_message_text("🆕 Создан и выбран новый диалог.")
             return
-
+    
+        # Открыть существующий
         if action == "open":
+            if len(parts) < 3:
+                await q.edit_message_text("Некорректные данные.")
+                return
+            try:
+                dlg_id = int(parts[2])
+            except Exception:
+                await q.edit_message_text("Некорректный идентификатор диалога.")
+                return
             if dlg_id in st.dialogs:
                 st.current_id = dlg_id
                 await q.edit_message_text(f"Открыт диалог: {st.dialogs[dlg_id].title}")
             else:
                 await q.edit_message_text("Диалог не найден.")
             return
-
+    
+        # Удалить
         if action == "del":
+            if len(parts) < 3:
+                await q.edit_message_text("Некорректные данные.")
+                return
+            try:
+                dlg_id = int(parts[2])
+            except Exception:
+                await q.edit_message_text("Некорректный идентификатор диалога.")
+                return
             if dlg_id in st.dialogs:
                 del st.dialogs[dlg_id]
                 if st.current_id == dlg_id:
