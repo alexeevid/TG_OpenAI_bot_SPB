@@ -15,6 +15,7 @@ from telegram import (
     InputFile,
 )
 from telegram.constants import ChatAction
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,13 +30,19 @@ from bot.settings import Settings
 
 # --- knowledge_base интеграция (мягкая) ---
 KB_AVAILABLE = True
+KB_MISSING_REASON = ""
 try:
     from bot.knowledge_base.indexer import sync as kb_sync  # type: ignore
     from bot.knowledge_base.retriever import list_documents as kb_list_docs  # type: ignore
-except Exception:
+except Exception as e:  # модуль не в сборке или сломан импорт
     KB_AVAILABLE = False
-    kb_sync = None
-    kb_list_docs = None
+    KB_MISSING_REASON = (
+        "Модуль базы знаний не найден: "
+        f"{e}. Убедитесь, что в деплой включены файлы:\n"
+        "  - bot/knowledge_base/indexer.py\n"
+        "  - bot/knowledge_base/retriever.py\n"
+        "и их зависимости (yadisk, sqlalchemy, модели БД и т.п.)."
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -123,11 +130,13 @@ class ChatGPTTelegramBot:
     # ---------------- Установка команд/хендлеров ----------------
 
     def install(self, app: Application) -> None:
+        # команды
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("stats", self.cmd_stats))
-        app.add_handler(CommandHandler("kb", self.cmd_kb))
+        if KB_AVAILABLE:
+            app.add_handler(CommandHandler("kb", self.cmd_kb))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("dialogs", self.cmd_dialogs))
@@ -135,30 +144,39 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("img", self.cmd_img))
         app.add_handler(CommandHandler("web", self.cmd_web))
 
+        # кнопки
         app.add_handler(CallbackQueryHandler(self.on_model_select, pattern=r"^model:"))
         app.add_handler(CallbackQueryHandler(self.on_mode_select, pattern=r"^mode:"))
-        app.add_handler(CallbackQueryHandler(self.on_kb_toggle, pattern=r"^kb:"))
+        if KB_AVAILABLE:
+            app.add_handler(CallbackQueryHandler(self.on_kb_toggle, pattern=r"^kb:"))
         app.add_handler(CallbackQueryHandler(self.on_dialog_action, pattern=r"^dlg:"))
 
+        # сообщения
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_or_photo))
         app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.on_text))
 
+        # глобальный error handler — ловим в т.ч. Conflict
+        app.add_error_handler(self.on_error)
+
         async def _set_global_commands(application: Application):
             try:
-                await application.bot.set_my_commands([
+                commands = [
                     ("start", "Запуск/справка"),
                     ("help", "Справка"),
                     ("reset", "Сброс контекста"),
                     ("stats", "Статистика"),
-                    ("kb", "База знаний"),
                     ("model", "Выбор модели"),
                     ("mode", "Стиль ответов"),
                     ("dialogs", "Диалоги"),
                     ("del", "Удалить текущий диалог"),
                     ("img", "Сгенерировать изображение"),
                     ("web", "Веб-поиск"),
-                ])
+                ]
+                if KB_AVAILABLE:
+                    # /kb добавляем только если модуль реально доступен
+                    commands.insert(4, ("kb", "База знаний"))
+                await application.bot.set_my_commands(commands)
             except Exception as e:
                 logger.warning("Не удалось установить команды: %s", e)
 
@@ -173,26 +191,56 @@ class ChatGPTTelegramBot:
                 await _set_global_commands(a)
             app.post_init = _chain
 
+    # ---------------- Error handler ----------------
+
+    async def on_error(self, update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
+        err = context.error
+        if isinstance(err, Conflict):
+            # Частая ситуация: второй инстанс бота запущен параллельно (локально/на другом сервисе).
+            logger.warning("Polling conflict detected: another instance of the bot is running. "
+                           "Этот инстанс продолжит работу; проверьте, что не запущена копия локально/в другом окружении.")
+            # Если хотите, чтобы «лишний» инстанс сам останавливался:
+            # await context.application.stop()
+            return
+        # иначе — стандартный лог
+        logger.exception("Unhandled error in handler: %s", err)
+
     # ---------------- Команды ----------------
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "Привет! Я готов к работе.\n"
-            "Команды: /help, /reset, /stats, /kb, /model, /mode, /dialogs, /del, /img, /web"
-        )
+        base = [
+            "/help — справка",
+            "/reset — сброс контекста",
+            "/stats — статистика",
+            "/model — выбор модели",
+            "/mode — стиль ответов",
+            "/dialogs — список диалогов (открыть/удалить)",
+            "/del — удалить текущий диалог",
+            "/img <описание> — генерация изображения",
+            "/web <запрос> — веб‑поиск со ссылками",
+        ]
+        if KB_AVAILABLE:
+            base.insert(3, "/kb — база знаний (включить/исключить документы)")
+        await update.message.reply_text("Привет! Я готов к работе.\nКоманды:\n" + "\n".join(base))
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "/reset — сброс контекста\n"
-            "/stats — статистика\n"
-            "/kb — база знаний (включить/исключить документы)\n"
-            "/model — выбор модели OpenAI\n"
-            "/mode — стиль ответов (Pro/Expert/User/CEO)\n"
-            "/dialogs — список диалогов (открыть/удалить)\n"
-            "/del — удалить текущий диалог\n"
-            "/img <описание> — сгенерировать изображение\n"
-            "/web <запрос> — веб‑поиск со ссылками"
-        )
+        lines = [
+            "/reset — сброс контекста",
+            "/stats — статистика",
+        ]
+        if KB_AVAILABLE:
+            lines.append("/kb — база знаний (включить/исключить документы)")
+        lines.extend([
+            "/model — выбор модели OpenAI",
+            "/mode — стиль ответов (Pro/Expert/User/CEO)",
+            "/dialogs — список диалогов (открыть/удалить)",
+            "/del — удалить текущий диалог",
+            "/img <описание> — сгенерировать изображение",
+            "/web <запрос> — веб‑поиск со ссылками",
+        ])
+        if not KB_AVAILABLE:
+            lines.append("\n⚠️ База знаний недоступна: модуль не включён в сборку.\n" + KB_MISSING_REASON)
+        await update.message.reply_text("\n".join(lines))
 
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
@@ -217,17 +265,20 @@ class ChatGPTTelegramBot:
         # названия выбранных документов, если есть knowledge_base
         doc_titles: List[str] = []
         if KB_AVAILABLE and kb_list_docs and dlg.selected_doc_ids:
-            docs = {d.id: d for d in kb_list_docs() or []}
-            for d_id in dlg.selected_doc_ids:
-                if d_id in docs:
-                    doc_titles.append(docs[d_id].title)
+            try:
+                docs = {d.id: d for d in kb_list_docs() or []}
+                for d_id in dlg.selected_doc_ids:
+                    if d_id in docs:
+                        doc_titles.append(docs[d_id].title)
+            except Exception:
+                pass
 
         lines = [
             "📊 Статистика:",
             f"- Диалог: {dlg.title}",
             f"- Модель: {model}",
             f"- Стиль: {style.capitalize()}",
-            f"- База знаний: {kb}",
+            f"- База знаний: {kb}" + ("" if KB_AVAILABLE else " (модуль недоступен)"),
             f"- Документов выбрано: {len(dlg.selected_doc_ids)}",
             f"- Создан: {_ts_fmt(dlg.created_at)} • Обновлён: {_ts_fmt(dlg.updated_at)}",
         ]
@@ -277,17 +328,17 @@ class ChatGPTTelegramBot:
         await q.edit_message_text(f"Стиль установлен: {style}")
 
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not KB_AVAILABLE or not kb_sync or not kb_list_docs:
+            await update.message.reply_text(
+                "⚠️ База знаний недоступна в этой сборке.\n" + KB_MISSING_REASON
+            )
+            return
+
         chat_id = update.effective_chat.id
         dlg = self._ensure_current_dialog(chat_id)
 
         msg = await update.message.reply_text("⏳ Синхронизирую базу знаний...")
         added = updated = deleted = 0
-
-        if not KB_AVAILABLE or not kb_sync or not kb_list_docs:
-            await msg.edit_text("⚠️ Модуль базы знаний недоступен в этой сборке. "
-                                "Проверьте, что папка bot/knowledge_base/* присутствует в деплое.")
-            return
-
         try:
             res = kb_sync()
             if isinstance(res, tuple) and len(res) >= 3:
@@ -300,7 +351,6 @@ class ChatGPTTelegramBot:
             await msg.edit_text(f"Ошибка синхронизации: {e}")
             return
 
-        docs = []
         try:
             docs = kb_list_docs() or []
         except Exception as e:
@@ -353,12 +403,10 @@ class ChatGPTTelegramBot:
             self._ensure_current_dialog(chat_id)
 
         rows: List[List[InlineKeyboardButton]] = []
-        # сортируем по updated_at убыв.
         items = sorted(st.dialogs.values(), key=lambda d: d.updated_at, reverse=True)
         for d in items:
             mark = " 🟢" if d.id == st.current_id else ""
             title = f"{d.title}{mark}\nсозд: {_ts_fmt(d.created_at)} • изм: {_ts_fmt(d.updated_at)}"
-            # две кнопки — открыть/удалить
             rows.append([
                 InlineKeyboardButton(f"↪️ {title}", callback_data=f"dlg:open:{d.id}"),
                 InlineKeyboardButton("🗑 Удалить", callback_data=f"dlg:del:{d.id}"),
@@ -456,7 +504,6 @@ class ChatGPTTelegramBot:
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         dlg = self._ensure_current_dialog(chat_id)
-        # автозаголовок по первому сообщению
         dlg.title = self._auto_title(dlg.title, update.message.text)
         dlg.updated_at = time.time()
 
@@ -486,7 +533,6 @@ class ChatGPTTelegramBot:
         await self._typing_once(update, context)
         try:
             text = self.openai.transcribe(bx.content, filename_hint="audio.ogg")
-            # сначала — показываем транскрипцию
             await update.message.reply_text(f"🎙️ Вы сказали: {text}")
         except Exception as e:
             await update.message.reply_text(f"Ошибка распознавания: {e}")
