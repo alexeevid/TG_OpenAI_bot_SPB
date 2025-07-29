@@ -20,10 +20,11 @@ def build_application() -> Application:
 
     openai = OpenAIHelper(
         api_key=settings.openai_api_key,
-        model=getattr(settings, "openai_model", None),
-        image_model=getattr(settings, "image_model", None),
-        temperature=getattr(settings, "openai_temperature", 0.2),
-        enable_image_generation=bool(getattr(settings, "enable_image_generation", True)),
+        default_model=getattr(settings, "openai_model", "gpt-4o"),
+        default_temperature=getattr(settings, "openai_temperature", 0.2),
+        image_primary=(getattr(settings, "image_model", None) or "gpt-image-1"),
+        # при желании можно добавить fallback-модель из настроек:
+        # image_fallback=getattr(settings, "image_fallback_model", "dall-e-3"),
     )
 
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
