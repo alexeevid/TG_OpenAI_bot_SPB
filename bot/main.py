@@ -1,15 +1,13 @@
-# bot/main.py
 from __future__ import annotations
 
 import logging
-
 from telegram import Update
 from telegram.ext import Application
 
 from bot.config import load_settings
 from bot.openai_helper import OpenAIHelper
 from bot.telegram_bot import ChatGPTTelegramBot
-
+from bot.db.session import init_db
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +15,13 @@ logger = logging.getLogger(__name__)
 def build_application() -> Application:
     settings = load_settings()
 
-    # Создаём OpenAI helper с новыми именами параметров.
+    # Инициализируем БД и таблицы
+    init_db()
+
     openai = OpenAIHelper(
         api_key=settings.openai_api_key,
         model=getattr(settings, "openai_model", None),
-        image_model=getattr(settings, "image_model", None),  # вместо image_primary
+        image_model=getattr(settings, "image_model", None),
         temperature=getattr(settings, "openai_temperature", 0.2),
         enable_image_generation=bool(getattr(settings, "enable_image_generation", True)),
     )
@@ -47,7 +47,6 @@ def main():
     logger.info("🔒 Advisory-lock получен. Запускаем бота.")
     app = build_application()
     logger.info("🚀 Бот запускается (run_polling)...")
-    # allowed_updates=Update.ALL_TYPES — чтобы обрабатывать voice/photo/docs
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
