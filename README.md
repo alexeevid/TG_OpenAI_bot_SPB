@@ -1,20 +1,36 @@
-# Telegram RAG Bot (OpenAI + Yandex.Disk REST)
+# Telegram Assistant Bot
 
-- PTB v20
-- OpenAI API (Responses or Chat Completions)
-- PostgreSQL via SQLAlchemy + psycopg2-binary
-- Yandex.Disk REST listing (sync via inline button in /kb)
+Полный минимальный проект Telegram‑бота с OpenAI (Responses API), Whisper, генерацией изображений, веб‑поиском и управлением диалогами.
 
-## Commands
-/start, /help, /reset, /stats, /kb, /model, /dialogs, /dialog <id>
+## Запуск локально
 
-## ENV (.env)
-TELEGRAM_BOT_TOKEN=...
-OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-4o-mini
-IMAGE_MODEL=gpt-image-1
-DATABASE_URL=postgresql://user:pass@host:5432/db
-YANDEX_DISK_TOKEN=...
-YANDEX_ROOT_PATH=/База Знаний
-ADMIN_USER_IDS=12345
-ALLOWED_TELEGRAM_USER_IDS=12345,67890
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+export TELEGRAM_BOT_TOKEN=...
+export OPENAI_API_KEY=...
+export DATABASE_URL=postgresql://user:pass@host:5432/dbname
+# (опционально) export OPENAI_MODEL=gpt-4o
+# (опционально) export IMAGE_MODEL=dall-e-3
+
+python -m bot.main
+```
+
+## Деплой на Railway
+
+- Добавьте переменные окружения: `TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`, `DATABASE_URL`.
+- При первом старте таблицы создадутся автоматически.
+
+## Команды
+
+- /help — Помощь
+- /reset — Сброс контекста
+- /stats — Статистика
+- /kb — База знаний (вкл/искл документы) — заглушка, реальную логику можно подключить позже
+- /model — Выбор модели OpenAI
+- /dialogs — Список диалогов с кнопками Открыть/Удалить (пагинация)
+- /image — Генерация изображения
+- /web — Вопрос с веб‑поиском
+- /style — Режим ответа: Профессиональный/Экспертный/Пользовательский/СЕО
