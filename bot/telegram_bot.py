@@ -1,18 +1,21 @@
 import asyncio
 import logging
+import os
+import tempfile
+import mimetypes
 from contextlib import suppress
 from functools import wraps
 from typing import Optional, List, Tuple, Dict
 from io import BytesIO
 from datetime import datetime
 
+import yadisk
 from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BotCommand,
     InputFile,
-    # Для обновления меню во всех областях
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
@@ -35,8 +38,9 @@ from bot.settings import Settings
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Индикатор «набирает… / загружает фото…» (совместимо с PTB v20)
+# Индикатор «набирает… / загружает фото… / записывает голос…»
 # ---------------------------------------------------------------------------
 class ChatActionSender:
     def __init__(self, *, action: ChatAction, chat_id: int, bot, interval: float = 4.0):
@@ -108,6 +112,7 @@ class ChatGPTTelegramBot:
 
     # ---------- Wiring ----------
     def install(self, app: Application):
+        # Команды
         app.add_handler(CommandHandler("start", self.on_start))
         app.add_handler(CommandHandler("help", self.on_help))
         app.add_handler(CommandHandler("reset", self.on_reset))
@@ -116,18 +121,22 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("model", self.on_model))
         app.add_handler(CommandHandler("dialogs", self.on_dialogs))
         app.add_handler(CommandHandler("dialog", self.on_dialog_select))
-
-        # Новые фичи
         app.add_handler(CommandHandler("mode", self.on_mode))
         app.add_handler(CommandHandler("img", self.on_img))
         app.add_handler(CommandHandler("cancelpass", self.on_cancel_pass))
         app.add_handler(CommandHandler("del", self.on_delete_dialogs))
-        app.add_handler(CommandHandler("reload_menu", self.on_reload_menu))  # обновление меню у всех
+        app.add_handler(CommandHandler("reload_menu", self.on_reload_menu))
+        app.add_handler(CommandHandler("cancelupload", self.on_cancel_upload))
 
+        # Callback-и
         app.add_handler(CallbackQueryHandler(self.on_callback))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
-        # Команды меню во всех scopes/языках — поставим на инициализации приложения
+        # Сообщения
+        app.add_handler(MessageHandler(filters.VOICE, self.on_voice))  # голосовые
+        app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_message))  # фото/документы
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))  # обычный текст
+
+        # Меню команд
         app.post_init = self._post_init_commands
 
     async def _post_init_commands(self, app: Application):
@@ -143,6 +152,7 @@ class ChatGPTTelegramBot:
             BotCommand("mode", "Стиль ответов"),
             BotCommand("del", "Удалить диалоги"),
             BotCommand("reload_menu", "Обновить меню у всех"),
+            BotCommand("cancelupload", "Выйти из режима загрузки в БЗ"),
         ]
         await self._set_all_scopes_commands(app, cmds)
 
@@ -155,13 +165,11 @@ class ChatGPTTelegramBot:
         ]
         langs = [None, "ru", "en"]
 
-        # Чистим старые команды
         for sc in scopes:
             for lang in langs:
                 with suppress(Exception):
                     await app.bot.delete_my_commands(scope=sc, language_code=lang)
 
-        # Ставим новые
         for sc in scopes:
             for lang in langs:
                 with suppress(Exception):
@@ -221,13 +229,14 @@ class ChatGPTTelegramBot:
         await update.message.reply_text(
             "/reset — сброс контекста\n"
             "/stats — статистика\n"
-            "/kb — база знаний (включить/исключить документы, пароли)\n"
-            "/model — выбор модели OpenAI\n"
+            "/kb — база знаний (включить/исключить документы, пароли, загрузка админом)\n"
+            "/model — выбор модели OpenAI (персонально для вашего чата)\n"
             "/mode — стиль ответов (Профессиональный/Экспертный/Пользовательский/СЕО)\n"
             "/dialogs — список диалогов, /dialog <id> — вернуться\n"
             "/img <описание> — сгенерировать изображение\n"
             "/del — удалить диалоги\n"
-            "/reload_menu — обновить меню у всех"
+            "/reload_menu — обновить меню у всех\n"
+            "/cancelupload — выйти из режима загрузки в БЗ"
         )
 
     @only_allowed
@@ -240,9 +249,10 @@ class ChatGPTTelegramBot:
         db.add(newc)
         db.commit()
         await update.message.reply_text("🔄 Новый диалог создан. Контекст очищен.")
-        # Сбрасываем только стиль/парольные состояния; выбранные документы не трогаем
+        # Сбрасываем только стиль/парольные состояния; выбранные документы и персональную модель НЕ трогаем
         context.user_data.pop("await_password_for", None)
-        context.user_data.pop("style", None)
+        # context.user_data["model"] сохраняем
+        # context.user_data["kb_selected_ids"] сохраняем
 
     @only_allowed
     async def on_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -253,6 +263,7 @@ class ChatGPTTelegramBot:
         kb_enabled = context.user_data.get("kb_enabled", True)
         style = context.user_data.get("style", "pro")
         style_label = STYLE_LABELS.get(style, "Профессиональный")
+        user_model = context.user_data.get("model", self.openai.model)
 
         title = conv.title or "Диалог"
         names: List[str] = []
@@ -263,7 +274,7 @@ class ChatGPTTelegramBot:
         text = (
             f"📊 Статистика:\n"
             f"- Диалог: {title}\n"
-            f"- Модель: {self.openai.model}\n"
+            f"- Модель: {user_model}\n"
             f"- Стиль: {style_label}\n"
             f"- База знаний: {'включена' if kb_enabled else 'выключена'}\n"
             f"- Документов выбрано: {len(docs)}"
@@ -284,22 +295,27 @@ class ChatGPTTelegramBot:
 
         kb_enabled = context.user_data.get("kb_enabled", True)
         selected = context.user_data.get("kb_selected_ids", set())
-        docs = db.query(Document).order_by(Document.id.asc()).limit(30).all()
+        docs = db.query(Document).order_by(Document.id.asc()).limit(50).all()
 
         rows = []
         for d in docs:
             mark = "✅" if d.id in selected else "➕"
             rows.append([InlineKeyboardButton(f"{mark} {d.title}", callback_data=f"kb_toggle:{d.id}")])
 
-        # Синхронизация показывается всем; доступ проверим в callback
         rows.append([InlineKeyboardButton("🔄 Синхронизировать с Я.Диском", callback_data="kb_sync")])
         rows.append([InlineKeyboardButton(("🔕 Отключить БЗ" if kb_enabled else "🔔 Включить БЗ"), callback_data="kb_toggle_enabled")])
         rows.append([InlineKeyboardButton("🔐 Указать пароли для выбранных", callback_data="kb_pass_menu")])
 
+        # Кнопка загрузки только для администраторов (или если список админов пуст — всем)
+        is_admin = (not self.admins) or (update.effective_user and update.effective_user.id in self.admins)
+        if is_admin:
+            rows.append([InlineKeyboardButton("📥 Добавить из чата", callback_data="kb_upload_mode")])
+
         await update.message.reply_text(
             f"База знаний: {'включена' if kb_enabled else 'выключена'}.\n"
             "• Нажмите на документ, чтобы включить/исключить его из контекста.\n"
-            "• Для документов с паролями используйте «🔐 Указать пароли для выбранных».",
+            "• «🔄 Синхронизировать» — подтянуть изменения с Я.Диска.\n"
+            "• «📥 Добавить из чата» — загрузить новые файлы на Диск (только админ).",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
@@ -307,7 +323,7 @@ class ChatGPTTelegramBot:
     @only_allowed
     async def on_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         models_all = self.openai.list_models()
-        current = self.openai.model
+        current = context.user_data.get("model", self.openai.model)
 
         allow_list = getattr(self.settings, "allowed_models_whitelist", [])
         deny_list = getattr(self.settings, "denylist_models", [])
@@ -349,7 +365,7 @@ class ChatGPTTelegramBot:
             cb = "noop" if m == current else f"set_model:{m}"
             rows.append([InlineKeyboardButton(label, callback_data=cb)])
 
-        await update.message.reply_text("Выберите модель:", reply_markup=InlineKeyboardMarkup(rows))
+        await update.message.reply_text("Выберите модель (сохраняется только для этого чата):", reply_markup=InlineKeyboardMarkup(rows))
 
     # ---------- Modes ----------
     @only_allowed
@@ -417,7 +433,6 @@ class ChatGPTTelegramBot:
 
     @only_allowed
     async def on_delete_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показывает список диалогов для удаления."""
         db = self._get_db()
         chat_id = update.effective_chat.id
         items = (
@@ -432,7 +447,6 @@ class ChatGPTTelegramBot:
             return
 
         rows = [[InlineKeyboardButton(f"🗑️ #{c.id} {c.title}", callback_data=f"ask_del:{c.id}")] for c in items]
-        # Кнопка удалить все неактивные
         rows.append([InlineKeyboardButton("🧹 Удалить все неактивные", callback_data="ask_del_all")])
         await update.message.reply_text("Выберите диалог для удаления:", reply_markup=InlineKeyboardMarkup(rows))
 
@@ -459,18 +473,15 @@ class ChatGPTTelegramBot:
         db.commit()
         await update.message.reply_text(f"✅ Активирован диалог #{c.id} ({c.title}).")
 
-    # ---------- Reload menu (для обновления у всех пользователей) ----------
+    # ---------- Reload menu ----------
     @only_allowed
     async def on_reload_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Разрешаем всем, если список админов пуст; иначе — только админам
         if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
             await update.message.reply_text("⛔ Доступно только администратору.")
             return
         await self._post_init_commands(context.application)
         await update.message.reply_text(
-            "✅ Меню обновлено для всех чатов и языков.\n"
-            "Если изменения не видны, попросите пользователя закрыть и заново открыть чат с ботом "
-            "или потянуть список команд вниз для обновления кэша."
+            "✅ Меню обновлено для всех чатов и языков. Если изменения не видны, перезапустите чат или потяните список команд вниз."
         )
 
     # ---------- Callbacks ----------
@@ -527,10 +538,21 @@ class ChatGPTTelegramBot:
             context.user_data.pop("await_password_for", None)
             await q.edit_message_text("Ввод пароля отменён.")
 
+        elif data == "kb_upload_mode":
+            # Только для админа
+            if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
+                await q.edit_message_text("⛔ Доступно только администратору.")
+                return
+            context.user_data["await_kb_upload"] = True
+            await q.edit_message_text(
+                "Режим загрузки в БЗ активирован. Пришлите фото/документы одним или несколькими сообщениями.\n"
+                "Команда для выхода: /cancelupload"
+            )
+
         # --- Models / Modes / Dialog navigation ---
         elif data.startswith("set_model:"):
             m = data.split(":", 1)[1]
-            self.openai.set_model(m)
+            context.user_data["model"] = m  # персонально для чата/пользователя
             await q.edit_message_text(f"Модель установлена: {m}")
 
         elif data == "noop":
@@ -627,6 +649,7 @@ class ChatGPTTelegramBot:
         elif data == "cancel_del":
             await q.edit_message_text("Удаление отменено.")
 
+    # ---------- KB sync ----------
     async def _kb_sync_internal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         from bot.knowledge_base.indexer import sync_disk_to_db
         db = SessionLocal()
@@ -651,11 +674,135 @@ class ChatGPTTelegramBot:
         finally:
             db.close()
 
+    # ---------- Cancel KB upload ----------
+    @only_allowed
+    async def on_cancel_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        context.user_data.pop("await_kb_upload", None)
+        await update.message.reply_text("Режим загрузки в БЗ отключён.")
+
     # ---------- KB passwords ----------
     @only_allowed
     async def on_cancel_pass(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("await_password_for", None)
         await update.message.reply_text("Ввод пароля отменён.")
+
+    # ---------- Voice messages ----------
+    @only_allowed
+    async def on_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        voice = update.message.voice
+        if not voice:
+            return
+        file = await context.bot.get_file(voice.file_id)
+
+        # Сохраняем во временный .ogg (Telegram voice = OGG/Opus)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tf:
+            tmp_ogg = tf.name
+        try:
+            await file.download_to_drive(custom_path=tmp_ogg)
+        except Exception as e:
+            await update.message.reply_text(f"Не удалось скачать голосовое: {e}")
+            return
+
+        # Пытаемся сразу распознать (многие аккаунты принимают .ogg)
+        text: Optional[str] = None
+        try:
+            async with ChatActionSender(
+                action=ChatAction.RECORD_VOICE,
+                chat_id=update.effective_chat.id,
+                bot=context.bot,
+            ):
+                text = await asyncio.to_thread(self.openai.transcribe, tmp_ogg)
+        except Exception:
+            # fallback: попробуем перекодировать в mp3, если установлен ffmpeg
+            try:
+                from pydub import AudioSegment  # требует ffmpeg в контейнере
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf2:
+                    tmp_mp3 = tf2.name
+                audio = AudioSegment.from_file(tmp_ogg)
+                audio.export(tmp_mp3, format="mp3")
+                async with ChatActionSender(
+                    action=ChatAction.RECORD_VOICE,
+                    chat_id=update.effective_chat.id,
+                    bot=context.bot,
+                ):
+                    text = await asyncio.to_thread(self.openai.transcribe, tmp_mp3)
+                os.unlink(tmp_mp3)
+            except Exception as e2:
+                await update.message.reply_text(
+                    "Не удалось распознать голосовое. "
+                    "Попробуйте прислать файл в формате mp3/m4a/wav или установите ffmpeg в образ."
+                )
+                logger.exception("Voice STT failed: %s", e2)
+                with suppress(Exception):
+                    os.unlink(tmp_ogg)
+                return
+
+        with suppress(Exception):
+            os.unlink(tmp_ogg)
+
+        # Если распознали, продолжим как обычный текстовый запрос
+        if text:
+            update.message.text = text
+            await self.on_text(update, context)
+
+    # ---------- Photos/Documents ----------
+    @only_allowed
+    async def on_file_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Если активирован режим загрузки в БЗ — принимаем файлы
+        awaiting_upload = context.user_data.get("await_kb_upload")
+        is_admin = (not self.admins) or (update.effective_user and update.effective_user.id in self.admins)
+
+        if awaiting_upload and is_admin:
+            try:
+                saved, remote = await self._save_incoming_to_yadisk(update, context)
+                await update.message.reply_text(f"📥 Загружено в БЗ: {remote}\nЗапускаю синхронизацию…")
+                await self._kb_sync_internal(update, context)
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка загрузки в БЗ: {e}")
+                logger.exception("KB upload failed: %s", e)
+            return
+
+        # Иначе просто информируем, что сделать
+        tip = "Чтобы добавить в БЗ, откройте /kb → «📥 Добавить из чата» (доступно администратору)."
+        await update.message.reply_text(tip)
+
+    async def _save_incoming_to_yadisk(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
+        """
+        Сохраняет фото/документ с сообщения в Я.Диск.
+        Возвращает (local_temp_path, remote_path).
+        """
+        y = yadisk.YaDisk(token=self.settings.yandex_disk_token)
+
+        # Определяем, что пришло
+        if update.message.document:
+            doc = update.message.document
+            file = await context.bot.get_file(doc.file_id)
+            filename = doc.file_name or f"file_{doc.file_unique_id}"
+            ext = os.path.splitext(filename)[1] or ".bin"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
+                local = tf.name
+            await file.download_to_drive(custom_path=local)
+        elif update.message.photo:
+            ph = update.message.photo[-1]  # самое большое качество
+            file = await context.bot.get_file(ph.file_id)
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            filename = f"photo_{ts}.jpg"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
+                local = tf.name
+            await file.download_to_drive(custom_path=local)
+        else:
+            raise ValueError("Нет поддерживаемого вложения")
+
+        # Куда кладём на Диске
+        root = self.settings.yandex_root_path.strip()
+        if not root.startswith("/"):
+            root = "/" + root
+        remote = f"disk:{root}/{filename}"
+
+        # Загрузка
+        y.upload(local_path=local, path=remote, overwrite=True)
+
+        return local, remote
 
     # ---------- Text handler ----------
     @only_allowed
@@ -693,10 +840,13 @@ class ChatGPTTelegramBot:
             titles = ", ".join([d.title for d in selected_docs][:10])
             kb_hint = f" Учитывай информацию из документов: {titles}."
 
-        # 3) Обновим заголовок диалога
+        # 3) Заголовок диалога
         self._ensure_conv_title(conv, update.message.text or "", db)
 
-        # 4) Запрос к OpenAI — в поток (не блокируем event loop)
+        # 4) Персональная модель
+        user_model = context.user_data.get("model", self.openai.model)
+
+        # 5) Запрос к OpenAI — в поток
         prompt = (update.message.text or "").strip()
         messages = [
             {"role": "system", "content": (sys_hint + kb_hint).strip()},
@@ -714,6 +864,7 @@ class ChatGPTTelegramBot:
                     messages,
                     temperature=temp,
                     max_output_tokens=4096,
+                    model=user_model,  # << персонально
                 )
         except Exception as e:
             await update.message.reply_text(f"Ошибка обращения к OpenAI: {e}")
