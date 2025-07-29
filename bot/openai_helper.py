@@ -1,7 +1,7 @@
 import logging
 from typing import List, Optional, Tuple, Dict, Any
-
 from base64 import b64decode
+
 from openai import OpenAI
 from openai import APIError, APIConnectionError, BadRequestError, PermissionDeniedError
 
@@ -14,8 +14,9 @@ class OpenAIHelper:
     Поддерживает:
       - chat (Chat Completions)
       - list_models()
-      - generate_image()
-      - transcribe()  — STT (Speech-to-Text)
+      - generate_image()  — генерация изображений (gpt-image-1 / dall-e-3)
+      - transcribe()      — STT (Speech-to-Text)
+      - answer_with_web() — Responses API + web_search
     """
 
     def __init__(
@@ -45,7 +46,7 @@ class OpenAIHelper:
         try:
             data = self.client.models.list()
             ids = [m.id for m in getattr(data, "data", [])]
-            # чуть отсортируем: «интересные» вперёд
+            # приоритизируем «часто используемые»
             prefer = ["gpt-4o", "gpt-4.1", "gpt-4", "gpt-3.5", "o4", "o3"]
             ids_sorted = sorted(
                 ids,
@@ -107,8 +108,10 @@ class OpenAIHelper:
         try:
             return _call(self.image_primary)
         except PermissionDeniedError as e:
-            logger.warning("Primary image model '%s' failed: %s. Trying '%s' fallback...",
-                           self.image_primary, e, self.image_fallback)
+            logger.warning(
+                "Primary image model '%s' failed: %s. Trying '%s' fallback...",
+                self.image_primary, e, self.image_fallback
+            )
             return _call(self.image_fallback)
         except Exception as e:
             logger.exception("Image generation failed: %s", e)
@@ -125,7 +128,6 @@ class OpenAIHelper:
                     model=self.stt_model,
                     file=f,
                 )
-            # в SDK текст доступен как .text
             text = getattr(tr, "text", None)
             if not text:
                 raise ValueError("Empty transcription result")
@@ -133,3 +135,48 @@ class OpenAIHelper:
         except Exception as e:
             logger.exception("STT failed: %s", e)
             raise
+
+    # -------- Responses + Web Search --------
+    def answer_with_web(self, prompt: str, *, model: Optional[str] = None) -> Tuple[str, List[Dict[str, str]]]:
+        """
+        Выполняет запрос с включенным web_search tool и возвращает (text, citations[]).
+        citations: список словарей {title, url}
+        """
+        use_model = model or self.model or "gpt-4o"
+        try:
+            resp = self.client.responses.create(
+                model=use_model,
+                input=prompt,
+                tools=[{"type": "web_search"}],
+            )
+
+            text_chunks: List[str] = []
+            citations: List[Dict[str, str]] = []
+
+            # Структура output: список шагов (сообщения, tool_calls и т.д.)
+            for out in getattr(resp, "output", []) or []:
+                if getattr(out, "type", None) == "message":
+                    for c in getattr(out, "content", []) or []:
+                        if getattr(c, "type", None) == "output_text" and getattr(c, "text", None):
+                            text_chunks.append(c.text)
+                        # аннотации со ссылками (если есть)
+                        for ann in (getattr(c, "annotations", []) or []):
+                            if getattr(ann, "type", None) == "url_citation":
+                                title = getattr(ann, "title", None)
+                                url = getattr(ann, "url", None)
+                                if url:
+                                    citations.append({"title": title or url, "url": url})
+
+            text = "\n".join(text_chunks).strip() or "Ничего не найдено."
+            # Убираем дубликаты ссылок
+            seen = set()
+            uniq = []
+            for it in citations:
+                if it["url"] not in seen:
+                    uniq.append(it)
+                    seen.add(it["url"])
+            return text, uniq
+
+        except Exception as e:
+            logger.exception("Web search failed: %s", e)
+            return f"Ошибка web‑поиска: {e}", []
