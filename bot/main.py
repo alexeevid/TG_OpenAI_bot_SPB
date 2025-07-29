@@ -35,7 +35,13 @@ def build_application():
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
 
     # OpenAI + Бот
-    openai = OpenAIHelper(settings=settings)
+    openai = OpenAIHelper(
+        api_key=settings.openai_api_key,
+        model=settings.openai_model,                 # дефолтная текстовая модель (например, "gpt-4o")
+        image_primary=settings.image_model,          # дефолт для /img (например, "gpt-image-1")
+        image_fallback="dall-e-3",                   # запасная на случай 403/нет доступа
+        stt_model=getattr(settings, "stt_model", "gpt-4o-mini-transcribe"),  # для голосовых
+    )
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
 
     # Если у бота есть install(app) — используем её
