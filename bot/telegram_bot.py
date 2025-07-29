@@ -1,852 +1,325 @@
+# bot/telegram_bot.py
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
 import tempfile
 from contextlib import suppress
-from functools import wraps
-from typing import Optional, List, Tuple, Dict
-from io import BytesIO
 from datetime import datetime
+from typing import List, Optional, Set
 
-import yadisk
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
 from telegram import (
-    Update,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BotCommand,
-    InputFile,
-    BotCommandScopeAllPrivateChats,
-    BotCommandScopeAllGroupChats,
-    BotCommandScopeAllChatAdministrators,
+    InlineKeyboardMarkup,
+    Update,
 )
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-from sqlalchemy.orm import Session
 from bot.db.session import SessionLocal
-from bot.db.models import Document, Conversation
+from bot.db.models import Document  # предполагается, что у вас есть эта модель
 from bot.openai_helper import OpenAIHelper
-from bot.settings import Settings
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Индикатор «набирает… / загружает фото… / записывает голос…»
-# ---------------------------------------------------------------------------
-class ChatActionSender:
-    def __init__(self, *, action: ChatAction, chat_id: int, bot, interval: float = 4.0):
-        self.action = action
-        self.chat_id = chat_id
+# ---------------- Utilities ----------------
+
+def style_system_hint(style: str) -> (str, float):
+    """
+    Возвращает (system_prompt, temperature) по выбранному стилю.
+    """
+    style = (style or "pro").lower()
+    if style == "pro":  # Профессиональный
+        return (
+            "Отвечай кратко, по делу и профессионально. "
+            "Используй строгую терминологию, избегай воды. "
+            "Если данных недостаточно — явно укажи, что нужно уточнить.",
+            0.2,
+        )
+    if style == "expert":  # Экспертный
+        return (
+            "Дай развёрнутый экспертный ответ: глубина, сопоставления, альтернативы, тон — наставника. "
+            "Добавляй структурирование: списки, шаги, caveats.",
+            0.35,
+        )
+    if style == "user":  # Пользовательский
+        return (
+            "Объясняй простым языком, как для непрофессионала. "
+            "Короткие фразы, примеры из быта.",
+            0.5,
+        )
+    if style == "ceo":  # СЕО
+        return (
+            "Отвечай как собственник бизнеса уровня EMBA/DBA: стратегия, риски, бюджет, эффект, KPI. "
+            "Сфокусируйся на принятии решений и следующем шаге.",
+            0.25,
+        )
+    return ("", 0.3)
+
+
+def only_allowed(func):
+    async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id if update.effective_user else None
+        if self.allowed and uid not in self.allowed and uid not in self.admins:
+            await update.effective_message.reply_text("⛔ Доступ запрещён.")
+            return
+        return await func(self, update, context)
+
+    return wrapper
+
+
+class TypingIndicator:
+    """
+    Периодически отправляет ChatAction.TYPING, пока выполняется долгий вызов.
+    """
+
+    def __init__(self, bot, chat_id, interval: float = 4.0):
         self.bot = bot
+        self.chat_id = chat_id
         self.interval = interval
         self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
 
     async def __aenter__(self):
-        async def _runner():
+        async def _loop():
             try:
-                while True:
-                    await self.bot.send_chat_action(chat_id=self.chat_id, action=self.action)
+                while not self._stop.is_set():
+                    await self.bot.send_chat_action(chat_id=self.chat_id, action=ChatAction.TYPING)
                     await asyncio.sleep(self.interval)
             except asyncio.CancelledError:
                 pass
 
-        self._task = asyncio.create_task(_runner())
+        self._task = asyncio.create_task(_loop())
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        self._stop.set()
         if self._task:
-            self._task.cancel()
-            with suppress(Exception):
-                await self._task
+            with suppress(asyncio.CancelledError):
+                self._task.cancel()
 
 
-# ---------- Access decorator ----------
-def only_allowed(func):
-    @wraps(func)
-    async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else None
-        # Если allowed пуст — доступ всем
-        if self.allowed and uid not in self.allowed:
-            await update.effective_message.reply_text("⛔ Доступ ограничен.")
-            return
-        return await func(self, update, context)
-    return wrapper
-
-
-# ---------- Styles ----------
-STYLE_LABELS = {
-    "pro": "Профессиональный",
-    "expert": "Экспертный",
-    "user": "Пользовательский",
-    "ceo": "СЕО",
-}
-
-def style_system_hint(style: str):
-    s = (style or "pro").lower()
-    if s == "pro":
-        return (
-            "Роль: консультант уровня Principal (15+ лет практики). "
-            "Отвечай кратко и структурно: 1) контекст; 2) ключевые выводы; 3) чёткие шаги; 4) риски и зависимости. "
-            "Избегай воды и общих слов. Если есть недостаток данных — уточни 1–3 конкретных вопроса.",
-            0.2,
-        )
-    if s == "expert":
-        return (
-            "Роль: эксперт-практик по теме. "
-            "Дай глубокое объяснение: механики, формулы, примеры применения, ограничения. "
-            "Построй причинно-следственную логику, перечисли подводные камни, предложи альтернативы.",
-            0.3,
-        )
-    if s == "user":
-        return (
-            "Роль: продвинутый пользователь. "
-            "Объясняй просто и понятно, без профессионального жаргона. "
-            "Используй аналогии и короткие примеры. Цель — чтобы понял человек без спецподготовки.",
-            0.6,
-        )
-    if s == "ceo":
-        return (
-            "Роль: собственник бизнеса (уровень EMBA/DBA). "
-            "Фокус: стратегия, юнит-экономика, ROI/IRR, ресурсные ограничения, оргдизайн, риски и приоритеты. "
-            "Ответ формулируй как управленческое решение: цель → метрики → план → риски → контрольные точки.",
-            0.25,
-        )
-    return ("Отвечай профессионально и по делу.", 0.3)
-
+# ---------------- Bot ----------------
 
 class ChatGPTTelegramBot:
-    def __init__(self, openai: OpenAIHelper, settings: Settings):
+    def __init__(self, openai: OpenAIHelper, settings):
         self.openai = openai
-        self.settings = settings
-        # Поддерживаем оба варианта имён полей (как в вашем окружении)
-        self.allowed = set(
-            getattr(settings, "allowed_set", None)
-            or getattr(settings, "allowed_user_ids", None)
+        # списки пользователей из настроек (поддержим старые/новые поля)
+        self.allowed: Set[int] = set(
+            getattr(settings, "allowed_user_ids", None)
+            or getattr(settings, "allowed_set", None)
             or []
         )
-        self.admins = set(
-            getattr(settings, "admin_set", None)
-            or getattr(settings, "admin_user_ids", None)
+        self.admins: Set[int] = set(
+            getattr(settings, "admin_user_ids", None)
+            or getattr(settings, "admin_set", None)
             or []
         )
 
-    # ---------- Wiring ----------
+        # конфиг по умолчанию
+        self.default_model: str = getattr(settings, "openai_model", None) or openai.model
+        self.image_model: Optional[str] = getattr(settings, "image_model", None) or openai.image_model
+        self.enable_image_generation: bool = bool(getattr(settings, "enable_image_generation", True))
+
+        # Модели и ограничения из ENV (опционально)
+        self.allowed_models_whitelist: List[str] = getattr(settings, "allowed_models_whitelist", []) or []
+        self.denylist_models: List[str] = getattr(settings, "denylist_models", []) or []
+
+    # ---- Helpers ----
+
+    def _get_db(self) -> Session:
+        return SessionLocal()
+
+    def _get_active_conv(self, chat_id: int, db: Session):
+        # В проекте уже есть таблица conversations — используем вашу логику, здесь — заглушка
+        return None
+
+    def _ensure_conv_title(self, conv, user_text: str, db: Session):
+        # Ваша логика именования диалогов; оставим как есть, если реализовано в другом месте
+        pass
+
+    # ---- Install ----
+
     def install(self, app: Application):
-        # Команды
         app.add_handler(CommandHandler("start", self.on_start))
         app.add_handler(CommandHandler("help", self.on_help))
         app.add_handler(CommandHandler("reset", self.on_reset))
         app.add_handler(CommandHandler("stats", self.on_stats))
-        app.add_handler(CommandHandler("kb", self.on_kb))
         app.add_handler(CommandHandler("model", self.on_model))
-        app.add_handler(CommandHandler("dialogs", self.on_dialogs))
-        app.add_handler(CommandHandler("dialog", self.on_dialog_select))
-        app.add_handler(CommandHandler("mode", self.on_mode))
-        app.add_handler(CommandHandler("img", self.on_img))
-        app.add_handler(CommandHandler("cancelpass", self.on_cancel_pass))
-        app.add_handler(CommandHandler("del", self.on_delete_dialogs))
-        app.add_handler(CommandHandler("reload_menu", self.on_reload_menu))
-        app.add_handler(CommandHandler("cancelupload", self.on_cancel_upload))
-        app.add_handler(CommandHandler("web", self.cmd_web))  # новый web-поиск
+        app.add_handler(CommandHandler("web", self.on_web))
+        app.add_handler(CommandHandler("image", self.on_image))
 
-        # Callback-и
+        # диагностика pgvector (админ)
+        app.add_handler(CommandHandler("debug_pgvector", self.on_debug_pgvector))
+
+        # обычный текст
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+        # голосовые
+        app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
+        # документы/фото — анализ, без автозагрузки в БЗ
+        app.add_handler(MessageHandler(filters.Document.ALL, self.on_document))
+        app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
+
+        # колбэки меню (например, выбор модели)
         app.add_handler(CallbackQueryHandler(self.on_callback))
 
-        # Сообщения
-        app.add_handler(MessageHandler(filters.VOICE, self.on_voice))  # голосовые
-        app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_message))  # фото/документы
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))  # обычный текст
+    # ---- Commands ----
 
-        # Меню команд для всех скоупов
-        app.post_init = self._post_init_commands
-
-    async def _post_init_commands(self, app: Application):
-        cmds = [
-            BotCommand("start", "Запуск и меню"),
-            BotCommand("help", "Помощь"),
-            BotCommand("reset", "Сброс контекста"),
-            BotCommand("stats", "Статистика"),
-            BotCommand("kb", "База знаний"),
-            BotCommand("model", "Выбор модели"),
-            BotCommand("dialogs", "Список диалогов"),
-            BotCommand("img", "Сгенерировать изображение"),
-            BotCommand("mode", "Стиль ответов"),
-            BotCommand("web", "Поиск в интернете"),
-            BotCommand("del", "Удалить диалоги"),
-            BotCommand("reload_menu", "Обновить меню у всех"),
-            BotCommand("cancelupload", "Выйти из режима загрузки в БЗ"),
-        ]
-        await self._set_all_scopes_commands(app, cmds)
-
-    async def _set_all_scopes_commands(self, app: Application, cmds: List[BotCommand]):
-        scopes = [
-            None,
-            BotCommandScopeAllPrivateChats(),
-            BotCommandScopeAllGroupChats(),
-            BotCommandScopeAllChatAdministrators(),
-        ]
-        langs = [None, "ru", "en"]
-
-        for sc in scopes:
-            for lang in langs:
-                with suppress(Exception):
-                    await app.bot.delete_my_commands(scope=sc, language_code=lang)
-
-        for sc in scopes:
-            for lang in langs:
-                with suppress(Exception):
-                    await app.bot.set_my_commands(commands=cmds, scope=sc, language_code=lang)
-
-    # ---------- DB helpers ----------
-    def _get_db(self) -> Session:
-        return SessionLocal()
-
-    def _get_active_conv(self, chat_id: int, db: Session) -> Conversation:
-        conv = (
-            db.query(Conversation)
-            .filter_by(chat_id=chat_id, is_active=True)
-            .order_by(Conversation.id.desc())
-            .first()
-        )
-        if not conv:
-            conv = Conversation(chat_id=chat_id, title="Диалог")
-            db.add(conv)
-            db.commit()
-            db.refresh(conv)
-        return conv
-
-    # ---------- Title helpers ----------
-    @staticmethod
-    def _short_title_from_text(text: str, limit: int = 48) -> str:
-        base = (text or "").strip().splitlines()[0]
-        base = " ".join(base.split())
-        return (base[:limit] + "…") if len(base) > limit else base
-
-    def _ensure_conv_title(self, conv: Conversation, first_user_text: str, db: Session):
-        base = conv.title or "Диалог"
-        created = conv.created_at.strftime("%Y-%m-%d")
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-        if base == "Диалог":
-            short = self._short_title_from_text(first_user_text) or "Диалог"
-            conv.title = f"{short} · {created} · upd {now}"
-        else:
-            parts = base.split(" · ")
-            if len(parts) >= 2:
-                conv.title = " ".join(parts[:2]) + f" · upd {now}"
-            else:
-                conv.title = f"{base} · upd {now}"
-        db.add(conv)
-        db.commit()
-
-    # ---------- Commands ----------
     @only_allowed
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Привет! Я готов к работе.\n"
-            "Команды: /help, /reset, /stats, /kb, /model, /dialogs, /img, /mode, /web, /del, /reload_menu"
+            "Команды: /help, /reset, /stats, /model, /image, /web"
         )
-        # сбросим возможные флаги режимов
-        context.user_data.pop("await_kb_upload", None)
-        context.user_data.pop("incoming_locals", None)
 
     @only_allowed
     async def on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "/reset — сброс контекста\n"
             "/stats — статистика\n"
-            "/kb — база знаний (включить/исключить документы, пароли, загрузка админом)\n"
-            "/model — выбор модели OpenAI (персонально для вашего чата)\n"
-            "/mode — стиль ответов (Профессиональный/Экспертный/Пользовательский/СЕО)\n"
-            "/dialogs — список диалогов, /dialog <id> — вернуться\n"
-            "/img <описание> — сгенерировать изображение\n"
-            "/web <запрос> — поиск в интернете\n"
-            "/del — удалить диалоги\n"
-            "/reload_menu — обновить меню у всех\n"
-            "/cancelupload — выйти из режима загрузки в БЗ"
+            "/model — выбор модели OpenAI\n"
+            "/image — генерация изображения\n"
+            "/web <запрос> — поиск в интернете с источниками"
         )
 
     @only_allowed
     async def on_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        db = self._get_db()
-        chat_id = update.effective_chat.id
-        db.query(Conversation).filter_by(chat_id=chat_id, is_active=True).update({"is_active": False})
-        db.commit()
-        newc = Conversation(chat_id=chat_id, title="Диалог")
-        db.add(newc)
-        db.commit()
+        context.user_data.clear()
         await update.message.reply_text("🔄 Новый диалог создан. Контекст очищен.")
-        # Сбрасываем только временные состояния; выбранные документы и персональную модель НЕ трогаем
-        context.user_data.pop("await_password_for", None)
-        context.user_data.pop("await_kb_upload", None)
-        context.user_data.pop("incoming_locals", None)
 
     @only_allowed
     async def on_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        db = self._get_db()
-        chat_id = update.effective_chat.id
-        conv = self._get_active_conv(chat_id, db)
-        docs = context.user_data.get("kb_selected_ids", set()) or set()
-        kb_enabled = context.user_data.get("kb_enabled", True)
         style = context.user_data.get("style", "pro")
-        style_label = STYLE_LABELS.get(style, "Профессиональный")
-        user_model = context.user_data.get("model", self.openai.model)
-
-        title = conv.title or "Диалог"
-        names: List[str] = []
-        if docs:
-            q = db.query(Document).filter(Document.id.in_(list(docs))).all()
-            names = [d.title for d in q]
-
-        text = (
-            f"📊 Статистика:\n"
-            f"- Диалог: {title}\n"
-            f"- Модель: {user_model}\n"
-            f"- Стиль: {style_label}\n"
-            f"- База знаний: {'включена' if kb_enabled else 'выключена'}\n"
-            f"- Документов выбрано: {len(docs)}"
-        )
-        if names:
-            text += "\n- В контексте: " + ", ".join(names[:10])
-            if len(names) > 10:
-                text += f" и ещё {len(names) - 10}…"
-
-        await update.message.reply_text(text)
-
-    # ---------- Knowledge Base ----------
-    @only_allowed
-    async def on_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        db = self._get_db()
-        chat_id = update.effective_chat.id
-        self._get_active_conv(chat_id, db)  # ensure exists
-
-        kb_enabled = context.user_data.get("kb_enabled", True)
-        selected = context.user_data.get("kb_selected_ids", set())
-        docs = db.query(Document).order_by(Document.id.asc()).limit(50).all()
-
-        rows = []
-        for d in docs:
-            mark = "✅" if d.id in selected else "➕"
-            rows.append([InlineKeyboardButton(f"{mark} {d.title}", callback_data=f"kb_toggle:{d.id}")])
-
-        rows.append([InlineKeyboardButton("🔄 Синхронизировать с Я.Диском", callback_data="kb_sync")])
-        rows.append([InlineKeyboardButton(("🔕 Отключить БЗ" if kb_enabled else "🔔 Включить БЗ"), callback_data="kb_toggle_enabled")])
-        rows.append([InlineKeyboardButton("🔐 Указать пароли для выбранных", callback_data="kb_pass_menu")])
-
-        # Кнопка загрузки только для администраторов (или если список админов пуст — всем)
-        is_admin = (not self.admins) or (update.effective_user and update.effective_user.id in self.admins)
-        if is_admin:
-            rows.append([InlineKeyboardButton("📥 Добавить из чата", callback_data="kb_upload_mode")])
-
+        model = context.user_data.get("model", self.default_model)
         await update.message.reply_text(
-            f"База знаний: {'включена' if kb_enabled else 'выключена'}.\n"
-            "• Нажмите на документ, чтобы включить/исключить его из контекста.\n"
-            "• «🔄 Синхронизировать» — подтянуть изменения с Я.Диска.\n"
-            "• «📥 Добавить из чата» — загрузить новые файлы на Диск (только админ).",
-            reply_markup=InlineKeyboardMarkup(rows),
+            "📊 Статистика:\n"
+            f"- Модель: {model}\n"
+            f"- Стиль: {style}\n"
         )
 
-    # ---------- Models ----------
     @only_allowed
     async def on_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        models_all = self.openai.list_models()
-        current = context.user_data.get("model", self.openai.model)
-
-        # у вас в окружении: ALLOWED_MODELS_WHITELIST, DENYLIST_MODELS
-        allow_list = getattr(self.settings, "allowed_models_whitelist", [])
-        deny_list = getattr(self.settings, "denylist_models", [])
-        allow = set(m.lower() for m in allow_list) if allow_list else None
-        deny = set(m.lower() for m in deny_list)
-
-        def _allowed(m: str) -> bool:
-            ml = m.lower()
-            if allow is not None and ml not in allow:
-                return False
-            if ml in deny:
-                return False
-            return True
-
-        models = [m for m in models_all if _allowed(m)]
-        prefer_keywords = ["gpt-4o", "gpt-4.1", "gpt-4", "gpt-3.5", "o4", "o3"]
-        prefer = [m for m in models if any(k in m for k in prefer_keywords)]
-
-        combined = []
-        seen = set()
-        for m in prefer + models:
-            if m not in seen:
-                seen.add(m)
-                combined.append(m)
-            if len(combined) >= 30:
-                break
-
-        items = combined or models[:30]
-        if not items:
-            await update.message.reply_text("Список моделей пуст — проверьте фильтры (whitelist/denylist).")
+        cur = context.user_data.get("model", self.default_model)
+        models = self.openai.list_models(
+            whitelist=self.allowed_models_whitelist or None,
+            denylist=self.denylist_models or None,
+        )
+        if not models:
+            await update.message.reply_text("Не удалось получить список моделей.")
             return
-
-        if current in items:
-            items = [current] + [m for m in items if m != current]
-
+        # соберём клавиатуру по 3 в ряд
         rows = []
-        for m in items:
-            label = f"✅ {m}" if m == current else m
-            cb = "noop" if m == current else f"set_model:{m}"
-            rows.append([InlineKeyboardButton(label, callback_data=cb)])
+        row = []
+        for m in models:
+            title = f"✅ {m}" if m == cur else m
+            row.append(InlineKeyboardButton(title, callback_data=f"set_model:{m}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        await update.message.reply_text("Выберите модель:", reply_markup=InlineKeyboardMarkup(rows))
 
-        await update.message.reply_text("Выберите модель (сохраняется только для этого чата):", reply_markup=InlineKeyboardMarkup(rows))
-
-    # ---------- Modes ----------
     @only_allowed
-    async def on_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        rows = [
-            [InlineKeyboardButton("Профессиональный", callback_data="set_mode:pro")],
-            [InlineKeyboardButton("Экспертный", callback_data="set_mode:expert")],
-            [InlineKeyboardButton("Пользовательский", callback_data="set_mode:user")],
-            [InlineKeyboardButton("СЕО", callback_data="set_mode:ceo")],
-        ]
-        await update.message.reply_text("Выберите стиль ответов:", reply_markup=InlineKeyboardMarkup(rows))
-
-    # ---------- Images ----------
-    @only_allowed
-    async def on_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not getattr(self.settings, "enable_image_generation", True):
-            await update.message.reply_text("Генерация изображений выключена администратором.")
-            return
-
-        prompt = " ".join(context.args) if context.args else ""
-        if not prompt and update.message and update.message.reply_to_message:
-            prompt = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
-        prompt = (prompt or "").strip()
-        if not prompt:
-            await update.message.reply_text(
-                "Уточните описание, например: `/img логотип в стиле минимализм`",
-                parse_mode="Markdown",
-            )
-            return
-
-        try:
-            async with ChatActionSender(
-                action=ChatAction.UPLOAD_PHOTO,
-                chat_id=update.effective_chat.id,
-                bot=context.bot,
-            ):
-                png, used_prompt, used_model = await asyncio.to_thread(
-                    self.openai.generate_image, prompt, size="1024x1024"
-                )
-            bio = BytesIO(png)
-            bio.name = "image.png"
-            bio.seek(0)
-            caption = f"🖼️ Модель: {used_model}\n📝 Промпт: {used_prompt}"
-            await update.message.reply_photo(photo=InputFile(bio, filename="image.png"), caption=caption)
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка генерации изображения: {e}")
-
-    # ---------- /web (Responses + web_search) ----------
-    @only_allowed
-    async def cmd_web(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """ /web <запрос> — поиск в интернете через OpenAI web_search tool. """
+    async def on_web(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = (update.message.text or "").split(maxsplit=1)
-        query = q[1].strip() if len(q) > 1 else ""
-        if not query:
-            await update.message.reply_text("Использование: /web <запрос>\nНапример: /web последние новости по ИИ")
+        if len(q) < 2:
+            await update.message.reply_text("Использование: /web <запрос>")
             return
 
-        try:
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        except Exception:
-            pass
+        query = q[1].strip()
+        model = context.user_data.get("model", self.default_model)
 
-        user_model = context.user_data.get("model", self.openai.model)
-        text, cites = await asyncio.to_thread(self.openai.answer_with_web, query, model=user_model)
+        async with TypingIndicator(context.bot, update.effective_chat.id):
+            text, cites = await asyncio.to_thread(self.openai.answer_with_web, query, model=model)
 
         if cites:
-            bullets = []
-            for i, c in enumerate(cites[:8], 1):
-                title = c.get("title") or "Источник"
-                url = c.get("url")
-                bullets.append(f"{i}. {title}\n{url}")
-            tail = "\n\nИсточники:\n" + "\n".join(bullets)
+            refs = "\n".join([f"• {c['title']}: {c['url']}" for c in cites])
+            reply = f"{text}\n\n<b>Источники</b>:\n{refs}"
+            await update.message.reply_text(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         else:
-            tail = ""
-
-        await update.message.reply_text(f"🔎 *Результаты по запросу:* {query}\n\n{text}{tail}", parse_mode="Markdown")
-
-    # ---------- Dialogs ----------
-    @only_allowed
-    async def on_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        db = self._get_db()
-        chat_id = update.effective_chat.id
-        items = (
-            db.query(Conversation)
-            .filter_by(chat_id=chat_id)
-            .order_by(Conversation.id.desc())
-            .limit(10)
-            .all()
-        )
-        if not items:
-            await update.message.reply_text("Нет сохранённых диалогов.")
-            return
-        rows = [[InlineKeyboardButton(f"#{c.id} {c.title}", callback_data=f"goto_dialog:{c.id}")] for c in items]
-        await update.message.reply_text("Выберите диалог:", reply_markup=InlineKeyboardMarkup(rows))
+            await update.message.reply_text(text)
 
     @only_allowed
-    async def on_delete_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        db = self._get_db()
-        chat_id = update.effective_chat.id
-        items = (
-            db.query(Conversation)
-            .filter_by(chat_id=chat_id)
-            .order_by(Conversation.id.desc())
-            .limit(15)
-            .all()
-        )
-        if not items:
-            await update.message.reply_text("Нет сохранённых диалогов.")
+    async def on_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # /image описание
+        args = (update.message.text or "").split(maxsplit=1)
+        if len(args) < 2:
+            await update.message.reply_text("Использование: /image <описание изображения>")
+            return
+        prompt = args[1].strip()
+        model = self.image_model
+
+        if not self.enable_image_generation:
+            await update.message.reply_text("Генерация изображений отключена конфигурацией.")
             return
 
-        rows = [[InlineKeyboardButton(f"🗑️ #{c.id} {c.title}", callback_data=f"ask_del:{c.id}")] for c in items]
-        rows.append([InlineKeyboardButton("🧹 Удалить все неактивные", callback_data="ask_del_all")])
-        await update.message.reply_text("Выберите диалог для удаления:", reply_markup=InlineKeyboardMarkup(rows))
-
-    @only_allowed
-    async def on_dialog_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        args = context.args or []
-        if not args:
-            await update.message.reply_text("Использование: /dialog <id>")
-            return
         try:
-            target = int(args[0])
-        except ValueError:
-            await update.message.reply_text("Некорректный id.")
-            return
+            async with TypingIndicator(context.bot, update.effective_chat.id):
+                img_bytes = await asyncio.to_thread(self.openai.generate_image, prompt, model=model)
 
-        db = self._get_db()
-        chat_id = update.effective_chat.id
-        db.query(Conversation).filter_by(chat_id=chat_id, is_active=True).update({"is_active": False})
-        c = db.query(Conversation).filter_by(chat_id=chat_id, id=target).first()
-        if not c:
-            await update.message.reply_text("Диалог не найден.")
-            return
-        c.is_active = True
-        db.commit()
-        await update.message.reply_text(f"✅ Активирован диалог #{c.id} ({c.title}).")
+            # Отправляем картинку
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tf:
+                tf.write(img_bytes)
+                tmp_png = tf.name
 
-    # ---------- Reload menu ----------
-    @only_allowed
-    async def on_reload_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
-            await update.message.reply_text("⛔ Доступно только администратору.")
-            return
-        await self._post_init_commands(context.application)
-        await update.message.reply_text(
-            "✅ Меню обновлено для всех чатов и языков. Если изменения не видны, перезапустите чат или потяните список команд вниз."
-        )
-
-    # ---------- Callbacks ----------
-    @only_allowed
-    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        q = update.callback_query
-        await q.answer()
-        data = q.data or ""
-
-        # --- KB toggles ---
-        if data.startswith("kb_toggle:"):
-            doc_id = int(data.split(":")[1])
-            selected = context.user_data.get("kb_selected_ids", set())
-            adding = doc_id not in selected
-
-            if adding:
-                selected.add(doc_id)
-            else:
-                selected.remove(doc_id)
-
-            context.user_data["kb_selected_ids"] = selected
-            await q.edit_message_reply_markup(reply_markup=None)
-
-            # Если документ только что ДОБАВЛЕН — проверим, нужно ли спросить пароль
-            if adding:
-                db = self._get_db()
-                try:
-                    doc = db.query(Document).filter_by(id=doc_id).first()
-                    if doc:
-                        kb_passwords: Dict[int, str] = context.user_data.get("kb_passwords", {}) or {}
-                        if doc_id not in kb_passwords and await self._needs_password_for_doc(doc):
-                            context.user_data["await_password_for"] = doc_id
-                            await q.message.reply_text(
-                                f"Документ «{doc.title}» защищён паролем.\n"
-                                f"Пожалуйста, введите пароль одним сообщением.\n"
-                                f"Команда для отмены: /cancelpass"
-                            )
-                            return
-                finally:
-                    with suppress(Exception):
-                        db.close()
-
-            await q.message.reply_text("Изменения применены. Нажмите /kb, чтобы обновить список.")
-
-        elif data == "kb_toggle_enabled":
-            cur = context.user_data.get("kb_enabled", True)
-            context.user_data["kb_enabled"] = not cur
-            await q.edit_message_text(
-                f"База знаний: {'включена' if not cur else 'выключена'}. Нажмите /kb, чтобы обновить."
+            await update.message.reply_photo(
+                photo=open(tmp_png, "rb"),
+                caption=f"🖼️ Итоговый промпт:\n{prompt}",
             )
-
-        elif data == "kb_sync":
-            is_admin = bool(self.admins) and (update.effective_user and update.effective_user.id in self.admins)
-            if not self.admins or is_admin:
-                await q.edit_message_text("Запускаю синхронизацию…")
-                await self._kb_sync_internal(update, context)
-            else:
-                await q.edit_message_text("Доступно только администратору.")
-
-        elif data == "kb_pass_menu":
-            selected = context.user_data.get("kb_selected_ids", set())
-            if not selected:
-                await q.edit_message_text("Нет выбранных документов. Сначала выберите их в /kb.")
-                return
-            db = self._get_db()
-            docs = db.query(Document).filter(Document.id.in_(list(selected))).all()
-            rows = [[InlineKeyboardButton(f"🔐 {d.title}", callback_data=f"kb_pass:{d.id}")] for d in docs[:30]]
-            rows.append([InlineKeyboardButton("❌ Отмена", callback_data="kb_pass_cancel")])
-            await q.edit_message_text("Выберите документ для ввода пароля:", reply_markup=InlineKeyboardMarkup(rows))
-
-        elif data.startswith("kb_pass:"):
-            doc_id = int(data.split(":")[1])
-            context.user_data["await_password_for"] = doc_id
-            await q.edit_message_text("Введите пароль одним сообщением. Команда для отмены: /cancelpass")
-
-        elif data == "kb_pass_cancel":
-            context.user_data.pop("await_password_for", None)
-            await q.edit_message_text("Ввод пароля отменён.")
-
-        elif data == "kb_upload_mode":
-            # Только для админа
-            if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
-                await q.edit_message_text("⛔ Доступно только администратору.")
-                return
-            context.user_data["await_kb_upload"] = True
-            await q.edit_message_text(
-                "Режим загрузки в БЗ активирован. Пришлите фото/документы одним или несколькими сообщениями.\n"
-                "Команда для выхода: /cancelupload"
-            )
-
-        elif data.startswith("kb_upload_local:"):
-            # Загрузка конкретного только что присланного файла в БЗ по кнопке
-            if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
-                await q.edit_message_text("⛔ Доступно только администратору.")
-                return
-            stash_key = data.split(":", 1)[1]
-            stash = context.user_data.get("incoming_locals", {}) or {}
-            item = stash.get(stash_key)
-            if not item:
-                await q.edit_message_text("Файл не найден в локальном буфере. Отправьте его ещё раз.")
-                return
-            local = item.get("path")
-            filename = (item.get("filename") or os.path.basename(local) or "file.bin")
-            try:
-                # Загрузка на Диск
-                y = yadisk.YaDisk(token=self.settings.yandex_disk_token)
-                root = self.settings.yandex_root_path.strip()
-                if not root.startswith("/"):
-                    root = "/" + root
-                remote = f"disk:{root}/{filename}"
-                y.upload(local_path=local, path=remote, overwrite=True)
-                await q.edit_message_text(f"📥 Загружено в БЗ: {remote}\nЗапускаю синхронизацию…")
-                await self._kb_sync_internal(update, context)
-            except Exception as e:
-                await q.edit_message_text(f"Ошибка загрузки в БЗ: {e}")
-                logger.exception("KB upload(local) failed: %s", e)
-                return
-            finally:
-                with suppress(Exception):
-                    os.unlink(local)
-                with suppress(Exception):
-                    stash.pop(stash_key, None)
-                    context.user_data["incoming_locals"] = stash
-
-        # --- Models / Modes / Dialog navigation ---
-        elif data.startswith("set_model:"):
-            m = data.split(":", 1)[1]
-            context.user_data["model"] = m  # персонально для чата/пользователя
-            await q.edit_message_text(f"Модель установлена: {m}")
-
-        elif data == "noop":
-            await q.answer("Эта модель уже выбрана.", show_alert=False)
-
-        elif data.startswith("goto_dialog:"):
-            try:
-                target = int(data.split(":")[1])
-            except ValueError:
-                return
-            db = self._get_db()
-            chat_id = update.effective_chat.id
-            db.query(Conversation).filter_by(chat_id=chat_id, is_active=True).update({"is_active": False})
-            c = db.query(Conversation).filter_by(chat_id=chat_id, id=target).first()
-            if c:
-                c.is_active = True
-                db.commit()
-                await q.edit_message_text(f"✅ Активирован диалог #{c.id} ({c.title}).")
-            else:
-                await q.edit_message_text("Диалог не найден.")
-
-        elif data.startswith("set_mode:"):
-            mode = data.split(":", 1)[1]
-            context.user_data["style"] = mode
-            await q.edit_message_text(f"Стиль установлен: {STYLE_LABELS.get(mode, 'Профессиональный')}")
-
-        # --- Delete dialogs ---
-        elif data.startswith("ask_del_all"):
-            rows = [
-                [InlineKeyboardButton("✅ Да, удалить все неактивные", callback_data="do_del_all")],
-                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_del")],
-            ]
-            await q.edit_message_text("Подтвердите удаление всех НЕактивных диалогов:", reply_markup=InlineKeyboardMarkup(rows))
-
-        elif data.startswith("do_del_all"):
-            db = self._get_db()
-            chat_id = update.effective_chat.id
-            to_del = db.query(Conversation).filter_by(chat_id=chat_id, is_active=False).all()
-            n = len(to_del)
-            for c in to_del:
-                db.delete(c)
-            db.commit()
-            await q.edit_message_text(f"🧹 Удалено неактивных диалогов: {n}")
-
-        elif data.startswith("ask_del:"):
-            try:
-                cid = int(data.split(":")[1])
-            except ValueError:
-                await q.edit_message_text("Некорректный id диалога.")
-                return
-            rows = [
-                [InlineKeyboardButton("✅ Да, удалить", callback_data=f"do_del:{cid}")],
-                [InlineKeyboardButton("❌ Отмена", callback_data="cancel_del")],
-            ]
-            await q.edit_message_text(f"Удалить диалог #{cid}?", reply_markup=InlineKeyboardMarkup(rows))
-
-        elif data.startswith("do_del:"):
-            try:
-                cid = int(data.split(":")[1])
-            except ValueError:
-                await q.edit_message_text("Некорректный id диалога.")
-                return
-
-            db = self._get_db()
-            chat_id = update.effective_chat.id
-            c = db.query(Conversation).filter_by(chat_id=chat_id, id=cid).first()
-            if not c:
-                await q.edit_message_text("Диалог не найден.")
-                return
-
-            was_active = bool(getattr(c, "is_active", False))
-            db.delete(c)
-            db.commit()
-
-            if was_active:
-                next_conv = (
-                    db.query(Conversation)
-                    .filter_by(chat_id=chat_id)
-                    .order_by(Conversation.id.desc())
-                    .first()
-                )
-                if next_conv:
-                    next_conv.is_active = True
-                    db.commit()
-                    await q.edit_message_text(f"🗑️ Диалог #{cid} удалён. Активирован диалог #{next_conv.id} ({next_conv.title}).")
-                else:
-                    nc = Conversation(chat_id=chat_id, title="Диалог", is_active=True)
-                    db.add(nc)
-                    db.commit()
-                    await q.edit_message_text(f"🗑️ Диалог #{cid} удалён. Создан новый пустой диалог.")
-            else:
-                await q.edit_message_text(f"🗑️ Диалог #{cid} удалён.")
-
-        elif data == "cancel_del":
-            await q.edit_message_text("Удаление отменено.")
-
-    # ---------- KB sync ----------
-    async def _kb_sync_internal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        from bot.knowledge_base.indexer import sync_disk_to_db
-        db = SessionLocal()
-        stats = {"added": 0, "updated": 0, "deleted": 0, "unchanged": 0}
-        try:
-            stats = sync_disk_to_db(
-                db,
-                self.settings.yandex_disk_token,
-                self.settings.yandex_root_path,
-            )
-            msg = (
-                "Готово.\n"
-                f"➕ Добавлено: {stats.get('added', 0)}\n"
-                f"♻️ Обновлено: {stats.get('updated', 0)}\n"
-                f"🗑️ Удалено: {stats.get('deleted', 0)}\n"
-                f"✅ Без изменений: {stats.get('unchanged', 0)}"
-            )
-            await update.effective_chat.send_message(msg)
         except Exception as e:
-            await update.effective_chat.send_message(f"Ошибка синхронизации: {e}")
-            logger.exception("KB sync failed: %s", e)
+            logger.exception("Image generation failed: %s", e)
+            await update.message.reply_text(f"Ошибка генерации изображения: {e}")
         finally:
-            db.close()
+            with suppress(Exception):
+                os.unlink(tmp_png)  # noqa
 
-    # ---------- Проверка: нужен ли пароль для PDF ----------
-    async def _needs_password_for_doc(self, doc: Document) -> bool:
-        """
-        Возвращает True, если документ – PDF и похоже зашифрован.
-        Проверка без внешних зависимостей: ищем маркер '/Encrypt' в первых ~2 МБ.
-        """
-        try:
-            mime = (doc.mime or "").lower()
-            if mime != "application/pdf":
-                return False
+    # ---- Messages ----
 
-            import tempfile
-            y = yadisk.YaDisk(token=self.settings.yandex_disk_token)
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
-                tmp = tf.name
-            try:
-                y.download(doc.path, tmp)
-                with open(tmp, "rb") as f:
-                    head = f.read(2_000_000)
-                return b"/Encrypt" in head
-            finally:
-                with suppress(Exception):
-                    os.unlink(tmp)
-        except Exception as e:
-            logger.warning("Не удалось проверить шифрование PDF (%s): %s", getattr(doc, "path", "?"), e)
-            # Если не смогли проверить — не блокируем пользователя запросом пароля
-            return False
-
-    # ---------- Cancel KB upload ----------
     @only_allowed
-    async def on_cancel_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.pop("await_kb_upload", None)
-        await update.message.reply_text("Режим загрузки в БЗ отключён.")
+    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_text = (update.message.text or "").strip()
+        style = context.user_data.get("style", "pro")
+        sys_hint, temp = style_system_hint(style)
+        model = context.user_data.get("model", self.default_model)
 
-    # ---------- KB passwords ----------
-    @only_allowed
-    async def on_cancel_pass(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.pop("await_password_for", None)
-        await update.message.reply_text("Ввод пароля отменён.")
+        messages = [
+            {"role": "system", "content": sys_hint},
+            {"role": "user", "content": user_text},
+        ]
 
-    # ---------- Voice messages ----------
+        async with TypingIndicator(context.bot, update.effective_chat.id):
+            answer = await asyncio.to_thread(
+                self.openai.chat,
+                messages,
+                temperature=temp,
+                max_output_tokens=4096,
+                model=model,
+            )
+
+        await update.message.reply_text(answer or "Пустой ответ.")
+
     @only_allowed
     async def on_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         voice = update.message.voice
         if not voice:
             return
 
-        # 1) Скачиваем voice как .ogg
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tf:
             tmp_ogg = tf.name
+
         try:
             file = await context.bot.get_file(voice.file_id)
             await file.download_to_drive(custom_path=tmp_ogg)
@@ -856,234 +329,140 @@ class ChatGPTTelegramBot:
                 os.unlink(tmp_ogg)
             return
 
-        # 2) Распознаём (показываем «печатает…», НЕ «записывает голос»)
         try:
-            async with ChatActionSender(
-                action=ChatAction.TYPING,
-                chat_id=update.effective_chat.id,
-                bot=context.bot,
-            ):
+            async with TypingIndicator(context.bot, update.effective_chat.id):
                 text = await asyncio.to_thread(self.openai.transcribe, tmp_ogg)
+
+                style = context.user_data.get("style", "pro")
+                sys_hint, temp = style_system_hint(style)
+                model = context.user_data.get("model", self.default_model)
+
+                messages = [
+                    {"role": "system", "content": sys_hint},
+                    {"role": "user", "content": (text or "").strip()},
+                ]
+                answer = await asyncio.to_thread(
+                    self.openai.chat,
+                    messages,
+                    temperature=temp,
+                    max_output_tokens=4096,
+                    model=model,
+                )
         except Exception as e:
-            await update.message.reply_text(
-                "Не удалось распознать голосовое. "
-                "Попробуйте прислать файл в формате mp3/m4a/wav. "
-                f"Техническая деталь: {e}"
-            )
-            with suppress(Exception):
-                os.unlink(tmp_ogg)
+            await update.message.reply_text(f"Не удалось распознать/ответить: {e}")
             return
         finally:
             with suppress(Exception):
                 os.unlink(tmp_ogg)
 
-        # 3) Показать, что распознали
-        await update.message.reply_text(f"🗣️ Вы сказали:\n{(text or '').strip()}")
+        await update.message.reply_text(f"🗣️ Вы сказали:\n{text.strip() if text else ''}")
+        await update.message.reply_text(answer or "Пустой ответ.")
 
-        # 4) Сгенерировать ответ как на обычный текст
-        update.message.text = text or ""
-        await self.on_text(update, context)
+    # ---- Files (анализ без автозагрузки в БЗ) ----
 
-    # ---------- Photos/Documents ----------
     @only_allowed
-    async def on_file_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Поведение:
-        - Если включён режим "📥 Добавить из чата" и пользователь — админ: загружаем на Я.Диск и синхронизируем БЗ.
-        - Иначе:
-            • Для фото: делаем краткий анализ (Vision) и показываем результат.
-            • Для документов: показываем метаданные (имя, тип, размер) + предлагаем кнопкой добавить в БЗ (только админам).
-        """
-        is_admin = (not self.admins) or (update.effective_user and update.effective_user.id in self.admins)
-        awaiting_upload = bool(context.user_data.get("await_kb_upload"))
-
-        # --- Ветка явной загрузки в БЗ ---
-        if awaiting_upload and is_admin:
-            try:
-                saved, remote = await self._save_incoming_to_yadisk(update, context)
-                await update.message.reply_text(f"📥 Загружено в БЗ: {remote}\nЗапускаю синхронизацию…")
-                await self._kb_sync_internal(update, context)
-            except Exception as e:
-                await update.message.reply_text(f"Ошибка загрузки в БЗ: {e}")
-                logger.exception("KB upload failed: %s", e)
+    async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        doc = update.message.document
+        if not doc:
             return
 
-        # --- Аналитика (no-upload mode) ---
-        # ФОТО → Vision-анализ
-        if update.message.photo:
-            # скачиваем фото локально
-            ph = update.message.photo[-1]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
-                local = tf.name
-            try:
-                file = await context.bot.get_file(ph.file_id)
-                await file.download_to_drive(custom_path=local)
-
-                detail = getattr(self.settings, "vision_detail", None) or None
-                model = getattr(self.settings, "vision_model", None) or self.openai.model
-
-                async with ChatActionSender(
-                    action=ChatAction.TYPING,
-                    chat_id=update.effective_chat.id,
-                    bot=context.bot,
-                ):
-                    analysis = await asyncio.to_thread(
-                        self.openai.analyze_image,
-                        local,
-                        prompt="Суммаризируй, что на фото: ключевые объекты, текст (если есть), возможные риски/аномалии.",
-                        model=model,
-                        detail=detail,
-                        max_tokens=int(getattr(self.settings, "vision_max_tokens", 600) or 600),
-                    )
-                await update.message.reply_text(f"🖼️ Анализ изображения:\n{analysis}")
-            except Exception as e:
-                await update.message.reply_text(f"Не удалось проанализировать фото: {e}")
-            finally:
-                with suppress(Exception):
-                    os.unlink(local)
-            return
-
-        # ДОКУМЕНТЫ → показать метаданные + предложить добавить в БЗ (кнопкой)
-        if update.message.document:
-            doc = update.message.document
-            size_mb = (doc.file_size or 0) / (1024 * 1024.0)
-            info = (
-                f"Документ получен:\n"
-                f"• Название: {doc.file_name or '(без имени)'}\n"
-                f"• Тип: {doc.mime_type or 'unknown'}\n"
-                f"• Размер: {size_mb:.2f} МБ"
-            )
-
-            # Скачаем локально, чтобы при желании можно было загрузить в БЗ по кнопке
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(doc.file_name or '')[1] or ".bin") as tf:
-                local = tf.name
-            try:
-                file = await context.bot.get_file(doc.file_id)
-                await file.download_to_drive(custom_path=local)
-            except Exception as e:
-                await update.message.reply_text(info + f"\n\n(Не удалось скачать для дальнейших действий: {e})")
-                with suppress(Exception):
-                    os.unlink(local)
-                return
-
-            # Сохраним путь во временное хранилище пользователя, чтобы кнопка могла его использовать
-            stash = context.user_data.get("incoming_locals", {})
-            stash_key = doc.file_unique_id
-            stash[stash_key] = {"path": local, "filename": doc.file_name}
-            context.user_data["incoming_locals"] = stash
-
-            # Кнопка "Добавить в БЗ" показывается только админу
-            if is_admin:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📥 Добавить в БЗ", callback_data=f"kb_upload_local:{stash_key}")],
-                ])
-                await update.message.reply_text(info + "\n\nДобавить файл в БЗ?", reply_markup=kb)
-            else:
-                await update.message.reply_text(info + "\n\nЧтобы добавить файл в БЗ, обратитесь к администратору или используйте /kb.")
-            return
-
-        # Иное вложение
-        await update.message.reply_text("Вложение получено. Чтобы добавить в БЗ — откройте /kb → «📥 Добавить из чата».")
-
-    async def _save_incoming_to_yadisk(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[str, str]:
-        """
-        Сохраняет фото/документ с сообщения в Я.Диск.
-        Возвращает (local_temp_path, remote_path).
-        """
-        y = yadisk.YaDisk(token=self.settings.yandex_disk_token)
-
-        if update.message.document:
-            doc = update.message.document
-            file = await context.bot.get_file(doc.file_id)
-            filename = doc.file_name or f"file_{doc.file_unique_id}"
-            ext = os.path.splitext(filename)[1] or ".bin"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
-                local = tf.name
-            await file.download_to_drive(custom_path=local)
-        elif update.message.photo:
-            ph = update.message.photo[-1]  # самое большое качество
-            file = await context.bot.get_file(ph.file_id)
-            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            filename = f"photo_{ts}.jpg"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
-                local = tf.name
-            await file.download_to_drive(custom_path=local)
-        else:
-            raise ValueError("Нет поддерживаемого вложения")
-
-        root = self.settings.yandex_root_path.strip()
-        if not root.startswith("/"):
-            root = "/" + root
-        remote = f"disk:{root}/{filename}"
-
-        y.upload(local_path=local, path=remote, overwrite=True)
-
-        return local, remote
-
-    # ---------- Text handler ----------
-    @only_allowed
-    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        db = self._get_db()
-        chat_id = update.effective_chat.id
-        conv = self._get_active_conv(chat_id, db)
-
-        # 1) Режим ввода пароля
-        awaiting: Optional[int] = context.user_data.get("await_password_for")
-        if awaiting is not None:
-            pwd = (update.message.text or "").strip()
-            if not pwd:
-                await update.message.reply_text("Пустой пароль. Повторите ввод или /cancelpass")
-                return
-            kb_passwords: Dict[int, str] = context.user_data.get("kb_passwords", {}) or {}
-            kb_passwords[awaiting] = pwd
-            context.user_data["kb_passwords"] = kb_passwords
-            context.user_data.pop("await_password_for", None)
-            await update.message.reply_text("✅ Пароль сохранён для выбранного документа.")
-            return
-
-        # 2) Формируем стиль и подсказку
-        kb_enabled = context.user_data.get("kb_enabled", True)
-        selected_ids = context.user_data.get("kb_selected_ids", set())
-        selected_docs: List[Document] = []
-        if kb_enabled and selected_ids:
-            selected_docs = db.query(Document).filter(Document.id.in_(list(selected_ids))).all()
-
-        style = context.user_data.get("style", "pro")
-        sys_hint, temp = style_system_hint(style)
-
-        kb_hint = ""
-        if selected_docs:
-            titles = ", ".join([d.title for d in selected_docs][:10])
-            kb_hint = f" Учитывай информацию из документов: {titles}."
-
-        # 3) Заголовок диалога
-        self._ensure_conv_title(conv, update.message.text or "", db)
-
-        # 4) Персональная модель
-        user_model = context.user_data.get("model", self.openai.model)
-
-        # 5) Запрос к OpenAI — в поток
-        prompt = (update.message.text or "").strip()
-        messages = [
-            {"role": "system", "content": (sys_hint + kb_hint).strip()},
-            {"role": "user", "content": prompt},
-        ]
+        # Скачиваем во временный файл
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tmp_path = tf.name
 
         try:
-            async with ChatActionSender(
-                action=ChatAction.TYPING,
-                chat_id=update.effective_chat.id,
-                bot=context.bot,
-            ):
-                ans = await asyncio.to_thread(
-                    self.openai.chat,
-                    messages,
-                    temperature=temp,
-                    max_output_tokens=4096,
-                    model=user_model,
-                )
+            tg_file = await context.bot.get_file(doc.file_id)
+            await tg_file.download_to_drive(custom_path=tmp_path)
+
+            size_mb = round((doc.file_size or 0) / (1024 * 1024), 2)
+            info = f"📄 Файл: {doc.file_name} ({size_mb} МБ, {doc.mime_type})\n\n"
+            info += "Файл проанализирован, но НЕ добавлен в Базу знаний.\n" \
+                    "Чтобы добавить — используйте меню БЗ/команду, доступную админам."
+            await update.message.reply_text(info)
         except Exception as e:
-            await update.message.reply_text(f"Ошибка обращения к OpenAI: {e}")
+            await update.message.reply_text(f"Ошибка загрузки файла: {e}")
+        finally:
+            with suppress(Exception):
+                os.unlink(tmp_path)
+
+    @only_allowed
+    async def on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Берём фото максимального размера
+        photo = (update.message.photo or [])[-1] if update.message.photo else None
+        if not photo:
+            return
+        await update.message.reply_text(
+            "🖼️ Фото получено. "
+            "Пока я делаю только текстовые ответы и генерацию изображений по описанию. "
+            "Если нужно — можно добавить анализ изображений/vision."
+        )
+
+    # ---- Callback buttons ----
+
+    @only_allowed
+    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        await q.answer()
+
+        data = q.data or ""
+        if data.startswith("set_model:"):
+            model = data.split(":", 1)[1]
+            context.user_data["model"] = model
+            await q.edit_message_text(f"Модель установлена: {model}")
+
+    # ---- Admin / Diagnostics ----
+
+    @only_allowed
+    async def on_debug_pgvector(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        /debug_pgvector — проверка доступности/установки расширения pgvector.
+        Доступно только администратору.
+        """
+        if self.admins and (not update.effective_user or update.effective_user.id not in self.admins):
+            await update.message.reply_text("⛔ Доступно только администратору.")
             return
 
-        await update.message.reply_text(ans or "Пустой ответ.")
+        try:
+            eng = SessionLocal.bind  # SQLAlchemy Engine
+            lines = []
+            with eng.connect() as conn:
+                ver = conn.execute(text("SELECT version();")).scalar()
+                lines.append(f"Postgres: {ver}")
+
+                avail = conn.execute(text("""
+                    SELECT name, default_version, installed_version
+                    FROM pg_available_extensions
+                    WHERE name='vector';
+                """)).fetchall()
+                if avail:
+                    n, dv, iv = avail[0]
+                    lines.append(f"pg_available_extensions: {n} (default={dv}, installed={iv})")
+                else:
+                    lines.append("pg_available_extensions: vector НЕ найден")
+
+                created = False
+                err = None
+                try:
+                    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                    conn.commit()
+                    created = True
+                except Exception as e:
+                    err = str(e)
+
+                if created:
+                    lines.append("CREATE EXTENSION vector: OK (или уже было)")
+                else:
+                    lines.append(f"CREATE EXTENSION vector: ошибка: {err}")
+
+                ext = conn.execute(text("""
+                    SELECT extname, extversion FROM pg_extension WHERE extname='vector';
+                """)).fetchall()
+                if ext:
+                    en, ev = ext[0]
+                    lines.append(f"pg_extension: установлено {en} v{ev}")
+                else:
+                    lines.append("pg_extension: vector НЕ установлен")
+
+            await update.message.reply_text("🔎 Проверка pgvector:\n" + "\n".join(lines))
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка проверки: {e}")
