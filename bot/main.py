@@ -11,22 +11,19 @@ from bot.openai_helper import OpenAIHelper
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+
 def build_application() -> Application:
     settings = load_settings()
 
-    # Инициализируем OpenAI-хелпер (совместимо с вашим кодом/параметрами)
+    # ВАЖНО: передаём только api_key, чтобы не ловить конфликт сигнатуры.
     openai = OpenAIHelper(
-        api_key=settings.openai_api_key,
-        model=getattr(settings, "openai_model", None),
-        image_model=getattr(settings, "image_model", None),
-        temperature=getattr(settings, "openai_temperature", 0.2),
-        enable_image_generation=bool(getattr(settings, "enable_image_generation", True)),
+        api_key=settings.openai_api_key
+        # Если ваш OpenAIHelper поддерживает другие параметры, можно добавить позже,
+        # но сейчас сохраняем совместимость с вашей актуальной версией.
     )
 
-    # Собираем приложение Telegram
     app = Application.builder().token(settings.telegram_bot_token).build()
 
-    # Подключаем бота (регистрация всех handlers)
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
     bot.install(app)
 
