@@ -5,6 +5,7 @@ import logging
 from base64 import b64decode
 from typing import Dict, List, Optional, Tuple
 
+import httpx  # ← ДОБАВИЛИ
 from openai import OpenAI
 from openai.types import ImagesResponse
 
@@ -130,31 +131,41 @@ class OpenAIHelper:
         """
         Генерация изображения. Возвращает бинарные PNG-данные.
         Если выбран 'gpt-image-1' и нет верификации — откатываемся на 'dall-e-3' (если разрешено).
+        Нормализуем ответ: сначала пытаемся забрать base64, если пришёл URL — скачиваем.
         """
         if not self.enable_image_generation:
             raise RuntimeError("Image generation is disabled by configuration.")
-
+    
         primary = model or self.image_model or "dall-e-3"
-
+    
         def _call(m: str) -> bytes:
             res: ImagesResponse = self.client.images.generate(
                 model=m,
                 prompt=prompt,
                 size=size,
+                # КЛЮЧЕВОЕ: просим base64, иначе некоторые модели отдают только URL
+                response_format="b64_json",
             )
             data = (res.data or [])
             if not data:
                 raise RuntimeError("Images API returned empty data.")
+            # 1) base64
             b64 = getattr(data[0], "b64_json", None)
-            if not b64:
-                raise RuntimeError("Images API did not return base64 image.")
-            return b64decode(b64)
-
+            if b64:
+                return b64decode(b64)
+            # 2) URL (fallback) — скачаем и отдадим байты
+            url = getattr(data[0], "url", None)
+            if url:
+                r = httpx.get(url, timeout=60.0)
+                r.raise_for_status()
+                return r.content
+            # иначе считаем, что провайдер ответил несовместимо
+            raise RuntimeError("Images API did not return base64 image or URL.")
+    
         try:
             return _call(primary)
         except Exception as e:
             logger.warning("Primary image model '%s' failed: %s", primary, e)
-            # Специальный кейс: частая 403 при gpt-image-1 (нужна верификация организации)
             if fallback_to_dalle3 and primary != "dall-e-3":
                 try:
                     return _call("dall-e-3")
