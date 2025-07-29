@@ -1,12 +1,19 @@
+from __future__ import annotations
+
+from typing import List, Dict
+
 class ContextManager:
-    def __init__(self):
-        self.chat_docs = {}  # chat_id -> [paths]
+    """
+    Склеивает найденные фрагменты в строку контекста для передачи в LLM.
+    """
 
-    def set_docs(self, chat_id: int, docs: list[str]):
-        self.chat_docs[chat_id] = docs
+    def __init__(self, settings) -> None:
+        self.settings = settings
 
-    def get_docs(self, chat_id: int) -> list[str]:
-        return self.chat_docs.get(chat_id, [])
-
-    def reset(self, chat_id: int):
-        self.chat_docs.pop(chat_id, None)
+    def build_context(self, chunks: List[Dict]) -> str:
+        parts = []
+        for ch in chunks or []:
+            txt = ch.get("text") or ch.get("content") or ""
+            if txt:
+                parts.append(txt)
+        return "\n---\n".join(parts)
