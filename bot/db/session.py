@@ -1,45 +1,36 @@
-from sqlalchemy import create_engine, inspect, text
+from __future__ import annotations
+
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from bot.settings import Settings
 
-settings = Settings()
-engine = create_engine(settings.database_url, echo=False, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+from bot.config import load_settings
 
-def init_db(Base):
-    """Создание схемы + автомиграция таблицы documents до актуального вида."""
-    Base.metadata.create_all(bind=engine)
-    _migrate_documents_table()
+# Загружаем настройки и нормализованный DATABASE_URL
+settings = load_settings()
 
-def _migrate_documents_table():
-    """Добиваемся наличия колонок: title, mime, size, created_at.
-    Безопасно для повторных запусков (no-op, если колонки уже есть)."""
-    with engine.begin() as conn:
-        insp = inspect(conn)
-        if 'documents' not in insp.get_table_names():
-            return
+# В Railway нередко приходит postgresql:// — используем psycopg2-драйвер
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    future=True,
+)
 
-        cols = {c['name'] for c in insp.get_columns('documents')}
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
 
-        # title
-        if 'title' not in cols:
-            conn.execute(text("ALTER TABLE documents ADD COLUMN title VARCHAR(512)"))
-            # Заполняем из последнего сегмента пути: 'disk:/Папка/Файл.pdf' -> 'Файл.pdf'
-            conn.execute(text(
-                "UPDATE documents "
-                "SET title = COALESCE(NULLIF(regexp_replace(path, '^.*/', ''), ''), 'Untitled') "
-                "WHERE title IS NULL OR title = ''"
-            ))
 
-        # mime
-        if 'mime' not in cols:
-            conn.execute(text("ALTER TABLE documents ADD COLUMN mime VARCHAR(128)"))
+def init_db(base=None) -> None:
+    """
+    Инициализация схемы БД.
 
-        # size
-        if 'size' not in cols:
-            conn.execute(text("ALTER TABLE documents ADD COLUMN size INTEGER"))
+    Совместима с двумя стилями вызова:
+      - init_db()                      # новый стиль (base определяется из моделей)
+      - init_db(Base)                  # старый стиль (передаётся DeclarativeBase)
 
-        # created_at
-        if 'created_at' not in cols:
-            conn.execute(text("ALTER TABLE documents ADD COLUMN created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT now()"))
-            conn.execute(text("UPDATE documents SET created_at = now() WHERE created_at IS NULL"))
+    :param base: DeclarativeBase (опционально)
+    """
+    if base is None:
+        # Импортируем здесь, чтобы избежать циклических импортов
+        from .models import Base as _Base
+        base = _Base
+
+    base.metadata.create_all(bind=engine)
