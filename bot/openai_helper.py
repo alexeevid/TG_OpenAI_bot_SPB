@@ -1,180 +1,275 @@
 from __future__ import annotations
 
-import logging
-from base64 import b64decode
-from typing import Dict, List, Optional, Tuple
+import base64
+import io
+import os
+import re
+import tempfile
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from openai import OpenAI
-from openai.types import ImagesResponse
 
-logger = logging.getLogger(__name__)
+try:
+    # OpenAI SDK v1.x
+    from openai import OpenAI
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
 
-def _extract_text_from_responses(resp) -> str:
-    chunks: List[str] = []
-    for out in getattr(resp, "output", []) or []:
-        if getattr(out, "type", None) == "message":
-            for c in getattr(out, "content", []) or []:
-                if getattr(c, "type", None) == "output_text" and getattr(c, "text", None):
-                    chunks.append(c.text)
-    if not chunks and getattr(resp, "output_text", None):
-        chunks.append(resp.output_text)
-    text = "\n".join(chunks).strip()
-    return text
+def _json_list_from_env(name: str, default: Optional[List[str]] = None) -> List[str]:
+    """
+    Безопасный парсер JSON-массивов из переменных окружения.
+    Допускает пустые/невалидные значения → возвращает default или [].
+    """
+    import json
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return list(default or [])
+    try:
+        val = json.loads(raw)
+        if isinstance(val, list):
+            return [str(x) for x in val]
+        return list(default or [])
+    except Exception:
+        return list(default or [])
+
+
+@dataclass
+class GenImageResult:
+    image_bytes: bytes
+    final_prompt: str
+    model_used: str
 
 
 class OpenAIHelper:
+    """
+    Единая обёртка поверх OpenAI:
+      - chat (Responses API)
+      - transcribe (whisper-1)
+      - image generation (gpt-image-1 / dall-e-3)
+      - простой web_search (DuckDuckGo HTML с парсингом ссылок)
+      - хранение текущей модели и стиля per-chat
+    """
+
     def __init__(
         self,
         api_key: str,
-        model: Optional[str] = None,
-        image_model: Optional[str] = None,
-        temperature: float = 0.2,
-        enable_image_generation: bool = True,
-        **kwargs,
+        default_model: str = "gpt-4o",
+        default_temperature: float = 0.2,
+        image_primary: str = "gpt-image-1",
+        image_fallback: str = "dall-e-3",
     ):
-        if image_model is None:
-            image_model = kwargs.pop("image_primary", None) or kwargs.pop("image_model_primary", None)
+        if OpenAI is None:
+            raise RuntimeError("OpenAI SDK не установлен.")
         self.client = OpenAI(api_key=api_key)
-        self.model = model or "gpt-4o"
-        self.image_model = image_model or "dall-e-3"
-        self.temperature = temperature
-        self.enable_image_generation = enable_image_generation
+        self.default_model = default_model
+        self.default_temperature = default_temperature
+        self.image_primary = image_primary
+        self.image_fallback = image_fallback
+
+        # per-chat настройки
+        self._per_chat_model: Dict[int, str] = {}
+        self._per_chat_style: Dict[int, str] = {}  # pro|expert|user|ceo
+
+    # ---------- MODELS ----------
+
+    def list_models_with_current(self, chat_id: int) -> Tuple[List[str], str]:
+        allow = _json_list_from_env("ALLOWED_MODELS_WHITELIST", [])
+        deny = set(_json_list_from_env("DENYLIST_MODELS", []))
+        current = self.get_current_model(chat_id)
+        # если whitelist пуст — даём несколько адекватных дефолтов
+        base = allow or ["gpt-4o", "gpt-4o-mini", "gpt-4", "o4-mini", "gpt-4.1-mini"]
+        models = [m for m in base if m not in deny]
+        return models, current
+
+    def set_current_model(self, chat_id: int, model: str) -> None:
+        self._per_chat_model[chat_id] = model
+
+    def get_current_model(self, chat_id: int) -> str:
+        return self._per_chat_model.get(chat_id, self.default_model)
+
+    # ---------- STYLES ----------
+
+    STYLES_SYS_PROMPT: Dict[str, str] = {
+        "pro": (
+            "Отвечай как высококвалифицированный профессионал с большим опытом. "
+            "Пиши кратко, точно, выверенно, без воды, с ясной структурой."
+        ),
+        "expert": (
+            "Отвечай как эксперт с глубокими знаниями предметной области. "
+            "Давай развернутые объяснения, сравнения, аргументацию, упоминания методик и терминов."
+        ),
+        "user": (
+            "Отвечай простым, человечным языком, избегай сложных терминов. "
+            "Представь, что объясняешь другу-пользователю без спецподготовки."
+        ),
+        "ceo": (
+            "Отвечай как собственник бизнеса уровня EMBA/DBA. "
+            "Фокусируйся на стратегии, рисках, экономике и эффектах для бизнеса."
+        ),
+    }
+
+    def set_style(self, chat_id: int, style: str) -> None:
+        style = style.lower()
+        if style not in self.STYLES_SYS_PROMPT:
+            style = "pro"
+        self._per_chat_style[chat_id] = style
+
+    def get_style(self, chat_id: int) -> str:
+        return self._per_chat_style.get(chat_id, "pro")
+
+    # ---------- CHAT ----------
+
+    def _compose_input(self, sys_hint: Optional[str], user_text: str) -> str:
+        """
+        Responses API принимает plain input. Формируем "префикс" для system.
+        """
+        if sys_hint:
+            return f"[SYSTEM]\n{sys_hint}\n\n{user_text}"
+        return user_text
 
     def chat(
         self,
-        messages: List[Dict[str, str]],
-        *,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        max_output_tokens: Optional[int] = None,
+        chat_id: int,
+        text: str,
+        kb_snippets: Optional[str] = None,
     ) -> str:
-        use_model = model or self.model
-        temp = self.temperature if temperature is None else temperature
+        """
+        Генерация ответа. Если есть сниппеты БЗ — подмешиваем в system.
+        """
+        model = self.get_current_model(chat_id)
+        style = self.get_style(chat_id)
+        sys_hint = self.STYLES_SYS_PROMPT.get(style, "")
 
-        sys_buf: List[str] = []
-        conv_buf: List[str] = []
+        if kb_snippets:
+            sys_hint = (sys_hint + "\n\n"
+                        "Учитывай следующие выдержки из документов базы знаний:\n"
+                        f"{kb_snippets}").strip()
 
-        for m in messages:
-            role = (m.get("role") or "").lower()
-            content = (m.get("content") or "").strip()
-            if not content:
-                continue
-            if role == "system":
-                sys_buf.append(content)
-            elif role == "user":
-                conv_buf.append(f"[USER]\n{content}")
-            elif role == "assistant":
-                conv_buf.append(f"[ASSISTANT]\n{content}")
+        prompt = self._compose_input(sys_hint, text)
 
-        system_block = ""
-        if sys_buf:
-            system_block = "[SYSTEM]\n" + "\n\n".join(sys_buf) + "\n\n"
-
-        prompt = system_block + "\n\n".join(conv_buf).strip()
-
-        resp = self.client.responses.create(
-            model=use_model,
+        cc = self.client.responses.create(
+            model=model,
             input=prompt,
-            temperature=temp,
-            max_output_tokens=max_output_tokens,
+            temperature=self.default_temperature,
         )
-        return _extract_text_from_responses(resp)
+        # В SDK 1.x ответ лежит в content[0].text
+        try:
+            return cc.output_text  # у unified responses есть это свойство
+        except Exception:
+            pass
 
-    def transcribe(self, audio_path: str) -> str:
-        with open(audio_path, "rb") as f:
+        try:
+            # на всякий
+            if cc and cc.output and len(cc.output) > 0:
+                block = cc.output[0]
+                if getattr(block, "content", None):
+                    return "".join([getattr(p, "text", "") for p in block.content if getattr(p, "type", "") == "output_text"])
+        except Exception:
+            pass
+
+        # более общий разбор
+        try:
+            if cc and cc.choices and len(cc.choices) > 0:
+                msg = cc.choices[0].message
+                if hasattr(msg, "content"):
+                    return str(msg.content)
+        except Exception:
+            pass
+
+        return "Не удалось получить ответ от модели."
+
+    # ---------- TRANSCRIBE ----------
+
+    def transcribe(self, audio_bytes: bytes, filename_hint: str = "audio.ogg") -> str:
+        """
+        Whisper-1 транскрипция.
+        """
+        # Записываем во временный файл, чтобы SDK корректно понял mimetype
+        with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename_hint)[-1] or ".ogg") as f:
+            f.write(audio_bytes)
+            f.flush()
+            f.seek(0)
             tr = self.client.audio.transcriptions.create(
                 model="whisper-1",
                 file=f,
+                response_format="text",
             )
-        return (getattr(tr, "text", None) or "").strip()
+        # SDK 1.x может вернуть str
+        return str(tr)
 
-    def generate_image(
-        self,
-        prompt: str,
-        *,
-        model: Optional[str] = None,
-        size: str = "1024x1024",
-        fallback_to_dalle3: bool = True,
-    ) -> bytes:
-        if not self.enable_image_generation:
-            raise RuntimeError("Image generation is disabled by configuration.")
-        primary = model or self.image_model or "dall-e-3"
+    # ---------- IMAGES ----------
 
-        def _call(m: str) -> bytes:
-            res: ImagesResponse = self.client.images.generate(
+    def generate_image(self, prompt: str, model: Optional[str] = None, size: str = "1024x1024") -> GenImageResult:
+        """
+        Возвращает bytes изображения + итоговый промпт + модель.
+        Делает fallback и поддерживает как base64, так и URL.
+        """
+        primary = model or self.image_primary
+        fallback = self.image_fallback
+
+        def _call(m: str) -> Tuple[Optional[bytes], str]:
+            res = self.client.images.generate(
                 model=m,
                 prompt=prompt,
                 size=size,
-                response_format="b64_json",
             )
-            data = (res.data or [])
-            if not data:
-                raise RuntimeError("Images API returned empty data.")
-            b64 = getattr(data[0], "b64_json", None)
+            if not res or not getattr(res, "data", None):
+                return None, prompt
+
+            item = res.data[0]
+            # base64?
+            b64 = getattr(item, "b64_json", None)
             if b64:
-                return b64decode(b64)
-            url = getattr(data[0], "url", None)
+                return base64.b64decode(b64), prompt
+
+            # url?
+            url = getattr(item, "url", None)
             if url:
-                r = httpx.get(url, timeout=60.0)
-                r.raise_for_status()
-                return r.content
-            raise RuntimeError("Images API did not return base64 image or URL.")
+                bx = httpx.get(url, timeout=60.0)
+                bx.raise_for_status()
+                return bx.content, prompt
+
+            return None, prompt
 
         try:
-            return _call(primary)
-        except Exception as e:
-            logger.warning("Primary image model '%s' failed: %s", primary, e)
-            if fallback_to_dalle3 and primary != "dall-e-3":
-                try:
-                    return _call("dall-e-3")
-                except Exception as e2:
-                    logger.error("Image generation failed even with fallback: %s", e2)
-                    raise
-            raise
+            img, pr = _call(primary)
+            if img:
+                return GenImageResult(img, pr, primary)
+        except Exception:
+            # пробуем fallback
+            pass
 
-    def answer_with_web(self, prompt: str, *, model: Optional[str] = None) -> Tuple[str, List[Dict[str, str]]]:
-        use_model = model or self.model or "gpt-4o"
-        try:
-            resp = self.client.responses.create(
-                model=use_model,
-                input=prompt,
-                tools=[{"type": "web_search"}],
-            )
+        img, pr = _call(fallback)
+        if not img:
+            raise RuntimeError("Images API не вернуло изображение (ни base64, ни URL).")
+        return GenImageResult(img, pr, fallback)
 
-            text = _extract_text_from_responses(resp)
-            citations: List[Dict[str, str]] = []
+    # ---------- WEB SEARCH ----------
 
-            for out in getattr(resp, "output", []) or []:
-                if getattr(out, "type", None) == "message":
-                    for c in getattr(out, "content", []) or []:
-                        for ann in (getattr(c, "annotations", []) or []):
-                            if getattr(ann, "type", None) == "url_citation":
-                                url = getattr(ann, "url", None)
-                                title = getattr(ann, "title", None)
-                                if url:
-                                    citations.append({"title": title or url, "url": url})
+    def web_search(self, query: str, limit: int = 3) -> List[Dict[str, str]]:
+        """
+        Простая выдача ссылок через DuckDuckGo HTML без ключей.
+        Парсинг по regex — без внешних зависимостей.
+        """
+        url = "https://duckduckgo.com/html"
+        r = httpx.get(url, params={"q": query}, timeout=20.0)
+        r.raise_for_status()
+        html = r.text
 
-            for out in getattr(resp, "output", []) or []:
-                if getattr(out, "type", None) == "tool_result":
-                    name = (getattr(out, "tool_name", None) or getattr(out, "name", None) or "").lower()
-                    if name == "web_search":
-                        data = getattr(out, "content", None) or getattr(out, "result", None)
-                        if isinstance(data, list):
-                            for item in data:
-                                if isinstance(item, dict) and item.get("url"):
-                                    citations.append({"title": item.get("title") or item["url"], "url": item["url"]})
-
-            seen = set()
-            uniq: List[Dict[str, str]] = []
-            for it in citations:
-                if it["url"] not in seen:
-                    uniq.append(it)
-                    seen.add(it["url"])
-
-            return (text or "Ничего не найдено.").strip(), uniq
-
-        except Exception as e:
-            logger.exception("Web search failed: %s", e)
-            return f"Ошибка web‑поиска: {e}", []
+        # Ищем блоки результатов <a class="result__a" href="...">Title</a>
+        # DDG может менять разметку, поэтому держим это как best-effort
+        pat = re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+        results: List[Dict[str, str]] = []
+        for m in pat.finditer(html):
+            href = m.group(1)
+            title = re.sub("<.*?>", "", m.group(2))  # вычищаем теги
+            # Сниппет возьмём из соседнего result__snippet, если найдём
+            # (упрощённо, без тяжёлых парсеров)
+            snippet = ""
+            # ограничимся ссылкой и заголовком
+            results.append({"title": title.strip(), "url": href, "snippet": snippet})
+            if len(results) >= limit:
+                break
+        return results
