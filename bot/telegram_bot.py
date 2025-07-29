@@ -162,9 +162,19 @@ class ChatGPTTelegramBot:
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.Document.ALL, self.on_document))
         app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
-
         app.add_handler(CallbackQueryHandler(self.on_callback))
-        app.post_init(_set_global_commands)
+        
+        # PTB v20.x: post_init — это атрибут-колбэк, а не вызываемый метод
+        if getattr(app, "post_init", None) is None:
+            app.post_init = _set_global_commands
+        else:
+            # если уже кто-то задал колбэк, оборачиваем, чтобы не потерять чужой
+            prev_cb = app.post_init
+            async def _chained_post_init(application):
+                if prev_cb:
+                    await prev_cb(application)
+                await _set_global_commands(application)
+            app.post_init = _chained_post_init
 
     @only_allowed
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
