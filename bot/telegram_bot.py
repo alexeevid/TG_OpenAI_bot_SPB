@@ -1,138 +1,166 @@
+# bot/telegram_bot.py
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
+import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-import httpx
 from telegram import (
     Update,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllChatAdministrators,
     InputFile,
 )
 from telegram.constants import ChatAction
-from telegram.error import Conflict
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-from bot.openai_helper import OpenAIHelper
-from bot.settings import Settings
-
-# --- knowledge_base интеграция (мягкая) ---
-KB_AVAILABLE = True
-KB_MISSING_REASON = ""
-try:
-    from bot.knowledge_base.indexer import sync as kb_sync  # type: ignore
-    from bot.knowledge_base.retriever import list_documents as kb_list_docs  # type: ignore
-except Exception as e:  # модуль не в сборке или сломан импорт
-    KB_AVAILABLE = False
-    KB_MISSING_REASON = (
-        "Модуль базы знаний не найден: "
-        f"{e}. Убедитесь, что в деплой включены файлы:\n"
-        "  - bot/knowledge_base/indexer.py\n"
-        "  - bot/knowledge_base/retriever.py\n"
-        "и их зависимости (yadisk, sqlalchemy, модели БД и т.п.)."
-    )
+from .openai_helper import OpenAIHelper
+from .settings import Settings
 
 logger = logging.getLogger(__name__)
 
-# ----------------- Память per-chat/диалоги -----------------
+# --- Опциональная База Знаний ------------------------------------------------
+KB_AVAILABLE = False
+KB_MISSING_REASON = "Папка bot/knowledge_base/* отсутствует в сборке."
+
+try:
+    from .knowledge_base.context_manager import KBContextManager  # type: ignore
+    from .knowledge_base.indexer import KnowledgeBaseIndexer  # type: ignore
+    KB_AVAILABLE = True
+    KB_MISSING_REASON = ""
+except Exception as e:
+    KB_AVAILABLE = False
+    KB_MISSING_REASON = f"Модуль БЗ недоступен: {e!s}"
+
+# --- Состояние диалога/чата ---------------------------------------------------
+
+def _ts_fmt(ts: float) -> str:
+    # короткая дата/время: 29.07 14:35
+    import datetime as _dt
+    dt = _dt.datetime.fromtimestamp(ts)
+    return dt.strftime("%d.%m %H:%M")
 
 @dataclass
 class DialogState:
     id: int
-    title: str
-    created_at: float
-    updated_at: float
-    selected_doc_ids: List[int] = field(default_factory=list)
+    title: str = "Диалог"
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     kb_enabled: bool = False
-
+    kb_selected: List[int] = field(default_factory=list)  # ids документов БЗ
+    style: str = "Pro"  # Pro | Expert | User | CEO
+    model: Optional[str] = None  # модель OpenAI на уровне диалога
 
 @dataclass
 class ChatState:
+    user_id: int
     dialogs: Dict[int, DialogState] = field(default_factory=dict)
     current_id: Optional[int] = None
 
-
-def _ts_fmt(ts: float) -> str:
-    # компактный штамп времени
-    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
-
+# --- Основной класс бота ------------------------------------------------------
 
 class ChatGPTTelegramBot:
-    """
-    Основная логика бота.
-    """
-
-    STYLES = {
-        "pro": "Профессиональный — кратко, по делу, максимально точно и уверенно.",
-        "expert": "Экспертный — глубокая аргументация, упоминание подходов/терминов.",
-        "user": "Пользовательский — простой язык, без перегруза терминами.",
-        "ceo": "СЕО — стратегический взгляд владельца бизнеса (EMBA/DBA).",
-    }
-
     def __init__(self, openai: OpenAIHelper, settings: Settings) -> None:
         self.openai = openai
         self.settings = settings
+
+        self.allowed: set[int] = set(getattr(settings, "allowed_user_ids", []) or [])
+        self.admins: set[int] = set(getattr(settings, "admin_user_ids", []) or [])
         self.state: Dict[int, ChatState] = {}
 
-    # ------------- Вспомогательные -------------
+        # Инициализация БЗ при наличии
+        self.kb_indexer: Optional[KnowledgeBaseIndexer] = None
+        self.kb_ctx: Optional[KBContextManager] = None
+        if KB_AVAILABLE:
+            try:
+                self.kb_indexer = KnowledgeBaseIndexer(settings)
+                self.kb_ctx = KBContextManager(settings)
+            except Exception as e:
+                logger.warning("Не удалось инициализировать БЗ: %s", e)
+
+    # ------------------------- ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ -----------------------
 
     def _get_chat(self, chat_id: int) -> ChatState:
-        st = self.state.get(chat_id)
-        if not st:
-            st = ChatState()
-            self.state[chat_id] = st
+        if chat_id not in self.state:
+            self.state[chat_id] = ChatState(user_id=chat_id)
+        st = self.state[chat_id]
+        if st.current_id is None:
+            self._ensure_current_dialog(chat_id)
         return st
 
-    def _ensure_current_dialog(self, chat_id: int) -> DialogState:
-        st = self._get_chat(chat_id)
-        if st.current_id is None or st.current_id not in st.dialogs:
-            dlg_id = int(time.time() * 1000)  # уникальнее
-            st.dialogs[dlg_id] = DialogState(
-                id=dlg_id,
-                title="Диалог",
-                created_at=time.time(),
-                updated_at=time.time(),
-            )
+    def _ensure_current_dialog(self, chat_id: int) -> None:
+        st = self.state[chat_id]
+        if st.current_id is None:
+            dlg_id = int(time.time() * 1000)
+            st.dialogs[dlg_id] = DialogState(id=dlg_id)
             st.current_id = dlg_id
-        return st.dialogs[st.current_id]
 
-    def _typing_once(self, update: Update, context: ContextTypes.DEFAULT_TYPE, seconds: float = 0.6):
-        return context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    async def _typing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    def _kb_snippets_from_ids(self, ids: List[int]) -> Optional[str]:
-        if not ids:
-            return None
-        if not KB_AVAILABLE or not kb_list_docs:
-            return "\n".join(f"- документ #{i}" for i in ids)
-        docs = {d.id: d for d in (kb_list_docs() or [])}
-        titles = [f"- {docs[i].title}" for i in ids if i in docs]
-        return "\n".join(titles) if titles else None
+    def _build_commands(self) -> List[BotCommand]:
+        cmds = [
+            BotCommand("start", "Запуск/справка"),
+            BotCommand("help", "Справка"),
+            BotCommand("new", "Новый диалог"),
+            BotCommand("reset", "Сброс контекста"),
+            BotCommand("stats", "Статистика"),
+            BotCommand("model", "Выбор модели"),
+            BotCommand("mode", "Стиль ответов"),
+            BotCommand("dialogs", "Диалоги"),
+            BotCommand("del", "Удалить текущий диалог"),
+            BotCommand("img", "Сгенерировать изображение"),
+            BotCommand("web", "Веб‑поиск"),
+        ]
+        if KB_AVAILABLE:
+            cmds.insert(6, BotCommand("kb", "База знаний"))
+        return cmds
 
-    def _auto_title(self, old: str, user_text: str) -> str:
-        """ Простая авто-генерация краткого названия по первому сообщению. """
-        if old != "Диалог":
-            return old
-        t = user_text.strip().splitlines()[0][:40]
-        return t if t else old
+    async def _refresh_all_scopes(self, bot):
+        scopes = [
+            BotCommandScopeDefault(),
+            BotCommandScopeAllPrivateChats(),
+            BotCommandScopeAllGroupChats(),
+            BotCommandScopeAllChatAdministrators(),
+        ]
+        commands = self._build_commands()
+        for scope in scopes:
+            try:
+                await bot.delete_my_commands(scope=scope)
+            except Exception:
+                pass
+            await bot.set_my_commands(commands, scope=scope)
 
-    # ---------------- Установка команд/хендлеров ----------------
+            # Дублируем для ru
+            try:
+                await bot.delete_my_commands(scope=scope, language_code="ru")
+            except Exception:
+                pass
+            await bot.set_my_commands(commands, scope=scope, language_code="ru")
+
+    # ------------------------------ РЕГИСТРАЦИЯ -----------------------------
 
     def install(self, app: Application) -> None:
-        # команды
+        # Команды
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
+        app.add_handler(CommandHandler("new", self.cmd_new))
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("stats", self.cmd_stats))
         if KB_AVAILABLE:
@@ -143,71 +171,27 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("del", self.cmd_del))
         app.add_handler(CommandHandler("img", self.cmd_img))
         app.add_handler(CommandHandler("web", self.cmd_web))
-        app.add_handler(CommandHandler("new", self.cmd_new))
+        app.add_handler(CommandHandler("reload_menu", self.cmd_reload_menu))
 
-        # кнопки
-        app.add_handler(CallbackQueryHandler(self.on_model_select, pattern=r"^model:"))
-        app.add_handler(CallbackQueryHandler(self.on_mode_select, pattern=r"^mode:"))
-        if KB_AVAILABLE:
-            app.add_handler(CallbackQueryHandler(self.on_kb_toggle, pattern=r"^kb:"))
+        # Callback-и
+        app.add_handler(CallbackQueryHandler(self.on_model_action, pattern=r"^model:"))
+        app.add_handler(CallbackQueryHandler(self.on_mode_action, pattern=r"^mode:"))
         app.add_handler(CallbackQueryHandler(self.on_dialog_action, pattern=r"^dlg:"))
+        if KB_AVAILABLE:
+            app.add_handler(CallbackQueryHandler(self.on_kb_action, pattern=r"^kb:"))
 
-        # сообщения
-        app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
-        app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_or_photo))
-        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.on_text))
+        # Сообщения
+        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, self.on_voice))
+        app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
-        # глобальный error handler — ловим в т.ч. Conflict
-        app.add_error_handler(self.on_error)
+        # Устанавливаем команды при инициализации
+        async def _post_init(application: Application):
+            await self._refresh_all_scopes(application.bot)
 
-        async def _set_global_commands(application: Application):
-            try:
-                commands = [
-                    ("start", "Запуск/справка"),
-                    ("help", "Справка"),
-                    ("reset", "Сброс контекста"),
-                    ("stats", "Статистика"),
-                    ("model", "Выбор модели"),
-                    ("mode", "Стиль ответов"),
-                    ("dialogs", "Диалоги"),
-                    ("del", "Удалить текущий диалог"),
-                    ("img", "Сгенерировать изображение"),
-                    ("web", "Веб-поиск"),
-                    ("new", "Новый диалог"),
-                ]
-                if KB_AVAILABLE:
-                    # /kb добавляем только если модуль реально доступен
-                    commands.insert(4, ("kb", "База знаний"))
-                await application.bot.set_my_commands(commands)
-            except Exception as e:
-                logger.warning("Не удалось установить команды: %s", e)
+        app.post_init(_post_init)
 
-        # post_init — атрибут, а не метод
-        if getattr(app, "post_init", None) is None:
-            app.post_init = _set_global_commands
-        else:
-            prev = app.post_init
-            async def _chain(a: Application):
-                if prev:
-                    await prev(a)
-                await _set_global_commands(a)
-            app.post_init = _chain
-
-    # ---------------- Error handler ----------------
-
-    async def on_error(self, update: Optional[Update], context: ContextTypes.DEFAULT_TYPE):
-        err = context.error
-        if isinstance(err, Conflict):
-            # Частая ситуация: второй инстанс бота запущен параллельно (локально/на другом сервисе).
-            logger.warning("Polling conflict detected: another instance of the bot is running. "
-                           "Этот инстанс продолжит работу; проверьте, что не запущена копия локально/в другом окружении.")
-            # Если хотите, чтобы «лишний» инстанс сам останавливался:
-            # await context.application.stop()
-            return
-        # иначе — стандартный лог
-        logger.exception("Unhandled error in handler: %s", err)
-
-    # ---------------- Команды ----------------
+    # ------------------------------ КОМАНДЫ ---------------------------------
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         base = [
@@ -217,18 +201,14 @@ class ChatGPTTelegramBot:
             "/stats — статистика",
             "/model — выбор модели",
             "/mode — стиль ответов",
-            "/dialogs — список диалогов (открыть/удалить)",
+            "/dialogs — диалоги (открыть/удалить)",
             "/del — удалить текущий диалог",
             "/img <описание> — генерация изображения",
             "/web <запрос> — веб‑поиск со ссылками",
         ]
         if KB_AVAILABLE:
-            # Показываем /kb только если модуль БЗ реально в сборке
-            base.insert(4, "/kb — база знаний (включить/исключить документы)")
-    
-        await update.message.reply_text(
-            "Привет! Я готов к работе.\nКоманды:\n" + "\n".join(base)
-        )
+            base.insert(4, "/kb — база знаний (вкл/искл документы)")
+        await update.message.reply_text("Привет! Я готов к работе.\nКоманды:\n" + "\n".join(base))
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [
@@ -241,206 +221,128 @@ class ChatGPTTelegramBot:
         lines.extend([
             "/model — выбор модели OpenAI",
             "/mode — стиль ответов (Pro/Expert/User/CEO)",
-            "/dialogs — список диалогов (открыть/удалить)",
+            "/dialogs — диалоги (открыть/удалить)",
             "/del — удалить текущий диалог",
             "/img <описание> — сгенерировать изображение",
             "/web <запрос> — веб‑поиск со ссылками",
         ])
-    
-        if not KB_AVAILABLE:
-            lines.append("\n⚠️ База знаний недоступна: модуль не включён в сборку.\n" + KB_MISSING_REASON)
-    
         await update.message.reply_text("\n".join(lines))
 
-    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        st = self._get_chat(chat_id)
-        dlg_id = int(time.time() * 1000)
-        st.dialogs[dlg_id] = DialogState(
-            id=dlg_id,
-            title="Диалог",
-            created_at=time.time(),
-            updated_at=time.time(),
-        )
-        st.current_id = dlg_id
-        await update.message.reply_text("🔄 Новый диалог создан. Контекст очищен.")
-
-    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        dlg = self._ensure_current_dialog(chat_id)
-        model = self.openai.get_current_model(chat_id)
-        style = self.openai.get_style(chat_id)
-        kb = "включена" if dlg.kb_enabled else "выключена"
-
-        # названия выбранных документов, если есть knowledge_base
-        doc_titles: List[str] = []
-        if KB_AVAILABLE and kb_list_docs and dlg.selected_doc_ids:
-            try:
-                docs = {d.id: d for d in kb_list_docs() or []}
-                for d_id in dlg.selected_doc_ids:
-                    if d_id in docs:
-                        doc_titles.append(docs[d_id].title)
-            except Exception:
-                pass
-
-        lines = [
-            "📊 Статистика:",
-            f"- Диалог: {dlg.title}",
-            f"- Модель: {model}",
-            f"- Стиль: {style.capitalize()}",
-            f"- База знаний: {kb}" + ("" if KB_AVAILABLE else " (модуль недоступен)"),
-            f"- Документов выбрано: {len(dlg.selected_doc_ids)}",
-            f"- Создан: {_ts_fmt(dlg.created_at)} • Обновлён: {_ts_fmt(dlg.updated_at)}",
-        ]
-        if doc_titles:
-            lines.append(f"- В контексте: {', '.join(doc_titles)}")
-        await update.message.reply_text("\n".join(lines))
+    async def cmd_reload_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._refresh_all_scopes(context.application.bot)
+        await update.message.reply_text("✅ Меню команд обновлено для всех scope.")
 
     async def cmd_new(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Явно создаёт новый пустой диалог и делает его текущим."""
         chat_id = update.effective_chat.id
         st = self._get_chat(chat_id)
         dlg_id = int(time.time() * 1000)
         st.dialogs[dlg_id] = DialogState(
-            id=dlg_id,
-            title="Диалог",
-            created_at=time.time(),
-            updated_at=time.time(),
+            id=dlg_id, title="Диалог", created_at=time.time(), updated_at=time.time()
         )
         st.current_id = dlg_id
         await update.message.reply_text("🆕 Создан и выбран новый диалог. Можете писать сообщение.")
-    
-    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
-        models, current = self.openai.list_models_with_current(chat_id)
-        if not models:
-            await update.message.reply_text("Список моделей недоступен.")
-            return
-        rows = []
+        self.state.pop(chat_id, None)
+        await update.message.reply_text("🔄 Новый диалог создан. Контекст очищен.")
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        st = self._get_chat(update.effective_chat.id)
+        dlg = st.dialogs.get(st.current_id)
+        model = dlg.model or self.openai.get_user_model(st.user_id) or self.openai.default_model
+        style = dlg.style
+        kb_on = "включена" if (dlg.kb_enabled if dlg else False) else "выключена"
+        kb_cnt = len(dlg.kb_selected) if dlg else 0
+        title = dlg.title if dlg else "—"
+        msg = (
+            "📊 Статистика:\n"
+            f"- Диалог: {title}\n"
+            f"- Модель: {model}\n"
+            f"- Стиль: {style}\n"
+            f"- База знаний: {kb_on}\n"
+            f"- Документов выбрано: {kb_cnt}"
+        )
+        await update.message.reply_text(msg)
+
+    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показ списка моделей с пометкой активной."""
+        user_id = update.effective_user.id
+        st = self._get_chat(update.effective_chat.id)
+        dlg = st.dialogs.get(st.current_id)
+        current = dlg.model or self.openai.get_user_model(user_id) or self.openai.default_model
+
+        models = self.openai.list_models_for_user(user_id)
+        rows: List[List[InlineKeyboardButton]] = []
         for m in models:
             mark = " ✅" if m == current else ""
-            rows.append([InlineKeyboardButton(text=f"{m}{mark}", callback_data=f"model:set:{m}")])
+            rows.append([InlineKeyboardButton(m + mark, callback_data=f"model:set:{m}")])
         await update.message.reply_text("Выберите модель:", reply_markup=InlineKeyboardMarkup(rows))
 
-    async def on_model_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def on_model_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        _, action, model = q.data.split(":", 2)
+        parts = q.data.split(":", 2)
+        if len(parts) < 3:
+            return
+        _, action, model = parts
         if action != "set":
             return
+        user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        self.openai.set_current_model(chat_id, model)
-        await q.edit_message_text(f"Модель установлена: {model}")
+        st = self._get_chat(chat_id)
+        dlg = st.dialogs.get(st.current_id)
+        # сохраняем на уровне диалога, а также user default
+        if dlg:
+            dlg.model = model
+            dlg.updated_at = time.time()
+        self.openai.set_user_model(user_id, model)
+        await q.edit_message_text(f"Модель переключена на: {model}")
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        current = self.openai.get_style(chat_id)
+        st = self._get_chat(update.effective_chat.id)
+        dlg = st.dialogs.get(st.current_id)
+        current = dlg.style if dlg else "Pro"
+        options = ["Pro", "Expert", "User", "CEO"]
         rows = []
-        for key, desc in self.STYLES.items():
-            mark = " ✅" if key == current else ""
-            rows.append([InlineKeyboardButton(f"{key}{mark}", callback_data=f"mode:set:{key}")])
-        await update.message.reply_text("Выберите стиль:", reply_markup=InlineKeyboardMarkup(rows))
+        for opt in options:
+            mark = " ✅" if opt == current else ""
+            rows.append([InlineKeyboardButton(opt + mark, callback_data=f"mode:set:{opt}")])
+        await update.message.reply_text("Выберите стиль ответов:", reply_markup=InlineKeyboardMarkup(rows))
 
-    async def on_mode_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def on_mode_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         await q.answer()
-        _, action, style = q.data.split(":", 2)
+        parts = q.data.split(":", 2)
+        if len(parts) < 3:
+            return
+        _, action, style = parts
         if action != "set":
             return
-        chat_id = update.effective_chat.id
-        self.openai.set_style(chat_id, style)
-        await q.edit_message_text(f"Стиль установлен: {style}")
-
-    async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not KB_AVAILABLE or not kb_sync or not kb_list_docs:
-            await update.message.reply_text(
-                "⚠️ База знаний недоступна в этой сборке.\n" + KB_MISSING_REASON
-            )
-            return
-
-        chat_id = update.effective_chat.id
-        dlg = self._ensure_current_dialog(chat_id)
-
-        msg = await update.message.reply_text("⏳ Синхронизирую базу знаний...")
-        added = updated = deleted = 0
-        try:
-            res = kb_sync()
-            if isinstance(res, tuple) and len(res) >= 3:
-                added, updated, deleted = res[:3]
-            elif isinstance(res, dict):
-                added = int(res.get("added", 0))
-                updated = int(res.get("updated", 0))
-                deleted = int(res.get("deleted", 0))
-        except Exception as e:
-            await msg.edit_text(f"Ошибка синхронизации: {e}")
-            return
-
-        try:
-            docs = kb_list_docs() or []
-        except Exception as e:
-            await msg.edit_text(f"Синхронизация ок. Ошибка чтения списка: {e}")
-            return
-
-        kb_switch = "🔓 Включить БЗ" if not dlg.kb_enabled else "🔒 Выключить БЗ"
-        rows: List[List[InlineKeyboardButton]] = [
-            [InlineKeyboardButton(kb_switch, callback_data="kb:switch")],
-        ]
-        for d in docs:
-            on = "✅" if d.id in dlg.selected_doc_ids else "❌"
-            rows.append([InlineKeyboardButton(f"{on} {d.title}", callback_data=f"kb:toggle:{d.id}")])
-
-        text = (
-            f"📚 База знаний:\n"
-            f"— Добавлено: {added}, Обновлено: {updated}, Удалено: {deleted}\n"
-            f"Выберите документы для контекста."
-        )
-        await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
-
-    async def on_kb_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        q = update.callback_query
-        await q.answer()
-        parts = q.data.split(":")
-        chat_id = update.effective_chat.id
-        dlg = self._ensure_current_dialog(chat_id)
-
-        if len(parts) == 2 and parts[1] == "switch":
-            dlg.kb_enabled = not dlg.kb_enabled
-            await q.answer("БЗ включена" if dlg.kb_enabled else "БЗ выключена")
-            return
-
-        if len(parts) == 3 and parts[1] == "toggle":
-            try:
-                doc_id = int(parts[2])
-            except Exception:
-                await q.answer("Некорректный id документа.")
-                return
-            if doc_id in dlg.selected_doc_ids:
-                dlg.selected_doc_ids.remove(doc_id)
-            else:
-                dlg.selected_doc_ids.append(doc_id)
-            await q.answer("Обновлено")
+        st = self._get_chat(update.effective_chat.id)
+        dlg = st.dialogs.get(st.current_id)
+        if dlg:
+            dlg.style = style
+            dlg.updated_at = time.time()
+        await q.edit_message_text(f"Стиль переключён на: {style}")
 
     async def cmd_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         st = self._get_chat(chat_id)
         if not st.dialogs:
             self._ensure_current_dialog(chat_id)
-    
         rows: List[List[InlineKeyboardButton]] = []
-    
-        # Первая строка — явная кнопка "Новый диалог"
+
+        # Первая строка — создать новый
         rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")])
-    
-        # Далее — по диалогу: 1-я строка широкая "Открыть", 2-я — узкая "✖ Удалить"
+
         items = sorted(st.dialogs.values(), key=lambda d: d.updated_at, reverse=True)
         for d in items:
             mark = " 🟢" if d.id == st.current_id else ""
             title = f"{d.title}{mark}\nсозд: {_ts_fmt(d.created_at)} • изм: {_ts_fmt(d.updated_at)}"
-            # ОТДЕЛЬНОЙ строкой — открытие (широкая кнопка, не режет название)
             rows.append([InlineKeyboardButton(f"↪️ {title}", callback_data=f"dlg:open:{d.id}")])
-            # Следующей строкой — маленькая удалялка (узкий символ ✖)
             rows.append([InlineKeyboardButton("✖ Удалить", callback_data=f"dlg:del:{d.id}")])
-    
+
         await update.message.reply_text("Диалоги:", reply_markup=InlineKeyboardMarkup(rows))
 
     async def on_dialog_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -449,50 +351,36 @@ class ChatGPTTelegramBot:
         parts = q.data.split(":", 2)
         if len(parts) < 2:
             return
-        _, action = parts[0], parts[1]
+        action = parts[1]
         chat_id = update.effective_chat.id
         st = self._get_chat(chat_id)
-    
-        # ➕ Создать новый
+
         if action == "new":
             dlg_id = int(time.time() * 1000)
-            st.dialogs[dlg_id] = DialogState(
-                id=dlg_id,
-                title="Диалог",
-                created_at=time.time(),
-                updated_at=time.time(),
-            )
+            st.dialogs[dlg_id] = DialogState(id=dlg_id, created_at=time.time(), updated_at=time.time())
             st.current_id = dlg_id
             await q.edit_message_text("🆕 Создан и выбран новый диалог.")
             return
-    
-        # Открыть существующий
+
+        if len(parts) < 3:
+            await q.edit_message_text("Некорректные данные.")
+            return
+
+        try:
+            dlg_id = int(parts[2])
+        except Exception:
+            await q.edit_message_text("Некорректный идентификатор диалога.")
+            return
+
         if action == "open":
-            if len(parts) < 3:
-                await q.edit_message_text("Некорректные данные.")
-                return
-            try:
-                dlg_id = int(parts[2])
-            except Exception:
-                await q.edit_message_text("Некорректный идентификатор диалога.")
-                return
             if dlg_id in st.dialogs:
                 st.current_id = dlg_id
                 await q.edit_message_text(f"Открыт диалог: {st.dialogs[dlg_id].title}")
             else:
                 await q.edit_message_text("Диалог не найден.")
             return
-    
-        # Удалить
+
         if action == "del":
-            if len(parts) < 3:
-                await q.edit_message_text("Некорректные данные.")
-                return
-            try:
-                dlg_id = int(parts[2])
-            except Exception:
-                await q.edit_message_text("Некорректный идентификатор диалога.")
-                return
             if dlg_id in st.dialogs:
                 del st.dialogs[dlg_id]
                 if st.current_id == dlg_id:
@@ -508,122 +396,280 @@ class ChatGPTTelegramBot:
         if st.current_id and st.current_id in st.dialogs:
             del st.dialogs[st.current_id]
             st.current_id = None
-            await update.message.reply_text("Диалог удалён. Начинаю новый.")
+            await update.message.reply_text("🗑 Текущий диалог удалён.")
         else:
-            await update.message.reply_text("Текущий диалог не найден.")
+            await update.message.reply_text("Нет активного диалога.")
+
+    async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not KB_AVAILABLE or not self.kb_ctx:
+            await update.message.reply_text(f"Модуль базы знаний недоступен. {KB_MISSING_REASON}")
+            return
+
+        chat_id = update.effective_chat.id
+        st = self._get_chat(chat_id)
+        dlg = st.dialogs.get(st.current_id)
+        if not dlg:
+            self._ensure_current_dialog(chat_id)
+            dlg = st.dialogs[st.current_id]
+
+        # По клику в /kb типично синхронизируем индекс (по требованию)
+        try:
+            if self.kb_indexer:
+                added, updated, deleted, unchanged = self.kb_indexer.sync()
+                logger.info("KB sync: added=%s, updated=%s, deleted=%s, unchanged=%s",
+                            added, updated, deleted, unchanged)
+        except Exception as e:
+            logger.warning("Ошибка синхронизации БЗ: %s", e)
+
+        # Покажем простое меню вкл/выкл + выбор документов
+        rows = [
+            [InlineKeyboardButton(
+                ("🔌 Отключить БЗ" if dlg.kb_enabled else "⚡ Включить БЗ"),
+                callback_data="kb:toggle"
+            )],
+            [InlineKeyboardButton("📄 Выбрать документы", callback_data="kb:pick")]
+        ]
+        await update.message.reply_text(
+            f"База знаний сейчас: {'включена' if dlg.kb_enabled else 'выключена'}.\n"
+            "Вы можете включить/выключить и выбрать документы для контекста.",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    async def on_kb_action(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not KB_AVAILABLE or not self.kb_ctx:
+            await update.callback_query.edit_message_text(f"Модуль БЗ недоступен. {KB_MISSING_REASON}")
+            return
+
+        q = update.callback_query
+        await q.answer()
+        chat_id = update.effective_chat.id
+        st = self._get_chat(chat_id)
+        dlg = st.dialogs.get(st.current_id)
+        if not dlg:
+            await q.edit_message_text("Нет активного диалога.")
+            return
+
+        parts = q.data.split(":", 1)
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "toggle":
+            dlg.kb_enabled = not dlg.kb_enabled
+            dlg.updated_at = time.time()
+            await q.edit_message_text(f"База знаний теперь: {'включена' if dlg.kb_enabled else 'выключена'}.")
+            return
+
+        if action == "pick":
+            # Покажем первые N документов (реализация зависит от KBContextManager)
+            try:
+                docs = self.kb_ctx.list_documents()
+            except Exception as e:
+                await q.edit_message_text(f"Ошибка получения списка документов: {e}")
+                return
+
+            rows = []
+            for d in docs[:50]:  # ограничим клавиатуру
+                checked = "✅ " if d.id in dlg.kb_selected else ""
+                rows.append([InlineKeyboardButton(f"{checked}{d.title}", callback_data=f"kb:toggle_doc:{d.id}")])
+            rows.append([InlineKeyboardButton("Готово", callback_data="kb:done")])
+            await q.edit_message_text("Выберите документы:", reply_markup=InlineKeyboardMarkup(rows))
+            return
+
+        if action.startswith("toggle_doc:"):
+            try:
+                doc_id = int(action.split(":", 1)[1])
+            except Exception:
+                return
+            if doc_id in dlg.kb_selected:
+                dlg.kb_selected.remove(doc_id)
+            else:
+                dlg.kb_selected.append(doc_id)
+            # Обновим текст клавиатуры, не меняя сообщение
+            try:
+                docs = self.kb_ctx.list_documents()
+                rows = []
+                for d in docs[:50]:
+                    checked = "✅ " if d.id in dlg.kb_selected else ""
+                    rows.append([InlineKeyboardButton(f"{checked}{d.title}", callback_data=f"kb:toggle_doc:{d.id}")])
+                rows.append([InlineKeyboardButton("Готово", callback_data="kb:done")])
+                await q.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+            except Exception:
+                pass
+            return
+
+        if action == "done":
+            await q.edit_message_text(f"Выбрано документов: {len(dlg.kb_selected)}. "
+                                      f"БЗ {'вкл' if dlg.kb_enabled else 'выкл'}.")
+            return
 
     async def cmd_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text("Использование: /img <описание>")
             return
-        prompt = " ".join(context.args)
-        chat_id = update.effective_chat.id
+        prompt = " ".join(context.args).strip()
+        await self._typing(update, context)
 
-        await self._typing_once(update, context)
+        # модель берём из env/настроек помощника
+        model = self.openai.get_image_model()
         try:
-            res = self.openai.generate_image(prompt)
-            bio = io.BytesIO(res.image_bytes)
-            bio.name = "image.png"
-            bio.seek(0)
-            cap = f"🖼️ Итоговый промпт:\n{res.final_prompt}\n\nМодель: {res.model_used}"
-            await update.message.reply_photo(photo=InputFile(bio), caption=cap)
+            img_bytes, used_prompt = await asyncio.to_thread(self.openai.generate_image, prompt, model=model)
         except Exception as e:
-            logger.error("Image generation failed: %s", e, exc_info=True)
+            logger.exception("Image generation failed: %s", e)
             await update.message.reply_text(f"Ошибка генерации изображения: {e}")
+            return
+
+        caption = f"🖼️ Сгенерировано.\nМодель: {model}\nПромпт: {used_prompt}"
+        await update.message.reply_photo(photo=img_bytes, caption=caption)
 
     async def cmd_web(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text("Использование: /web <запрос>")
             return
-        query = " ".join(context.args)
-        await self._typing_once(update, context)
+        query = " ".join(context.args).strip()
+        await self._typing(update, context)
         try:
-            results = self.openai.web_search(query, limit=5)
+            answer, links = await asyncio.to_thread(self.openai.web_search, query)
+            if links:
+                links_text = "\n".join(f"• {u}" for u in links[:8])
+                await update.message.reply_text(f"{answer}\n\n🔗 Источники:\n{links_text}")
+            else:
+                await update.message.reply_text(f"{answer}\n\n⚠️ Модель не вернула явных ссылок.")
         except Exception as e:
             await update.message.reply_text(f"Ошибка веб‑поиска: {e}")
-            return
-        if not results:
-            await update.message.reply_text("Не удалось найти источники.")
-            return
-        lines = [f"🔎 Поиск: {query}", ""]
-        for i, r in enumerate(results, 1):
-            title = r.get("title") or r.get("url")
-            url = r.get("url")
-            snippet = r.get("snippet", "")
-            lines.append(f"{i}. {title}\n{url}")
-            if snippet:
-                lines.append(snippet)
-            lines.append("")
-        await update.message.reply_text("\n".join(lines).strip())
 
-    # --------------- Сообщения ----------------
+    # ------------------------------ ОБРАБОТЧИКИ СООБЩЕНИЙ -------------------
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._typing(update, context)
+        user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        dlg = self._ensure_current_dialog(chat_id)
-        dlg.title = self._auto_title(dlg.title, update.message.text)
-        dlg.updated_at = time.time()
+        text = update.message.text.strip()
 
-        await self._typing_once(update, context)
-        kb_snip = None
-        if dlg.kb_enabled and dlg.selected_doc_ids:
-            kb_snip = self._kb_snippets_from_ids(dlg.selected_doc_ids)
+        st = self._get_chat(chat_id)
+        dlg = st.dialogs.get(st.current_id)
+        if not dlg:
+            self._ensure_current_dialog(chat_id)
+            dlg = st.dialogs[st.current_id]
+
+        # авто‑название из первого сообщения
+        if dlg.title == "Диалог" and text:
+            dlg.title = (text[:40] + "…") if len(text) > 40 else text
+
+        model = dlg.model or self.openai.get_user_model(user_id) or self.openai.default_model
+        style = dlg.style
+
+        kb_docs: List[Tuple[int, str]] = []
+        if KB_AVAILABLE and dlg.kb_enabled and dlg.kb_selected and self.kb_ctx:
+            try:
+                kb_docs = self.kb_ctx.fetch_chunks(dlg.kb_selected, top_k=int(os.getenv("RAG_TOP_K", "8")))
+            except Exception as e:
+                logger.warning("KB fetch failed: %s", e)
 
         try:
-            reply = self.openai.chat(chat_id, update.message.text, kb_snip)
+            reply = await asyncio.to_thread(
+                self.openai.chat,
+                user_id,
+                dlg.id,
+                text,
+                model=model,
+                style=style,
+                kb=kb_docs,
+            )
         except Exception as e:
-            logger.error("Chat failed: %s", e, exc_info=True)
-            reply = f"Ошибка обращения к OpenAI: {e}"
+            logger.exception("Chat failed: %s", e)
+            await update.message.reply_text(f"Ошибка обращения к OpenAI: {e}")
+            return
 
+        dlg.updated_at = time.time()
         await update.message.reply_text(reply)
 
     async def on_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.RECORD_AUDIO)
+        file = await update.effective_message.voice.get_file() if update.effective_message.voice else await update.effective_message.audio.get_file()
+        tmp_path = f"/tmp/{file.file_unique_id}.ogg"
+        await file.download_to_drive(custom_path=tmp_path)
+
+        try:
+            transcript = await asyncio.to_thread(self.openai.transcribe, tmp_path)
+        except Exception as e:
+            await update.message.reply_text(f"Не удалось распознать аудио: {e}")
+            return
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        # Покажем, что было распознано, и ответим текстом
+        await self._typing(update, context)
+        user_id = update.effective_user.id
         chat_id = update.effective_chat.id
-        dlg = self._ensure_current_dialog(chat_id)
+        st = self._get_chat(chat_id)
+        dlg = st.dialogs.get(st.current_id)
+        if not dlg:
+            self._ensure_current_dialog(chat_id)
+            dlg = st.dialogs[st.current_id]
+
+        model = dlg.model or self.openai.get_user_model(user_id) or self.openai.default_model
+        style = dlg.style
+
+        kb_docs: List[Tuple[int, str]] = []
+        if KB_AVAILABLE and dlg.kb_enabled and dlg.kb_selected and self.kb_ctx:
+            try:
+                kb_docs = self.kb_ctx.fetch_chunks(dlg.kb_selected, top_k=int(os.getenv("RAG_TOP_K", "8")))
+            except Exception as e:
+                logger.warning("KB fetch failed: %s", e)
+
+        try:
+            reply = await asyncio.to_thread(
+                self.openai.chat,
+                user_id,
+                dlg.id,
+                transcript,
+                model=model,
+                style=style,
+                kb=kb_docs,
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка обращения к OpenAI: {e}")
+            return
+
         dlg.updated_at = time.time()
+        await update.message.reply_text(f"🎙️ Вы сказали: {transcript}\n\n{reply}")
 
-        file_id = update.message.voice.file_id
-        f = await context.bot.get_file(file_id)
-        bx = httpx.get(f.file_path, timeout=60.0)
-        bx.raise_for_status()
+    async def on_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Фото/документы НЕ добавляем в БЗ автоматически. Делаем краткий анализ."""
+        await self._typing(update, context)
+        msg = update.effective_message
 
-        await self._typing_once(update, context)
-        try:
-            text = self.openai.transcribe(bx.content, filename_hint="audio.ogg")
-            await update.message.reply_text(f"🎙️ Вы сказали: {text}")
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка распознавания: {e}")
-            return
-
-        kb_snip = None
-        if dlg.kb_enabled and dlg.selected_doc_ids:
-            kb_snip = self._kb_snippets_from_ids(dlg.selected_doc_ids)
-
-        try:
-            reply = self.openai.chat(chat_id, text, kb_snip)
-        except Exception as e:
-            reply = f"Ошибка обращения к OpenAI: {e}"
-
-        await update.message.reply_text(reply)
-
-    async def on_file_or_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        При получении файлов — **не** добавляем сразу в БЗ.
-        Короткий анализ и предложение использовать /kb для добавления/выбора.
-        """
-        msg = update.message
-        if msg.document:
-            name = msg.document.file_name or "документ"
-            size = msg.document.file_size or 0
-            await msg.reply_text(
-                f"Получен файл: {name} ({size} байт).\n"
-                f"Я не добавляю файлы автоматически в БЗ.\n"
-                f"Используйте /kb для синхронизации и выбора документов."
-            )
-            return
+        # Скачаем файл во временную папку
         if msg.photo:
-            await msg.reply_text(
-                "Получено изображение. Анализ возможен по запросу. "
-                "Добавление в БЗ доступно только для документов. Используйте /kb."
-            )
-            return
+            t = msg.photo[-1]
+            f = await t.get_file()
+            ext = ".jpg"
+        else:
+            doc = msg.document
+            if not doc:
+                return
+            f = await doc.get_file()
+            filename = doc.file_name or f.file_unique_id
+            _, ext = os.path.splitext(filename)
+            if not ext:
+                ext = ".bin"
+
+        tmp_path = f"/tmp/{f.file_unique_id}{ext}"
+        await f.download_to_drive(custom_path=tmp_path)
+
+        try:
+            summary = await asyncio.to_thread(self.openai.describe_file, tmp_path)
+        except Exception as e:
+            summary = f"Не удалось проанализировать файл: {e}"
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        tail = ""
+        if KB_AVAILABLE and (update.effective_user.id in self.admins):
+            tail = "\n\nЧтобы добавить в базу знаний, используйте команду /kb и выберите документ."
+        await update.message.reply_text(f"📎 Файл получен.\nКраткий разбор:\n{summary}{tail}")
