@@ -1,48 +1,20 @@
+# bot/main.py
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
-from contextlib import asynccontextmanager
-
-from telegram.ext import ApplicationBuilder
+from telegram.ext import Application
 
 from bot.config import load_settings
-from bot.db.session import init_db
-from bot.openai_helper import OpenAIHelper
 from bot.telegram_bot import ChatGPTTelegramBot
+from bot.openai_helper import OpenAIHelper
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=logging.INFO)
 
-LOCK_FILE = "/tmp/tg_bot.lock"
-
-@asynccontextmanager
-async def advisory_lock(path: str):
-    """
-    Простейший advisory-lock на уровне файловой системы, чтобы на Railway не запустились
-    два poller'а одновременно (иначе будут конфликты getUpdates 409/Conflict).
-    """
-    if os.path.exists(path):
-        logger.info("🔒 Advisory-lock уже существует. Второй процесс завершен.")
-        raise SystemExit(0)
-    with open(path, "w") as f:
-        f.write(str(os.getpid()))
-    try:
-        yield
-    finally:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-
-def build_application():
+def build_application() -> Application:
     settings = load_settings()
 
-    # 1) Инициализация БД (создаем таблицы, если их ещё нет)
-    init_db()
-
-    # 2) OpenAI helper
+    # Инициализируем OpenAI-хелпер (совместимо с вашим кодом/параметрами)
     openai = OpenAIHelper(
         api_key=settings.openai_api_key,
         model=getattr(settings, "openai_model", None),
@@ -51,31 +23,26 @@ def build_application():
         enable_image_generation=bool(getattr(settings, "enable_image_generation", True)),
     )
 
-    # 3) Telegram bot (handlers + колбэк post_init)
+    # Собираем приложение Telegram
+    app = Application.builder().token(settings.telegram_bot_token).build()
+
+    # Подключаем бота (регистрация всех handlers)
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
-
-    # 4) PTB Application + правильная регистрация post_init ЧЕРЕЗ BUILDER!
-    app = (
-        ApplicationBuilder()
-        .token(settings.telegram_bot_token)
-        .post_init(bot._post_init)  # ВАЖНО: post_init задаётся на BUILDER, а не вызывается у Application!
-        .concurrent_updates(True)
-        .build()
-    )
-
-    # 5) Регистрируем все хэндлеры
     bot.install(app)
 
     return app
 
-def main():
+
+def main() -> None:
     logger.info("🔒 Advisory-lock получен. Запускаем бота.")
-    async def _run():
-        async with advisory_lock(LOCK_FILE):
-            app = build_application()
-            logger.info("🚀 Бот запускается (run_polling)...")
-            await app.run_polling(allowed_updates=["message", "edited_message", "callback_query"])
-    asyncio.run(_run())
+    app = build_application()
+
+    logger.info("🚀 Бот запускается (run_polling)...")
+    # ВАЖНО: без asyncio.run и без await!
+    app.run_polling(
+        allowed_updates=["message", "edited_message", "callback_query"]
+    )
+
 
 if __name__ == "__main__":
     main()
