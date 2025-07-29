@@ -201,13 +201,36 @@ class ChatGPTTelegramBot:
 
     @only_allowed
     async def on_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        style = context.user_data.get("style", "pro")
+        # Пытаемся собрать «богатую» статистику из user_data
+        dialog_title = context.user_data.get("dialog_title") or context.user_data.get("title") or "Диалог"
         model = context.user_data.get("model", self.default_model)
-        await update.message.reply_text(
+    
+        style = context.user_data.get("style", "pro")
+        kb_enabled = bool(context.user_data.get("kb_enabled", False))
+        selected_docs = context.user_data.get("kb_selected_docs") or context.user_data.get("kb_selected") or []
+        if isinstance(selected_docs, set):
+            selected_docs = list(selected_docs)
+    
+        # Имена документов, если у нас вместо имён лежат id — просто покажем как есть
+        if selected_docs and not isinstance(selected_docs[0], str):
+            # Поддержка старого формата — id/кортежи; аккуратно конвертируем в строки
+            selected_docs = [str(d) for d in selected_docs]
+    
+        docs_line = ", ".join(selected_docs[:10]) + ("…" if len(selected_docs) > 10 else "")
+        docs_cnt = len(selected_docs)
+    
+        msg = (
             "📊 Статистика:\n"
+            f"- Диалог: {dialog_title}\n"
             f"- Модель: {model}\n"
-            f"- Стиль: {style}\n"
+            f"- Стиль: {style.capitalize()}\n"
+            f"- База знаний: {'включена' if kb_enabled else 'выключена'}\n"
+            f"- Документов выбрано: {docs_cnt}\n"
         )
+        if docs_cnt:
+            msg += f"- В контексте: {docs_line}\n"
+    
+        await update.message.reply_text(msg)
 
     @only_allowed
     async def on_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,19 +261,23 @@ class ChatGPTTelegramBot:
         if len(q) < 2:
             await update.message.reply_text("Использование: /web <запрос>")
             return
-
+    
         query = q[1].strip()
         model = context.user_data.get("model", self.default_model)
-
+    
         async with TypingIndicator(context.bot, update.effective_chat.id):
             text, cites = await asyncio.to_thread(self.openai.answer_with_web, query, model=model)
-
+    
         if cites:
             refs = "\n".join([f"• {c['title']}: {c['url']}" for c in cites])
             reply = f"{text}\n\n<b>Источники</b>:\n{refs}"
             await update.message.reply_text(reply, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         else:
-            await update.message.reply_text(text)
+            # Явно сообщим, что модель не вернула источников
+            await update.message.reply_text(
+                text + "\n\n⚠️ Модель не вернула явных ссылок-источников для этого ответа.",
+                disable_web_page_preview=True
+            )
 
     @only_allowed
     async def on_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
