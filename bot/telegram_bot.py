@@ -1,11 +1,12 @@
 # bot/telegram_bot.py
 from __future__ import annotations
 
-import io
 import asyncio
+import io
 import logging
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import (
     Update,
@@ -30,27 +31,26 @@ from telegram.ext import (
 
 logger = logging.getLogger(__name__)
 
-# --- Опциональная База Знаний (KB) ---
+# --- Опциональная База Знаний (через контракт + адаптеры) ---
 KB_AVAILABLE = True
 try:
-    from bot.knowledge_base.indexer import KnowledgeBaseIndexer
-    from bot.knowledge_base.retriever import KnowledgeBaseRetriever
-    from bot.knowledge_base.context_manager import ContextManager
-except ImportError as e:
+    from bot.knowledge_base.interfaces import IKnowledgeBaseIndexer, IKnowledgeBaseRetriever, IContextBuilder, KbDocument
+    from bot.knowledge_base.adapters import IndexerAdapter, RetrieverAdapter, ContextAdapter
+except Exception as e:
     KB_AVAILABLE = False
     logger.warning("KB unavailable: %s", e)
 
 
-# --- Простейшая in-memory модель диалогов ---
+# --- Простая модель диалогов в памяти (если у вас уже есть БД — замените сохранение здесь на БД) ---
 @dataclass
 class DialogState:
     dialog_id: int
     title: str = "Диалог"
-    created_at_ts: float = 0.0
-    updated_at_ts: float = 0.0
+    created_at_ts: float = field(default_factory=lambda: time.time())
+    updated_at_ts: float = field(default_factory=lambda: time.time())
     model: Optional[str] = None
-    style: str = "Pro"  # Pro | Expert | User | CEO
-    kb_selected_docs: List[str] = field(default_factory=list)  # список id документов
+    style: str = "Pro"
+    kb_selected_docs: List[str] = field(default_factory=list)  # список id выбранных документов
 
 
 class ChatGPTTelegramBot:
@@ -59,41 +59,34 @@ class ChatGPTTelegramBot:
         self.settings = settings
 
         # Разрешения
-        self.admin_ids = set(
-            getattr(settings, "admin_user_ids", [])
-            or getattr(settings, "admin_set", [])
-            or []
-        )
-        self.allowed_ids = set(
-            getattr(settings, "allowed_user_ids", [])
-            or getattr(settings, "allowed_set", [])
-            or []
-        )
+        self.admin_ids = set(getattr(settings, "admin_user_ids", []) or getattr(settings, "admin_set", []) or [])
+        self.allowed_ids = set(getattr(settings, "allowed_user_ids", []) or getattr(settings, "allowed_set", []) or [])
 
-        # Диалоги (на пользователя)
-        self._dialogs_by_user: Dict[int, Dict[int, DialogState]] = {}
-        self._current_dialog_by_user: Dict[int, Optional[int]] = {}
+        # Состояние пользователей (наивная in‑memory реализация)
+        self._dialogs_by_user: Dict[int, Dict[int, DialogState]] = {}  # user_id -> {dialog_id -> DialogState}
+        self._current_dialog_by_user: Dict[int, int] = {}              # user_id -> dialog_id
         self._next_dialog_id: int = 1
 
         # KB
-        self.kb_indexer: Optional[KnowledgeBaseIndexer] = None
-        self.kb_retriever: Optional[KnowledgeBaseRetriever] = None
-        self.kb_ctx: Optional[ContextManager] = None
+        self.kb_indexer: Optional[IKnowledgeBaseIndexer] = None
+        self.kb_retriever: Optional[IKnowledgeBaseRetriever] = None
+        self.kb_ctx: Optional[IContextBuilder] = None
         if KB_AVAILABLE:
             try:
-                self.kb_indexer = KnowledgeBaseIndexer(settings)
-                self.kb_retriever = KnowledgeBaseRetriever(settings)
-                self.kb_ctx = ContextManager(settings)
+                self.kb_indexer = IndexerAdapter(settings)
+                self.kb_retriever = RetrieverAdapter(settings)
+                self.kb_ctx = ContextAdapter(settings)
             except Exception as e:
+                KB_AVAILABLE_FLAG = False
                 logger.exception("KB init failed: %s", e)
 
-    # ------------- Команды/меню -------------
+    # ========== Команды/меню ==========
     def _build_commands(self) -> List[BotCommand]:
         return [
             BotCommand("help", "помощь"),
             BotCommand("reset", "сброс контекста"),
             BotCommand("stats", "статистика"),
-            BotCommand("kb", "база знаний (выбор документов)"),
+            BotCommand("kb", "база знаний"),
             BotCommand("model", "выбор модели OpenAI"),
             BotCommand("mode", "стиль ответов"),
             BotCommand("dialogs", "список диалогов"),
@@ -101,12 +94,15 @@ class ChatGPTTelegramBot:
             BotCommand("web", "веб‑поиск"),
         ]
 
-    async def _apply_bot_commands(self, bot, lang: Optional[str] = None) -> None:
+    async def setup_commands(self, app: Application) -> None:
+        """
+        Вызывается из Application.builder().post_init(...)
+        Устанавливает команды во всех scope.
+        """
         commands = self._build_commands()
 
         try:
-            # Показать стандартную кнопку «Меню» с командами
-            await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         except Exception:
             pass
 
@@ -117,57 +113,49 @@ class ChatGPTTelegramBot:
         ]
         for scope in scopes:
             try:
-                await bot.delete_my_commands(scope=scope)
+                await app.bot.delete_my_commands(scope=scope)
             except Exception:
                 pass
-            await bot.set_my_commands(commands=commands, scope=scope, language_code=lang)
+            await app.bot.set_my_commands(commands=commands, scope=scope)
 
-    async def setup_commands(self, app: Application) -> None:
-        """
-        Этот метод передаём в Application.builder().post_init(...)
-        Он вызовется один раз после initialize().
-        """
-        lang = getattr(self.settings, "bot_language", None)
-        # сначала без языка
-        await self._apply_bot_commands(app.bot, lang=None)
-        # затем локализованный набор, если нужен
-        if lang:
-            await self._apply_bot_commands(app.bot, lang=lang)
         logger.info("✅ Команды установлены (global scopes)")
 
-    # ------------- Регистрация обработчиков -------------
+    # ========== Регистрация обработчиков ==========
     def install(self, app: Application) -> None:
         # Команды
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("stats", self.cmd_stats))
-        app.add_handler(CommandHandler("kb", self.cmd_kb))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("dialogs", self.cmd_dialogs))
         app.add_handler(CommandHandler("img", self.cmd_img))
         app.add_handler(CommandHandler("web", self.cmd_web))
+        # KB
+        app.add_handler(CommandHandler("kb", self.cmd_kb))
 
-        # Сообщения
+        # Сообщения пользователя
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_or_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
 
-        # Inline
+        # Inline callbacks
         app.add_handler(CallbackQueryHandler(self.on_callback))
 
-    # ------------- Вспомогательные -------------
+    # ========== Вспомогательные ==========
+    def _is_admin(self, user_id: int) -> bool:
+        return user_id in self.admin_ids if self.admin_ids else True  # если список пуст — считаем всех админами
+
     def _ensure_dialog(self, user_id: int) -> DialogState:
         user_dialogs = self._dialogs_by_user.setdefault(user_id, {})
-        curr = self._current_dialog_by_user.get(user_id)
-        if curr is None or curr not in user_dialogs:
+        if user_id not in self._current_dialog_by_user:
             dlg_id = self._next_dialog_id
             self._next_dialog_id += 1
             st = DialogState(dialog_id=dlg_id)
             user_dialogs[dlg_id] = st
             self._current_dialog_by_user[user_id] = dlg_id
-        return user_dialogs[self._current_dialog_by_user[user_id]]  # type: ignore[arg-type]
+        return user_dialogs[self._current_dialog_by_user[user_id]]
 
     def _list_dialogs(self, user_id: int) -> List[DialogState]:
         return list(self._dialogs_by_user.get(user_id, {}).values())
@@ -178,22 +166,24 @@ class ChatGPTTelegramBot:
         except Exception:
             pass
 
-    async def _kb_titles_by_ids(self, ids: List[str]) -> List[str]:
-        if not ids:
-            return []
-        if not (KB_AVAILABLE and self.kb_indexer):
-            return ids
-        list_fn = getattr(self.kb_indexer, "list_documents", None)
-        if not callable(list_fn):
-            return ids
-        try:
-            docs = await asyncio.to_thread(list_fn)
-            by_id = {str(getattr(d, "id")): getattr(d, "title", str(getattr(d, "id"))) for d in docs}
-            return [by_id.get(i, i) for i in ids]
-        except Exception:
-            return ids
+    # Построение клавиатуры выбора документов KB
+    def _render_kb_picker(self, docs: List[KbDocument], selected: List[str], is_admin: bool) -> InlineKeyboardMarkup:
+        rows: List[List[InlineKeyboardButton]] = []
+        for d in docs:
+            mark = "✅ " if d.id in selected else ""
+            lock = " 🔒" if d.encrypted else ""
+            rows.append([InlineKeyboardButton(f"{mark}{d.title}{lock}", callback_data=f"kb:pick:{d.id}")])
 
-    # ------------- Команды -------------
+        # нижняя панель
+        bottom: List[InlineKeyboardButton] = []
+        if is_admin:
+            bottom.append(InlineKeyboardButton("🔄 Синхронизировать", callback_data="kb:sync"))
+        bottom.append(InlineKeyboardButton("🧹 Очистить", callback_data="kb:clear"))
+        bottom.append(InlineKeyboardButton("✅ Готово", callback_data="kb:done"))
+        rows.append(bottom)
+        return InlineKeyboardMarkup(rows)
+
+    # ========== Команды ==========
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self._ensure_dialog(update.effective_user.id)
         await update.effective_message.reply_text(
@@ -204,10 +194,10 @@ class ChatGPTTelegramBot:
         text = (
             "/reset — сброс контекста (новый диалог)\n"
             "/stats — статистика\n"
-            "/kb — база знаний (выбор документов)\n"
+            "/kb — база знаний (синк для админов, выбор документов)\n"
             "/model — выбор модели OpenAI\n"
             "/mode — стиль ответов\n"
-            "/dialogs — список диалогов (открыть/удалить/новый)\n"
+            "/dialogs — список диалогов (открыть/удалить)\n"
             "/img — сгенерировать изображение\n"
             "/web — веб‑поиск\n"
         )
@@ -223,14 +213,14 @@ class ChatGPTTelegramBot:
 
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
-        titles = await self._kb_titles_by_ids(st.kb_selected_docs)
-        kb_list = ", ".join(titles) if titles else "—"
-        model = st.model or getattr(self.settings, "openai_model", "gpt-4o")
+        kb_on = bool(st.kb_selected_docs)
+        kb_list = ", ".join(st.kb_selected_docs) if st.kb_selected_docs else "—"
         text = (
             "📊 Статистика:\n"
             f"- Диалог: {st.title}\n"
-            f"- Модель: {model}\n"
+            f"- Модель: {st.model or getattr(self.settings, 'openai_model', 'gpt-4o')}\n"
             f"- Стиль: {st.style}\n"
+            f"- База знаний: {'включена' if kb_on else 'выключена'}\n"
             f"- Документов выбрано: {len(st.kb_selected_docs)}\n"
             f"- В контексте: {kb_list}"
         )
@@ -239,34 +229,28 @@ class ChatGPTTelegramBot:
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
         try:
-            models = self.openai.list_models_for_menu()  # ожидается list[str]
+            models = self.openai.list_models_for_menu()
         except Exception as e:
             logger.exception("list_models failed: %s", e)
             await update.effective_message.reply_text("Не удалось получить список моделей.")
             return
 
+        rows = []
         current = st.model or getattr(self.settings, "openai_model", None)
-        rows: List[List[InlineKeyboardButton]] = []
         for name in models:
             mark = "✅ " if name == current else ""
             rows.append([InlineKeyboardButton(f"{mark}{name}", callback_data=f"model:{name}")])
-
-        await update.effective_message.reply_text(
-            "Выберите модель:",
-            reply_markup=InlineKeyboardMarkup(rows) if rows else None
-        )
+        kb = InlineKeyboardMarkup(rows)
+        await update.effective_message.reply_text("Выберите модель:", reply_markup=kb)
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
         modes = ["Pro", "Expert", "User", "CEO"]
-        rows: List[List[InlineKeyboardButton]] = []
+        rows = []
         for m in modes:
             mark = "✅ " if st.style == m else ""
             rows.append([InlineKeyboardButton(f"{mark}{m}", callback_data=f"mode:{m}")])
-        await update.effective_message.reply_text(
-            "Выберите стиль ответа:",
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
+        await update.effective_message.reply_text("Выберите стиль ответа:", reply_markup=InlineKeyboardMarkup(rows))
 
     async def cmd_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -276,39 +260,31 @@ class ChatGPTTelegramBot:
             await update.effective_message.reply_text("Диалогов пока нет. Нажмите /reset для создания нового.")
             return
 
-        rows: List[List[InlineKeyboardButton]] = []
+        rows = []
         for d in dialogs:
             title = d.title or f"Диалог #{d.dialog_id}"
             prefix = "⭐ " if d.dialog_id == current_id else ""
-            # Кнопки: открыть | удалить
             rows.append([
                 InlineKeyboardButton(f"{prefix}{title}", callback_data=f"open:{d.dialog_id}"),
                 InlineKeyboardButton("🗑️", callback_data=f"del:{d.dialog_id}"),
             ])
         rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="newdlg")])
-
-        await update.effective_message.reply_text(
-            "Выберите диалог:",
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
+        await update.effective_message.reply_text("Выберите диалог:", reply_markup=InlineKeyboardMarkup(rows))
 
     async def cmd_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # /img <prompt>
         if not context.args:
             await update.effective_message.reply_text("Использование: /img <описание изображения>")
             return
         prompt = " ".join(context.args)
         await self._send_typing(update.effective_chat.id, context)
         try:
-            # generate_image возвращает (bytes, used_prompt)
             img_bytes, used_prompt = await asyncio.to_thread(
                 self.openai.generate_image, prompt, None
             )
             bio = io.BytesIO(img_bytes)
             bio.name = "image.png"
-            await update.effective_message.reply_photo(
-                photo=InputFile(bio),
-                caption=f"🖼️ Сгенерировано по prompt:\n{used_prompt}"
-            )
+            await update.effective_message.reply_photo(photo=InputFile(bio), caption=f"🖼️ Сгенерировано по prompt:\n{used_prompt}")
         except Exception as e:
             logger.exception("Image generation failed: %s", e)
             await update.effective_message.reply_text(f"Ошибка генерации изображения: {e}")
@@ -331,69 +307,24 @@ class ChatGPTTelegramBot:
             await update.effective_message.reply_text(f"Ошибка веб‑поиска: {e}")
 
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """KB: админ при вызове /kb сначала делает sync(), затем всем показываем пикер документов."""
         st = self._ensure_dialog(update.effective_user.id)
         if not KB_AVAILABLE or not (self.kb_indexer and self.kb_retriever and self.kb_ctx):
             await update.effective_message.reply_text("Модуль базы знаний недоступен в этой сборке.")
             return
 
-        user_id = update.effective_user.id
-        if user_id in self.admin_ids:
-            try:
-                added, updated, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)
-                await update.effective_message.reply_text(
-                    "Синхронизация завершена:\n"
-                    f"• Добавлено: {added}\n"
-                    f"• Обновлено: {updated}\n"
-                    f"• Удалено: {deleted}\n"
-                    f"• Без изменений: {unchanged}"
-                )
-            except Exception as e:
-                logger.warning("KB sync failed: %s", e)
-
-        await self._kb_render_picker(update, context, st)
-
-    async def _kb_render_picker(self, update: Update, context: ContextTypes.DEFAULT_TYPE, st: DialogState):
-        list_fn = getattr(self.kb_indexer, "list_documents", None) if self.kb_indexer else None
-        if not callable(list_fn):
-            await update.effective_message.reply_text(
-                "Не удалось получить список документов: Indexer не предоставляет list_documents()."
-            )
-            return
-
+        is_admin = self._is_admin(update.effective_user.id)
+        # Показываем список документов (сразу — без автосинка). Синк — по кнопке для админов.
         try:
-            docs = await asyncio.to_thread(list_fn)
+            docs = list(self.kb_indexer.list_documents())
         except Exception as e:
-            logger.exception("list_documents failed: %s", e)
-            await update.effective_message.reply_text(f"Ошибка получения списка документов: {e}")
+            logger.exception("KB list_documents failed: %s", e)
+            await update.effective_message.reply_text("Не удалось получить список документов БЗ.")
             return
 
-        if not docs:
-            await update.effective_message.reply_text(
-                "Документов пока нет. Загрузите их на Я.Диск и запустите синхронизацию (админом)."
-            )
-            return
+        kb = self._render_kb_picker(docs, st.kb_selected_docs, is_admin=is_admin)
+        await update.effective_message.reply_text("База знаний: выберите документы (галочки).", reply_markup=kb)
 
-        selected = set(st.kb_selected_docs or [])
-        rows: List[List[InlineKeyboardButton]] = []
-        for d in docs:
-            doc_id = str(getattr(d, "id"))
-            title = getattr(d, "title", doc_id) or doc_id
-            mark = "✅ " if doc_id in selected else "⬜ "
-            shown = title if len(title) <= 48 else title[:45] + "…"
-            rows.append([InlineKeyboardButton(f"{mark}{shown}", callback_data=f"kb:toggle_doc:{doc_id}")])
-
-        rows.append([
-            InlineKeyboardButton("Очистить выбор", callback_data="kb:clear"),
-            InlineKeyboardButton("Готово", callback_data="kb:done"),
-        ])
-
-        await update.effective_message.reply_text(
-            "Выберите документы (повторное нажатие снимает выбор):",
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
-
-    # ------------- Сообщения -------------
+    # ========== Сообщения ==========
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
         user_text = update.effective_message.text
@@ -404,7 +335,7 @@ class ChatGPTTelegramBot:
         if st.kb_selected_docs and KB_AVAILABLE and self.kb_retriever and self.kb_ctx:
             try:
                 chunks = await asyncio.to_thread(self.kb_retriever.retrieve, user_text, st.kb_selected_docs)
-                kb_ctx = self.kb_ctx.build_context(chunks)
+                kb_ctx = self.kb_ctx.build(chunks)
             except Exception as e:
                 logger.warning("KB retrieve failed: %s", e)
 
@@ -439,7 +370,7 @@ class ChatGPTTelegramBot:
         if st.kb_selected_docs and KB_AVAILABLE and self.kb_retriever and self.kb_ctx:
             try:
                 chunks = await asyncio.to_thread(self.kb_retriever.retrieve, transcript, st.kb_selected_docs)
-                kb_ctx = self.kb_ctx.build_context(chunks)
+                kb_ctx = self.kb_ctx.build(chunks)
             except Exception as e:
                 logger.warning("KB retrieve failed: %s", e)
 
@@ -459,7 +390,8 @@ class ChatGPTTelegramBot:
 
     async def on_file_or_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        По файлам/фото: только анализ (описание). В БЗ добавление — через /kb (админ-синк + выбор).
+        В этой логике при получении файла/фото бот ТОЛЬКО анализирует и описывает,
+        а в БЗ добавление делается через /kb (не автоматически).
         """
         message = update.effective_message
         await self._send_typing(update.effective_chat.id, context)
@@ -479,7 +411,7 @@ class ChatGPTTelegramBot:
             logger.exception("file/photo analyze failed: %s", e)
             await message.reply_text(f"Не удалось проанализировать вложение: {e}")
 
-    # ------------- Inline callbacks -------------
+    # ========== Inline callbacks ==========
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not query:
@@ -490,21 +422,23 @@ class ChatGPTTelegramBot:
         user_id = update.effective_user.id
         st = self._ensure_dialog(user_id)
 
-        # --- model:<name>
+        # model:<name>
         if data.startswith("model:"):
             name = data.split(":", 1)[1]
             st.model = name
+            st.updated_at_ts = time.time()
             await query.edit_message_text(f"Модель установлена: {name}")
             return
 
-        # --- mode:<name>
+        # mode:<name>
         if data.startswith("mode:"):
             name = data.split(":", 1)[1]
             st.style = name
+            st.updated_at_ts = time.time()
             await query.edit_message_text(f"Стиль установлен: {name}")
             return
 
-        # --- dialogs
+        # dialogs
         if data == "newdlg":
             dlg_id = self._next_dialog_id
             self._next_dialog_id += 1
@@ -529,57 +463,60 @@ class ChatGPTTelegramBot:
                 if self._current_dialog_by_user.get(user_id) == dlg_id:
                     rest = list(self._dialogs_by_user.get(user_id, {}).keys())
                     self._current_dialog_by_user[user_id] = rest[0] if rest else None
-                await query.edit_message_text(f"Диалог #{dlg_id} удалён.")
+                await query.edit_message_text(f"Диалог #{dlg_id} удален.")
             else:
                 await query.edit_message_text("Диалог не найден.")
             return
 
-        # --- KB: новый интерфейс выбора документов
-        if data.startswith("kb:toggle_doc:"):
-            doc_id = data.rsplit(":", 1)[1]
-            cur = set(st.kb_selected_docs or [])
-            if doc_id in cur:
-                cur.remove(doc_id)
-            else:
-                cur.add(doc_id)
-            st.kb_selected_docs = list(cur)
-            # Перерисуем пикер
-            await query.edit_message_reply_markup(reply_markup=None)
-            await self._kb_render_picker(update, context, st)
-            return
-
-        if data == "kb:clear":
-            st.kb_selected_docs = []
-            await query.edit_message_reply_markup(reply_markup=None)
-            await self._kb_render_picker(update, context, st)
-            return
-
-        if data == "kb:done":
-            titles = await self._kb_titles_by_ids(st.kb_selected_docs)
-            picked = ", ".join(titles) if titles else "ничего не выбрано"
-            await query.edit_message_text(f"Готово. Выбрано: {picked}")
-            return
-
-        # --- KB: обратная совместимость (если где-то остался вызов)
-        if data == "kb:pick":
-            await query.edit_message_reply_markup(reply_markup=None)
-            await self._kb_render_picker(update, context, st)
-            return
-
+        # --- KB callbacks ---
         if data == "kb:sync":
             if not KB_AVAILABLE or not self.kb_indexer:
                 await query.edit_message_text("Модуль базы знаний недоступен.")
                 return
+            if not self._is_admin(user_id):
+                await query.edit_message_text("Синхронизацию может запускать только администратор.")
+                return
             try:
-                added, updated, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)
+                res = await asyncio.to_thread(self.kb_indexer.sync)
+                # после синка — перечитываем список и перерисовываем
+                docs = list(self.kb_indexer.list_documents())
+                kb = self._render_kb_picker(docs, st.kb_selected_docs, is_admin=True)
                 await query.edit_message_text(
-                    "Синхронизация завершена:\n"
-                    f"• Добавлено: {added}\n"
-                    f"• Обновлено: {updated}\n"
-                    f"• Удалено: {deleted}\n"
-                    f"• Без изменений: {unchanged}"
+                    f"Синхронизация завершена: +{res.added} / ↑{res.updated} / −{res.deleted} / ={res.unchanged}\n"
+                    f"Обновлён список документов.",
+                    reply_markup=kb
                 )
             except Exception as e:
                 logger.exception("KB sync failed: %s", e)
                 await query.edit_message_text(f"Ошибка синхронизации: {e}")
+            return
+
+        if data == "kb:clear":
+            st.kb_selected_docs.clear()
+            st.updated_at_ts = time.time()
+            try:
+                docs = list(self.kb_indexer.list_documents()) if (KB_AVAILABLE and self.kb_indexer) else []
+            except Exception:
+                docs = []
+            kb = self._render_kb_picker(docs, st.kb_selected_docs, is_admin=self._is_admin(user_id))
+            await query.edit_message_text("Выбор очищен.", reply_markup=kb)
+            return
+
+        if data == "kb:done":
+            await query.edit_message_text("Готово. Документы для контекста выбраны.")
+            return
+
+        if data.startswith("kb:pick:"):
+            doc_id = data.split(":", 2)[2]
+            if doc_id in st.kb_selected_docs:
+                st.kb_selected_docs.remove(doc_id)
+            else:
+                st.kb_selected_docs.append(doc_id)
+            st.updated_at_ts = time.time()
+            try:
+                docs = list(self.kb_indexer.list_documents()) if (KB_AVAILABLE and self.kb_indexer) else []
+            except Exception:
+                docs = []
+            kb = self._render_kb_picker(docs, st.kb_selected_docs, is_admin=self._is_admin(user_id))
+            await query.edit_message_reply_markup(reply_markup=kb)
             return
