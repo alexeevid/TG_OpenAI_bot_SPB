@@ -8,9 +8,26 @@ from bot.config import load_settings
 from bot.telegram_bot import ChatGPTTelegramBot
 from bot.openai_helper import OpenAIHelper
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
 
+# приглушаем шум
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.request").setLevel(logging.WARNING)
+logging.getLogger("yadisk").setLevel(logging.WARNING)
+
+# Если нужно скрыть ТОЛЬКО getUpdates:
+class _DropGetUpdates(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return "getUpdates" not in record.getMessage()
+        except Exception:
+            return True
+
+logging.getLogger("httpx").addFilter(_DropGetUpdates())
 
 def build_application() -> Application:
     settings = load_settings()
