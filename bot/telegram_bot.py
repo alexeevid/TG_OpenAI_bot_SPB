@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from telegram import (
     Update,
@@ -13,11 +14,11 @@ from telegram import (
     InlineKeyboardMarkup,
     BotCommand,
     MenuButtonCommands,
-    InputFile,  # не используем from_bytes, но тип пригодится
     BotCommandScopeDefault,
     BotCommandScopeAllPrivateChats,
-    BotCommandScopeAllGroupChats,
     BotCommandScopeAllChatAdministrators,
+    BotCommandScopeChat,
+    InputFile,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -31,7 +32,7 @@ from telegram.ext import (
 
 logger = logging.getLogger(__name__)
 
-# --- Опциональная База Знаний (KB) ---
+# ====== Опциональная База Знаний (KB) ======
 KB_AVAILABLE = True
 try:
     from bot.knowledge_base.indexer import KnowledgeBaseIndexer
@@ -42,7 +43,7 @@ except Exception as e:
     logger.warning("KB unavailable: %s", e)
 
 
-# --- Простая модель диалогов в памяти (если у вас есть БД — можно заменить) ---
+# ====== Вспомогательные структуры ======
 @dataclass
 class DialogState:
     dialog_id: int
@@ -50,42 +51,40 @@ class DialogState:
     created_at_ts: float = field(default_factory=lambda: time.time())
     updated_at_ts: float = field(default_factory=lambda: time.time())
     model: Optional[str] = None
-    style: str = "Pro"  # Pro | Expert | User | CEO
+    # В UI показываем русские названия, внутрь в хелпер передаём внутренний код
+    style_display: str = "Профессиональный"  # отображаемое имя
+    style_code: str = "Pro"                  # внутренний код (Pro/Expert/User/CEO)
     kb_enabled: bool = False
     kb_selected_docs: List[str] = field(default_factory=list)
 
 
-class ChatGPTTelegramBot:
-    """
-    Класс регистрирует все handlers и содержит логику команд.
-    Команды в меню Telegram выставляются через async-метод `setup_commands`,
-    который должен быть передан в Application.builder().post_init(...)
-    в main.py.
-    """
+STYLE_OPTIONS: List[tuple[str, str]] = [
+    ("Профессиональный", "Pro"),
+    ("Экспертный", "Expert"),
+    ("Пользовательский", "User"),
+    ("CEO", "CEO"),
+]
 
-    # ====== Конструктор ======
+
+class ChatGPTTelegramBot:
     def __init__(self, openai, settings):
+        """
+        openai: экземпляр OpenAIHelper
+        settings: Settings
+        """
         self.openai = openai
         self.settings = settings
 
-        # Разрешения
-        self.admin_ids = set(
-            getattr(settings, "admin_user_ids", [])
-            or getattr(settings, "admin_set", [])
-            or []
-        )
-        self.allowed_ids = set(
-            getattr(settings, "allowed_user_ids", [])
-            or getattr(settings, "allowed_set", [])
-            or []
-        )
+        # Разрешения (если используются)
+        self.admin_ids = set(getattr(settings, "admin_user_ids", []) or getattr(settings, "admin_set", []) or [])
+        self.allowed_ids = set(getattr(settings, "allowed_user_ids", []) or getattr(settings, "allowed_set", []) or [])
 
-        # Диалоги (наивная in-memory реализация)
-        self._dialogs_by_user: Dict[int, Dict[int, DialogState]] = {}
-        self._current_dialog_by_user: Dict[int, int] = {}
+        # Состояние пользователей (простая in-memory реализация)
+        self._dialogs_by_user: Dict[int, Dict[int, DialogState]] = {}   # user_id -> {dialog_id -> DialogState}
+        self._current_dialog_by_user: Dict[int, int] = {}               # user_id -> dialog_id
         self._next_dialog_id: int = 1
 
-        # База знаний
+        # KB
         self.kb_indexer: Optional[KnowledgeBaseIndexer] = None
         self.kb_retriever: Optional[KnowledgeBaseRetriever] = None
         self.kb_ctx: Optional[ContextManager] = None
@@ -94,16 +93,14 @@ class ChatGPTTelegramBot:
                 self.kb_indexer = KnowledgeBaseIndexer(settings)
                 self.kb_retriever = KnowledgeBaseRetriever(settings)
                 self.kb_ctx = ContextManager(settings)
-            except Exception as e:
-                logger.exception("KB init failed: %s", e)
+            except Exception:
+                logger.exception("KB init failed")
 
     # ====== Команды/меню ======
     def _build_commands(self) -> List[BotCommand]:
-        """
-        ТОЛЬКО актуальные команды. Старые вроде /del, /reload_menu, /cancelupload
-        здесь намеренно отсутствуют.
-        """
+        # В системное меню Telegram выставляем только согласованный набор
         return [
+            BotCommand("start", "запуск и меню"),
             BotCommand("help", "помощь"),
             BotCommand("reset", "сброс контекста"),
             BotCommand("stats", "статистика"),
@@ -115,48 +112,50 @@ class ChatGPTTelegramBot:
             BotCommand("web", "веб‑поиск"),
         ]
 
-    async def setup_commands(self, app: Application) -> None:
+    async def _apply_bot_commands(self, bot, lang: Optional[str] = None) -> None:
         """
-        ВАЖНО: этот метод должен передаваться в Application.builder().post_init(...)
-        в main.py. Он вызывается один раз после инициализации Application.
-        Полностью очищает команды во всех scope и выставляет актуальные.
+        Ставит команды в глобальные scope (Default / AllPrivate / AllChatAdmins).
+        Вызывается из setup_commands (post_init).
         """
-        bot = app.bot
-
-        # Показываем кнопку "Команды" в шторке (если поддерживается)
+        commands = self._build_commands()
         try:
             await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         except Exception:
             pass
 
-        commands = self._build_commands()
-
         scopes = [
             BotCommandScopeDefault(),
             BotCommandScopeAllPrivateChats(),
-            BotCommandScopeAllGroupChats(),
             BotCommandScopeAllChatAdministrators(),
         ]
-        # Языковые варианты: без кода и (опционально) язык из настроек
-        langs = [None]
-        lang_cfg = getattr(self.settings, "bot_language", None)
-        if lang_cfg:
-            langs.append(lang_cfg)
-
-        # Сначала удаляем старые команды
         for scope in scopes:
-            for lc in langs:
-                try:
-                    await bot.delete_my_commands(scope=scope, language_code=lc)
-                except Exception:
-                    pass
+            try:
+                await bot.delete_my_commands(scope=scope)
+            except Exception:
+                pass
+            await bot.set_my_commands(commands=commands, scope=scope, language_code=lang)
 
-        # Затем выставляем актуальные
-        for scope in scopes:
-            for lc in langs:
-                await bot.set_my_commands(commands=commands, scope=scope, language_code=lc)
+    async def _apply_chat_commands(self, bot, chat_id: int, lang: Optional[str] = None) -> None:
+        """
+        Обновляет команды именно для текущего чата (chat-scope), чтобы вычистить «хвосты».
+        Вызываем при /start.
+        """
+        commands = self._build_commands()
+        try:
+            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id))
+        except Exception:
+            pass
+        await bot.set_my_commands(commands=commands, scope=BotCommandScopeChat(chat_id), language_code=lang)
 
-        logger.info("✅ Команды обновлены во всех scope/языках.")
+    async def setup_commands(self, app: Application) -> None:
+        """
+        Метод для Application.post_init: ставим глобальные команды (всех scope).
+        """
+        lang = getattr(self.settings, "bot_language", None)
+        await self._apply_bot_commands(app.bot, lang=None)
+        if lang:
+            await self._apply_bot_commands(app.bot, lang=lang)
+        logger.info("✅ Команды установлены (global scopes)")
 
     # ====== Регистрация обработчиков ======
     def install(self, app: Application) -> None:
@@ -183,6 +182,9 @@ class ChatGPTTelegramBot:
 
     # ====== Вспомогательные ======
     def _ensure_dialog(self, user_id: int) -> DialogState:
+        """
+        Гарантирует наличие текущего диалога для пользователя.
+        """
         user_dialogs = self._dialogs_by_user.setdefault(user_id, {})
         if user_id not in self._current_dialog_by_user or self._current_dialog_by_user[user_id] not in user_dialogs:
             dlg_id = self._next_dialog_id
@@ -195,6 +197,13 @@ class ChatGPTTelegramBot:
     def _list_dialogs(self, user_id: int) -> List[DialogState]:
         return list(self._dialogs_by_user.get(user_id, {}).values())
 
+    def _style_buttons(self, current_display: str) -> InlineKeyboardMarkup:
+        rows: List[List[InlineKeyboardButton]] = []
+        for disp, code in STYLE_OPTIONS:
+            mark = "✅ " if disp == current_display else ""
+            rows.append([InlineKeyboardButton(f"{mark}{disp}", callback_data=f"mode:{code}")])
+        return InlineKeyboardMarkup(rows)
+
     async def _send_typing(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -204,6 +213,11 @@ class ChatGPTTelegramBot:
     # ====== Команды ======
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self._ensure_dialog(update.effective_user.id)
+
+        # Освежаем chat-scope команды (чтобы убрать старые /del и т.п.)
+        lang = getattr(self.settings, "bot_language", None)
+        await self._apply_chat_commands(context.bot, update.effective_chat.id, lang)
+
         await update.effective_message.reply_text(
             "Привет! Я готов к работе.\n"
             "Команды: /help, /reset, /stats, /kb, /model, /mode, /dialogs, /img, /web"
@@ -216,7 +230,7 @@ class ChatGPTTelegramBot:
             "/kb — база знаний (вкл/искл документы)\n"
             "/model — выбор модели OpenAI\n"
             "/mode — стиль ответов\n"
-            "/dialogs — список диалогов (открыть/удалить)\n"
+            "/dialogs — список диалогов (открыть/удалить/создать)\n"
             "/img — сгенерировать изображение\n"
             "/web — веб‑поиск\n"
         )
@@ -233,12 +247,11 @@ class ChatGPTTelegramBot:
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
         kb_list = ", ".join(st.kb_selected_docs) if st.kb_selected_docs else "—"
-        model_name = st.model or getattr(self.settings, "openai_model", "gpt-4o")
         text = (
             "📊 Статистика:\n"
             f"- Диалог: {st.title}\n"
-            f"- Модель: {model_name}\n"
-            f"- Стиль: {st.style}\n"
+            f"- Модель: {st.model or getattr(self.settings, 'openai_model', 'gpt-4o')}\n"
+            f"- Стиль: {st.style_display}\n"
             f"- База знаний: {'включена' if st.kb_enabled else 'выключена'}\n"
             f"- Документов выбрано: {len(st.kb_selected_docs)}\n"
             f"- В контексте: {kb_list}"
@@ -246,9 +259,12 @@ class ChatGPTTelegramBot:
         await update.effective_message.reply_text(text)
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Показываем список моделей (из OpenAIHelper) + отмечаем текущую.
+        """
         st = self._ensure_dialog(update.effective_user.id)
         try:
-            models = self.openai.list_models_for_menu()  # -> List[str]
+            models = self.openai.list_models_for_menu()  # ожидается список строк
         except Exception as e:
             logger.exception("list_models failed: %s", e)
             await update.effective_message.reply_text("Не удалось получить список моделей.")
@@ -264,12 +280,10 @@ class ChatGPTTelegramBot:
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
-        modes = ["Pro", "Expert", "User", "CEO"]
-        rows = []
-        for m in modes:
-            mark = "✅ " if st.style == m else ""
-            rows.append([InlineKeyboardButton(f"{mark}{m}", callback_data=f"mode:{m}")])
-        await update.effective_message.reply_text("Выберите стиль ответа:", reply_markup=InlineKeyboardMarkup(rows))
+        await update.effective_message.reply_text(
+            "Выберите стиль ответа:",
+            reply_markup=self._style_buttons(st.style_display),
+        )
 
     async def cmd_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -285,24 +299,27 @@ class ChatGPTTelegramBot:
             prefix = "⭐ " if d.dialog_id == current_id else ""
             rows.append([
                 InlineKeyboardButton(f"{prefix}{title}", callback_data=f"open:{d.dialog_id}"),
-                InlineKeyboardButton("🗑️", callback_data=f"del:{d.dialog_id}"),
+                InlineKeyboardButton("🗑", callback_data=f"del:{d.dialog_id}"),
             ])
         rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="newdlg")])
         await update.effective_message.reply_text("Выберите диалог:", reply_markup=InlineKeyboardMarkup(rows))
 
     async def cmd_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # /img <prompt>
         if not context.args:
             await update.effective_message.reply_text("Использование: /img <описание изображения>")
             return
         prompt = " ".join(context.args)
+
+        # для UX — показываем «печатает»
         await self._send_typing(update.effective_chat.id, context)
         try:
-            img_bytes, used_prompt = await asyncio.to_thread(
-                self.openai.generate_image, prompt, None
-            )
-            # PTB умеет отправлять bytes напрямую
+            img_bytes, used_prompt = await asyncio.to_thread(self.openai.generate_image, prompt, None)
+            # корректная отправка: используем InputFile(io.BytesIO(...))
+            bio = io.BytesIO(img_bytes)
+            bio.name = "image.png"
             await update.effective_message.reply_photo(
-                photo=img_bytes,
+                photo=InputFile(bio, filename="image.png"),
                 caption=f"🖼️ Сгенерировано по prompt:\n{used_prompt}",
             )
         except Exception as e:
@@ -310,6 +327,7 @@ class ChatGPTTelegramBot:
             await update.effective_message.reply_text(f"Ошибка генерации изображения: {e}")
 
     async def cmd_web(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # /web <запрос>
         if not context.args:
             await update.effective_message.reply_text("Использование: /web <запрос>")
             return
@@ -320,7 +338,7 @@ class ChatGPTTelegramBot:
             if sources:
                 src_text = "\n\nИсточники:\n" + "\n".join(f"• {u}" for u in sources)
             else:
-                src_text = "\n\n⚠️ Модель не вернула явных ссылок-источников."
+                src_text = "\n\n⚠️ Модель не вернула явных ссылок‑источников."
             await update.effective_message.reply_text(answer + src_text)
         except Exception as e:
             logger.exception("Web search failed: %s", e)
@@ -345,8 +363,8 @@ class ChatGPTTelegramBot:
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
         user_text = update.effective_message.text
-
         await self._send_typing(update.effective_chat.id, context)
+
         kb_ctx = None
         if st.kb_enabled and st.kb_selected_docs and KB_AVAILABLE and self.kb_retriever and self.kb_ctx:
             try:
@@ -361,9 +379,10 @@ class ChatGPTTelegramBot:
                 user_text,
                 st.model or getattr(self.settings, "openai_model", None),
                 getattr(self.settings, "openai_temperature", 0.2),
-                st.style,
+                st.style_code,
                 kb_ctx,
             )
+            st.updated_at_ts = time.time()
             await update.effective_message.reply_text(reply)
         except Exception as e:
             logger.exception("text chat failed: %s", e)
@@ -396,9 +415,10 @@ class ChatGPTTelegramBot:
                 transcript,
                 st.model or getattr(self.settings, "openai_model", None),
                 getattr(self.settings, "openai_temperature", 0.2),
-                st.style,
+                st.style_code,
                 kb_ctx,
             )
+            st.updated_at_ts = time.time()
             await update.effective_message.reply_text(f"🎙️ Вы сказали: {transcript}\n\nОтвет:\n{reply}")
         except Exception as e:
             logger.exception("voice chat failed: %s", e)
@@ -406,8 +426,8 @@ class ChatGPTTelegramBot:
 
     async def on_file_or_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        В этой логике при получении файла/фото бот ТОЛЬКО анализирует и описывает,
-        а в БЗ добавление делается через /kb -> «Выбрать документы» (не автоматически).
+        При получении файла/фото бот ТОЛЬКО анализирует и описывает.
+        Добавление в БЗ — только из /kb (не автоматически).
         """
         message = update.effective_message
         await self._send_typing(update.effective_chat.id, context)
@@ -419,7 +439,7 @@ class ChatGPTTelegramBot:
                 summary = await asyncio.to_thread(self.openai.describe_file, bytes(content), message.document.file_name)
                 await message.reply_text(f"📄 Файл получен: {message.document.file_name}\nАнализ:\n{summary}")
             elif message.photo:
-                file = await message.photo[-1].get_file()  # самая большая превью
+                file = await message.photo[-1].get_file()
                 content = await file.download_as_bytearray()
                 summary = await asyncio.to_thread(self.openai.describe_image, bytes(content))
                 await message.reply_text(f"🖼️ Фото получено. Анализ:\n{summary}")
@@ -446,12 +466,15 @@ class ChatGPTTelegramBot:
             await query.edit_message_text(f"Модель установлена: {name}")
             return
 
-        # mode:<name>
+        # mode:<code>  (внутренний код)
         if data.startswith("mode:"):
-            name = data.split(":", 1)[1]
-            st.style = name
+            code = data.split(":", 1)[1]
+            # находим отображаемое имя
+            disp = next((d for d, c in STYLE_OPTIONS if c == code), code)
+            st.style_code = code
+            st.style_display = disp
             st.updated_at_ts = time.time()
-            await query.edit_message_text(f"Стиль установлен: {name}")
+            await query.edit_message_text(f"Стиль установлен: {disp}")
             return
 
         # dialogs
@@ -479,7 +502,7 @@ class ChatGPTTelegramBot:
                 if self._current_dialog_by_user.get(user_id) == dlg_id:
                     rest = list(self._dialogs_by_user.get(user_id, {}).keys())
                     self._current_dialog_by_user[user_id] = rest[0] if rest else None
-                await query.edit_message_text(f"Диалог #{dlg_id} удален.")
+                await query.edit_message_text(f"Диалог #{dlg_id} удалён.")
             else:
                 await query.edit_message_text("Диалог не найден.")
             return
@@ -492,8 +515,9 @@ class ChatGPTTelegramBot:
             try:
                 added, updated, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)
                 await query.edit_message_text(
-                    f"Синхронизация завершена:\n"
-                    f"• Добавлено: {added}\n• Обновлено: {updated}\n• Удалено: {deleted}\n• Без изменений: {unchanged}"
+                    "Синхронизация завершена:\n"
+                    f"• Добавлено: {added}\n• Обновлено: {updated}\n"
+                    f"• Удалено: {deleted}\n• Без изменений: {unchanged}"
                 )
             except Exception as e:
                 logger.exception("KB sync failed: %s", e)
@@ -504,13 +528,12 @@ class ChatGPTTelegramBot:
             try:
                 v = int(data.split(":", 2)[2])
                 st.kb_enabled = bool(v)
-                st.updated_at_ts = time.time()
                 await query.edit_message_text(f"База знаний {'включена' if st.kb_enabled else 'выключена'}.")
             except Exception:
                 await query.edit_message_text("Некорректный переключатель.")
             return
 
         if data == "kb:pick":
-            # TODO: здесь можно показать список документов из БЗ.
+            # TODO: показать список документов из индекса (если реализовано в retriever)
             await query.edit_message_text("Выбор документов пока не реализован в этом интерфейсе.")
             return
