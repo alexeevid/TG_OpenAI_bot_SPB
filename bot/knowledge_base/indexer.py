@@ -2,48 +2,80 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Dict, Any, Tuple
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple
 
-from bot.settings import Settings
+try:
+    # Настройки опциональны: если нет — работа не сломается
+    from bot.settings import Settings  # type: ignore
+except Exception:  # pragma: no cover
+    class Settings:  # простая заглушка
+        pass
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class KBDocument:
+    """
+    Унифицированное описание документа в БЗ.
+    """
+    id: str
+    title: str
+    path: str
+    mime: Optional[str] = None
+    size: Optional[int] = None
+    encrypted: bool = False
+    mtime: Optional[float] = None  # unix timestamp
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class KnowledgeBaseIndexer:
     """
-    Минимально совместимый интерфейс для Telegram-бота:
+    Базовый интерфейс под телеграм-бот:
       - __init__(settings)
       - sync() -> (added, updated, deleted, unchanged)
-      - list_documents() -> [{id, title, path, mime, size, encrypted?}, ...]
-      - get_documents_by_ids(ids) -> […]
-    Внутри подключите свою реальную логику (Я.Диск, БД и т.д.).
+      - list_documents() -> List[Dict[str, Any]]
+      - get_documents_by_ids(ids) -> List[Dict[str, Any]]
+
+    Сейчас — безопасная заглушка: возвращает пустой каталог, но не падает.
+    Позже сюда легко встраивается Я.Диск/ФС/БД.
     """
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or Settings()
-        # TODO: инициализируйте клиентов/БД/кэш и т.п.
+        self._catalog: Dict[str, KBDocument] = {}  # id -> KBDocument
+
+    # --- API для бота ---
 
     def sync(self) -> Tuple[int, int, int, int]:
         """
-        Выполнить синхронизацию каталога БЗ (скан/сверка/обновление).
-        Верните кортеж: (added, updated, deleted, unchanged).
+        Скан хранилища и обновление self._catalog.
+
+        Возвращает кортеж (added, updated, deleted, unchanged).
         """
-        # TODO: ваша реальная логика
+        # TODO: Вставьте реальную синхронизацию (Я.Диск / локальные файлы / БД).
         added = 0
         updated = 0
         deleted = 0
-        unchanged = 0
-        logger.info("KB sync: added=%s updated=%s deleted=%s unchanged=%s", added, updated, deleted, unchanged)
+        unchanged = len(self._catalog)
+        logger.info(
+            "KB sync: added=%s updated=%s deleted=%s unchanged=%s",
+            added, updated, deleted, unchanged
+        )
         return added, updated, deleted, unchanged
 
     def list_documents(self) -> List[Dict[str, Any]]:
         """
-        Вернуть список документов для выбора пользователем.
-        Пример элемента: {"id": "doc_123", "title": "PMBOK 7 RU", "path": "disk:/KB/PMBOK.pdf",
-                          "mime": "application/pdf", "size": 1234567, "encrypted": False}
+        Список документов для выбора в UI бота.
         """
-        # TODO: ваша реальная логика
-        return []
+        return [doc.to_dict() for doc in self._catalog.values()]
 
     def get_documents_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
-        all_docs = {d["id"]: d for d in self.list_documents()}
-        return [all_docs[i] for i in ids if i in all_docs]
+        out: List[Dict[str, Any]] = []
+        for _id in ids:
+            doc = self._catalog.get(_id)
+            if doc:
+                out.append(doc.to_dict())
+        return out
