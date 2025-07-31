@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from .types import KBDocument, KBChunk
 
@@ -13,17 +13,16 @@ logger = logging.getLogger(__name__)
 
 
 def _default_kb_dir(settings) -> str:
-    # Каталог для локального манифеста (на Railway можно монтировать volume)
     return getattr(settings, "kb_index_dir", "/data/kb")
 
 
 class KnowledgeBaseRetriever:
     """
-    Упрощённый retriever:
-    - читает manifest.json, созданный Indexer'ом;
+    Упрощённый retriever без pgvector:
+    - читает manifest.json, созданный индексером;
     - отдаёт список документов для UI;
-    - делает простую keyword-релевантность по чанкам.
-    Позже сюда добавим pgvector (DB) путь как приоритетный.
+    - делает очень простой keyword-score по чанкам.
+    Позже сюда легко встраивается путь с pgvector (как приоритетный).
     """
 
     def __init__(self, settings) -> None:
@@ -32,11 +31,8 @@ class KnowledgeBaseRetriever:
         self.manifest_path = os.path.join(self.kb_dir, "manifest.json")
         self._manifest_cache: Optional[Dict] = None
 
-        if not os.path.isdir(self.kb_dir):
-            os.makedirs(self.kb_dir, exist_ok=True)
-
+        os.makedirs(self.kb_dir, exist_ok=True)
         if not os.path.isfile(self.manifest_path):
-            # создадим пустой манифест, чтобы UI не падал
             logger.warning("KB Retriever: manifest.json not found, creating empty.")
             with open(self.manifest_path, "w", encoding="utf-8") as f:
                 json.dump({"documents": []}, f, ensure_ascii=False, indent=2)
@@ -60,9 +56,6 @@ class KnowledgeBaseRetriever:
     # ---------- API для бота ----------
 
     def list_documents(self) -> List[KBDocument]:
-        """
-        Возвращает список документов из локального манифеста.
-        """
         data = self._load_manifest()
         docs: List[KBDocument] = []
         for d in data["documents"]:
@@ -80,12 +73,7 @@ class KnowledgeBaseRetriever:
                 logger.warning("KB Retriever: skip bad doc entry: %s (err=%s)", d, e)
         return docs
 
-    def retrieve(
-        self,
-        query: str,
-        selected_ext_ids: List[str],
-        top_k: Optional[int] = None,
-    ) -> List[KBChunk]:
+    def retrieve(self, query: str, selected_ext_ids: List[str], top_k: Optional[int] = None) -> List[KBChunk]:
         """
         Простая релевантность без векторов:
         - токенизируем запрос на ключевые слова
@@ -95,8 +83,6 @@ class KnowledgeBaseRetriever:
             return []
 
         top_k = top_k or int(getattr(self.settings, "rag_top_k", 5))
-
-        # подгрузим чанки из манифеста
         data = self._load_manifest()
         words = self._extract_words(query)
         if not words:
@@ -129,7 +115,7 @@ class KnowledgeBaseRetriever:
         results.sort(key=lambda x: x.score, reverse=True)
         return results[:top_k]
 
-    # ---------- Utilities ----------
+    # ---------- utils ----------
 
     _word_re = re.compile(r"[A-Za-zА-Яа-я0-9]+")
 
@@ -142,6 +128,5 @@ class KnowledgeBaseRetriever:
         lt = text.lower()
         s = 0
         for w in words:
-            # очень простая метрика: число вхождений
             s += lt.count(w)
         return s
