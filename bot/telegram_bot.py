@@ -5,7 +5,7 @@ import asyncio
 import io
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from telegram import (
     Update,
@@ -16,7 +16,6 @@ from telegram import (
     BotCommandScopeDefault,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllChatAdministrators,
-    InputFile,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -27,6 +26,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.error import Conflict
 
 # ---------- Логирование ----------
 logger = logging.getLogger(__name__)
@@ -113,19 +113,23 @@ class ChatGPTTelegramBot:
             BotCommand("web", "веб-поиск"),
         ]
 
-    async def setup_commands(self, app: Application) -> None:
+    async def setup_commands_and_cleanup(self, app: Application) -> None:
         """
-        Колбэк для Application.post_init — устанавливает команды
-        во всех релевантных scope.
+        Колбэк для Application.post_init — сначала чистим webhook (на всякий),
+        затем устанавливаем команды во всех scope.
         """
-        commands = self._build_commands()
-
         try:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         except Exception:
-            # не критично
             pass
 
+        # Гарантированно убираем webhook, чтобы не было конфликтов режимов
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as e:
+            logger.warning("delete_webhook failed: %s", e)
+
+        commands = self._build_commands()
         scopes = [
             BotCommandScopeDefault(),
             BotCommandScopeAllPrivateChats(),
@@ -196,9 +200,6 @@ class ChatGPTTelegramBot:
             return []
 
     def _prepare_kb_context(self, chunks: List[KBChunk]) -> str:
-        """
-        Сборка текстового контекста для RAG.
-        """
         if not chunks:
             return ""
         lines: List[str] = []
@@ -212,9 +213,6 @@ class ChatGPTTelegramBot:
         return "\n".join(lines)
 
     def _kb_render_menu(self, st: DialogState) -> InlineKeyboardMarkup:
-        """
-        Рисуем меню БЗ: список документов с чекбоксами.
-        """
         docs = self._kb_all_documents()
         rows: List[List[InlineKeyboardButton]] = []
         rows.append([InlineKeyboardButton("🔄 Синхронизировать", callback_data="kb:sync")])
@@ -246,7 +244,7 @@ class ChatGPTTelegramBot:
         text = (
             "/reset — сброс контекста (новый диалог)\n"
             "/stats — статистика\n"
-            "/kb — база знаний (синхронизировать и выбрать документы)\n"
+            "/kb — база знаний (синхронизация и выбор документов)\n"
             "/model — выбор модели OpenAI\n"
             "/mode — стиль ответов\n"
             "/dialogs — список диалогов (открыть/удалить)\n"
@@ -277,12 +275,9 @@ class ChatGPTTelegramBot:
         await update.effective_message.reply_text(text)
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Список моделей из хелпера; текущая помечается галкой.
-        """
         st = self._ensure_dialog(update.effective_user.id)
         try:
-            models = self.openai.list_models_for_menu()  # ожидается список строк
+            models = self.openai.list_models_for_menu()
         except Exception as e:
             logger.exception("list_models failed: %s", e)
             await update.effective_message.reply_text("Не удалось получить список моделей.")
@@ -298,7 +293,6 @@ class ChatGPTTelegramBot:
 
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
-        # Расширяемые режимы
         modes = ["Pro", "Expert", "User", "CEO"]
         rows = []
         for m in modes:
@@ -326,7 +320,6 @@ class ChatGPTTelegramBot:
         await update.effective_message.reply_text("Выберите диалог:", reply_markup=InlineKeyboardMarkup(rows))
 
     async def cmd_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # /img <prompt>
         if not context.args:
             await update.effective_message.reply_text("Использование: /img <описание изображения>")
             return
@@ -334,7 +327,6 @@ class ChatGPTTelegramBot:
         await self._send_typing(update.effective_chat.id, context)
         try:
             img_bytes, used_prompt = await asyncio.to_thread(self.openai.generate_image, prompt, None)
-            # PTB20: используем BytesIO вместо InputFile.from_bytes
             bio = io.BytesIO(img_bytes)
             bio.name = "image.png"
             await update.effective_message.reply_photo(photo=bio, caption=f"🖼️ Сгенерировано по prompt:\n{used_prompt}")
@@ -343,7 +335,6 @@ class ChatGPTTelegramBot:
             await update.effective_message.reply_text(f"Ошибка генерации изображения: {e}")
 
     async def cmd_web(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # /web <запрос>
         if not context.args:
             await update.effective_message.reply_text("Использование: /web <запрос>")
             return
@@ -361,28 +352,24 @@ class ChatGPTTelegramBot:
             await update.effective_message.reply_text(f"Ошибка веб-поиска: {e}")
 
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Логика БЗ: при вызове — выполняем sync и показываем список документов с чекбоксами.
-        """
         st = self._ensure_dialog(update.effective_user.id)
 
         if not (self.kb_available and self.kb_indexer and self.kb_retriever):
             await update.effective_message.reply_text("Модуль базы знаний недоступен в этой сборке.")
             return
 
-        # 1) Синхронизация (админом или любым — по ТЗ автостарт при открытии)
+        # 1) Синхронизация при входе в меню
         try:
             added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)
             sync_msg = (
-                "Синхронизация BЗ завершена:\n"
+                "Синхронизация БЗ завершена:\n"
                 f"• Добавлено: {added}\n• Обновлено: {updated_cnt}\n• Удалено: {deleted}\n• Без изменений: {unchanged}\n\n"
-                "Выберите документы, которые хотите включить в контекст:"
+                "Выберите документы для контекста:"
             )
         except Exception as e:
             logger.exception("KB sync failed: %s", e)
             sync_msg = "Не удалось синхронизировать БЗ. Можно выбрать из текущего списка."
 
-        # 2) Показ меню с чекбоксами
         kb_markup = self._kb_render_menu(st)
         await update.effective_message.reply_text(sync_msg, reply_markup=kb_markup)
 
@@ -395,7 +382,6 @@ class ChatGPTTelegramBot:
 
         await self._send_typing(update.effective_chat.id, context)
 
-        # RAG: извлекаем чанки по выбранным документам
         kb_ctx_text = ""
         if self.kb_available and self.kb_retriever and st.kb_selected_docs:
             try:
@@ -474,7 +460,7 @@ class ChatGPTTelegramBot:
                 )
                 await message.reply_text(f"📄 Файл получен: {message.document.file_name}\nАнализ:\n{summary}")
             elif message.photo:
-                file = await message.photo[-1].get_file()  # наибольшее превью
+                file = await message.photo[-1].get_file()
                 content = await file.download_as_bytearray()
                 summary = await asyncio.to_thread(self.openai.describe_image, bytes(content))
                 await message.reply_text(f"🖼️ Фото получено. Анализ:\n{summary}")
@@ -555,7 +541,6 @@ class ChatGPTTelegramBot:
                 logger.exception("KB sync failed: %s", e)
                 prefix = "Не удалось синхронизировать. Выберите документы из текущего списка."
             await query.edit_message_text(prefix)
-            # Отправляем новое меню (Telegram требует новый message для новой разметки)
             await query.message.reply_text("Документы:", reply_markup=self._kb_render_menu(st))
             return
 
@@ -568,11 +553,9 @@ class ChatGPTTelegramBot:
                 st.kb_selected_docs.remove(ext_id)
             else:
                 st.kb_selected_docs.append(ext_id)
-            # Обновляем меню в этом же сообщении
             try:
                 await query.edit_message_reply_markup(reply_markup=self._kb_render_menu(st))
             except Exception:
-                # если не удалось отредактировать, перерисуем сообщением
                 await query.message.reply_text("Документы:", reply_markup=self._kb_render_menu(st))
             return
 
@@ -583,8 +566,25 @@ class ChatGPTTelegramBot:
             return
 
         if data == "kb:nop":
-            # Ничего не делаем, просто закроем всплывашку
             return
 
-        # неизвестный колбэк
         await query.edit_message_text("Неизвестное действие.")
+
+    # ------------------------------------------------------------------
+    #                        Error handler (важно!)
+    # ------------------------------------------------------------------
+    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err = context.error
+        if isinstance(err, Conflict):
+            logger.error(
+                "Conflict: another getUpdates request is running. "
+                "Проверьте, что бот не запущен вторым процессом."
+            )
+            # Мягко остановим приложение, чтобы избежать спама retry
+            try:
+                await context.application.stop()
+            except Exception:
+                pass
+            return
+
+        logger.exception("Unhandled error: %s", err)
