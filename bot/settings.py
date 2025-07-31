@@ -1,120 +1,79 @@
-from typing import List, Optional
-from pydantic_settings import BaseSettings
-from pydantic import Field, AliasChoices, PrivateAttr, computed_field
+# bot/settings.py
+from __future__ import annotations
+
 import json
+import os
+from typing import List, Optional
 
-# ----------------- helpers -----------------
-def _split_ints(v: Optional[str]) -> List[int]:
-    """
-    CSV/SSV -> List[int], устойчив к мусору.
-    Примеры: "1,2,3" / "1; 2 ; 3" -> [1,2,3]
-    """
-    if not v:
-        return []
-    parts = [p.strip() for p in v.replace(";", ",").split(",") if p.strip()]
-    out: List[int] = []
-    for p in parts:
-        try:
-            out.append(int(p))
-        except Exception:
-            # игнорируем некорректные элементы
-            pass
-    return out
+from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings
 
-def _split_strs(v: Optional[str]) -> List[str]:
-    """
-    CSV/SSV или JSON-массив -> List[str].
-    Примеры:
-      "gpt-4o,gpt-4o-mini" -> ["gpt-4o","gpt-4o-mini"]
-      '["gpt-4o","gpt-4o-mini"]' -> ["gpt-4o","gpt-4o-mini"]
-    """
-    if not v:
-        return []
-    s = v.strip()
-    # пробуем как JSON-массив
-    if s.startswith("[") and s.endswith("]"):
-        try:
-            data = json.loads(s)
-            if isinstance(data, list):
-                return [str(x).strip() for x in data if str(x).strip()]
-        except Exception:
-            pass
-    # иначе CSV/SSV
-    parts = [p.strip() for p in s.replace(";", ",").split(",")]
-    return [p for p in parts if p]
 
-# ----------------- settings -----------------
 class Settings(BaseSettings):
-    # DB: поддерживаем и DATABASE_URL, и POSTGRES_URL
-    database_url: str = Field(
-        ...,
-        validation_alias=AliasChoices("DATABASE_URL", "POSTGRES_URL"),
-    )
-
-    log_level: str = Field("INFO", alias="LOG_LEVEL")
+    # Telegram
+    telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
+    bot_language: Optional[str] = Field(default=None, alias="BOT_LANGUAGE")
 
     # OpenAI
     openai_api_key: str = Field(..., alias="OPENAI_API_KEY")
-    openai_model: str = Field("gpt-4o-mini", alias="OPENAI_MODEL")
-    # модель изображений опциональна — если пусто, в коде есть fallback на dall-e-3
-    image_model: Optional[str] = Field(None, alias="IMAGE_MODEL")
+    openai_model: str = Field(default="gpt-4o", alias="OPENAI_MODEL")
+    openai_temperature: float = Field(default=0.2, alias="OPENAI_TEMPERATURE")
 
-    # Telegram
-    telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
+    # Image generation
+    image_model: str = Field(default="gpt-image-1", alias="IMAGE_MODEL")
+    enable_image_generation: bool = Field(default=True, alias="ENABLE_IMAGE_GENERATION")
 
-    # ---------- ENV (raw-строки) ----------
-    admin_user_ids_env: Optional[str] = Field(
-        None, validation_alias=AliasChoices("ADMIN_USER_IDS", "ADMIN_SET")
-    )
-    allowed_user_ids_env: Optional[str] = Field(
-        None, validation_alias=AliasChoices("ALLOWED_TELEGRAM_USER_IDS", "ALLOWED_USER_IDS")
-    )
-    allowed_models_whitelist_env: Optional[str] = Field(None, alias="ALLOWED_MODELS_WHITELIST")
-    denylist_models_env: Optional[str] = Field(None, alias="DENYLIST_MODELS")
+    # Access control
+    admin_user_ids: Optional[List[int]] = Field(default=None, alias="ADMIN_USER_IDS")
+    admin_set: Optional[List[int]] = Field(default=None, alias="ADMIN_SET")
+    allowed_user_ids: Optional[List[int]] = Field(default=None, alias="ALLOWED_USER_IDS")
+    allowed_set: Optional[List[int]] = Field(default=None, alias="ALLOWED_SET")
 
-    # ---------- Приватные распарсенные значения ----------
-    _admin_set: List[int] = PrivateAttr(default_factory=list)
-    _allowed_set: List[int] = PrivateAttr(default_factory=list)
-    _allowed_models_whitelist: List[str] = PrivateAttr(default_factory=list)
-    _denylist_models: List[str] = PrivateAttr(default_factory=list)
+    # KB / Yandex Disk
+    yandex_disk_token: Optional[str] = Field(default=None, alias="YANDEX_DISK_TOKEN")
+    yandex_disk_folder: str = Field(default="База Знаний", alias="YANDEX_DISK_FOLDER")
 
-    # Yandex Disk
-    yandex_disk_token: str = Field("", alias="YANDEX_DISK_TOKEN")
-    yandex_root_path: str = Field("/База Знаний", alias="YANDEX_ROOT_PATH")
+    # KB / embeddings & retrieval
+    kb_embedding_model: str = Field(default="text-embedding-3-small", alias="KB_EMBEDDING_MODEL")
+    kb_top_k: int = Field(default=6, alias="KB_TOP_K")
 
-    # Фичи
-    enable_image_generation: bool = Field(True, alias="ENABLE_IMAGE_GENERATION")
+    # Vector DB (optional)
+    kb_vector_db_url: Optional[str] = Field(default=None, alias="KB_VECTOR_DB_URL")
 
-    # ---------- post-init: парсим строки в списки ----------
-    def model_post_init(self, __context) -> None:
-        self._admin_set = _split_ints(self.admin_user_ids_env)
-        self._allowed_set = _split_ints(self.allowed_user_ids_env)
-        self._allowed_models_whitelist = _split_strs(self.allowed_models_whitelist_env)
-        self._denylist_models = _split_strs(self.denylist_models_env)
+    # Model filters (optional JSON)
+    allowed_models_whitelist: Optional[List[str]] = Field(default=None, alias="ALLOWED_MODELS_WHITELIST")
+    models_blacklist: Optional[List[str]] = Field(default=None, alias="MODELS_BLACKLIST")
 
-    # ---------- публичные вычисляемые поля (совместимо с pydantic v2) ----------
-    @computed_field  # type: ignore[misc]
-    @property
-    def admin_set(self) -> List[int]:
-        return list(self._admin_set)
+    @field_validator("allowed_models_whitelist", "models_blacklist", mode="before")
+    @classmethod
+    def _parse_json_array(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return json.loads(s)
+            except Exception:
+                # Если пришла не-JSON строка — трактуем как один элемент
+                return [s]
+        return None
 
-    @computed_field  # type: ignore[misc]
-    @property
-    def allowed_set(self) -> List[int]:
-        # Пустой список трактуем как "доступ всем"
-        return list(self._allowed_set)
-
-    @computed_field  # type: ignore[misc]
-    @property
-    def allowed_models_whitelist(self) -> List[str]:
-        return list(self._allowed_models_whitelist)
-
-    @computed_field  # type: ignore[misc]
-    @property
-    def denylist_models(self) -> List[str]:
-        return list(self._denylist_models)
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        populate_by_name = True
+    @field_validator("kb_vector_db_url", mode="after")
+    @classmethod
+    def _normalize_pg_url(cls, v):
+        """
+        Приводим postgres://... к postgresql+psycopg2://...
+        """
+        if not v:
+            return v
+        if v.startswith("postgres://"):
+            return "postgresql+psycopg2://" + v[len("postgres://") :]
+        if v.startswith("postgresql://"):
+            # добавим psycopg2, если не указан другой драйвер
+            if "+psycopg2://" not in v:
+                return v.replace("postgresql://", "postgresql+psycopg2://", 1)
+        return v
