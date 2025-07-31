@@ -1,169 +1,147 @@
-# bot/knowledge_base/indexer.py
+# bot/knowledge_base/retriever.py
 from __future__ import annotations
 
 import json
 import logging
 import os
-import time
-from dataclasses import dataclass, asdict
-from typing import Iterable, List, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
-try:
-    import yadisk  # установлен в requirements
-except Exception:
-    yadisk = None  # работаем без YaDisk, если его нет
+from .types import KBDocument, KBChunk
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_INDEX_DIR = "/data/kb"  # куда кладём manifest.json если не задано иное
+
+def _default_kb_dir(settings) -> str:
+    # Каталог для локального манифеста (на Railway можно монтировать volume)
+    return getattr(settings, "kb_index_dir", "/data/kb")
 
 
-@dataclass
-class ManifestDoc:
-    path: str
-    name: str
-    size: int
-    mtime: float
-
-
-class KnowledgeBaseIndexer:
+class KnowledgeBaseRetriever:
     """
-    Простая реализация индексатора:
-      - при sync() перечисляет документы в корне Я.Диска (или локально) и пишет manifest.json
-      - возвращает счётчики added/updated/deleted/unchanged
-    Не занимается эмбеддингами — это обязанность Retriever/ingestor.
+    Упрощённый retriever:
+    - читает manifest.json, созданный Indexer'ом;
+    - отдаёт список документов для UI;
+    - делает простую keyword-релевантность по чанкам.
+    Позже сюда добавим pgvector (DB) путь как приоритетный.
     """
 
     def __init__(self, settings) -> None:
         self.settings = settings
-        # где хранить манифест
-        self.index_dir = getattr(settings, "kb_index_dir", None) or DEFAULT_INDEX_DIR
-        os.makedirs(self.index_dir, exist_ok=True)
-        self.manifest_path = os.path.join(self.index_dir, "manifest.json")
+        self.kb_dir = _default_kb_dir(settings)
+        self.manifest_path = os.path.join(self.kb_dir, "manifest.json")
+        self._manifest_cache: Optional[Dict] = None
 
-        # параметры Я.Диска
-        self.yadisk_token = getattr(settings, "yandex_disk_token", None)
-        self.yadisk_root = getattr(settings, "yandex_root_path", "/База Знаний")
+        if not os.path.isdir(self.kb_dir):
+            os.makedirs(self.kb_dir, exist_ok=True)
 
-        # допустимые расширения
-        self.allowed_ext = {".pdf", ".docx", ".txt", ".md", ".pptx"}
+        if not os.path.isfile(self.manifest_path):
+            # создадим пустой манифест, чтобы UI не падал
+            logger.warning("KB Retriever: manifest.json not found, creating empty.")
+            with open(self.manifest_path, "w", encoding="utf-8") as f:
+                json.dump({"documents": []}, f, ensure_ascii=False, indent=2)
 
-    # ---------- публичный API ----------
-    def sync(self) -> Tuple[int, int, int, int]:
-        """
-        Сканирует источник (Я.Диск / локальный каталог) и обновляет manifest.json.
-        Возвращает: added, updated, deleted, unchanged
-        """
-        prev = self._load_manifest()
-        prev_by_path = {d["path"]: d for d in prev}
+    # ---------- внутреннее ----------
 
-        current = list(self._scan_documents())
-        cur_by_path = {d.path: d for d in current}
-
-        added = 0
-        updated = 0
-        deleted = 0
-        unchanged = 0
-
-        # сравнение
-        for p, cur in cur_by_path.items():
-            if p not in prev_by_path:
-                added += 1
-            else:
-                old = prev_by_path[p]
-                if int(old.get("size", 0)) != cur.size or float(old.get("mtime", 0)) != cur.mtime:
-                    updated += 1
-                else:
-                    unchanged += 1
-
-        for p in prev_by_path.keys():
-            if p not in cur_by_path:
-                deleted += 1
-
-        # сохраняем манифест
-        self._save_manifest([asdict(d) for d in current])
-
-        logger.info("KB sync: added=%s updated=%s deleted=%s unchanged=%s",
-                    added, updated, deleted, unchanged)
-        return added, updated, deleted, unchanged
-
-    def list_manifest_docs(self) -> List[str]:
-        """Возвращает список имён документов из manifest.json (для UI)."""
-        data = self._load_manifest()
-        return [d.get("name") or d.get("path") for d in data]
-
-    # ---------- внутренняя логика ----------
-    def _load_manifest(self) -> List[dict]:
-        if not os.path.exists(self.manifest_path):
-            return []
+    def _load_manifest(self) -> Dict:
+        if self._manifest_cache is not None:
+            return self._manifest_cache
         try:
             with open(self.manifest_path, "r", encoding="utf-8") as f:
-                return json.load(f).get("documents", [])
+                data = json.load(f)
+            if "documents" not in data or not isinstance(data["documents"], list):
+                data = {"documents": []}
         except Exception as e:
-            logger.warning("Cannot read manifest: %s", e)
+            logger.exception("KB Retriever: failed to read manifest: %s", e)
+            data = {"documents": []}
+        self._manifest_cache = data
+        return data
+
+    # ---------- API для бота ----------
+
+    def list_documents(self) -> List[KBDocument]:
+        """
+        Возвращает список документов из локального манифеста.
+        """
+        data = self._load_manifest()
+        docs: List[KBDocument] = []
+        for d in data["documents"]:
+            try:
+                docs.append(
+                    KBDocument(
+                        ext_id=d.get("ext_id") or d.get("id") or d.get("path") or d.get("title", "doc"),
+                        title=d.get("title") or os.path.basename(d.get("path", "")) or "Документ",
+                        source_path=d.get("path"),
+                        size_bytes=d.get("size_bytes"),
+                        mtime_ts=d.get("mtime_ts"),
+                    )
+                )
+            except Exception as e:
+                logger.warning("KB Retriever: skip bad doc entry: %s (err=%s)", d, e)
+        return docs
+
+    def retrieve(
+        self,
+        query: str,
+        selected_ext_ids: List[str],
+        top_k: Optional[int] = None,
+    ) -> List[KBChunk]:
+        """
+        Простая релевантность без векторов:
+        - токенизируем запрос на ключевые слова
+        - ранжируем чанки по количеству вхождений
+        """
+        if not query.strip() or not selected_ext_ids:
             return []
 
-    def _save_manifest(self, docs: List[dict]) -> None:
-        tmp = self.manifest_path + ".tmp"
-        payload = {"updated_at": time.time(), "documents": docs}
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.manifest_path)
+        top_k = top_k or int(getattr(self.settings, "rag_top_k", 5))
 
-    def _scan_documents(self) -> Iterable[ManifestDoc]:
-        """
-        Возвращает список ManifestDoc из источника.
-        Если доступен yadisk и есть токен — сканируем папку на диске.
-        Иначе смотрим локальную папку self.yadisk_root (если это путь) и берём файлы оттуда.
-        """
-        if yadisk and self.yadisk_token:
-            try:
-                ya = yadisk.YaDisk(token=self.yadisk_token)
-                # рекурсивный обход файлов в self.yadisk_root
-                for item in ya.listdir(self.yadisk_root):
-                    yield from self._flatten_yadisk(ya, item)
-                return
-            except Exception as e:
-                logger.warning("YaDisk scan failed, fallback to local: %s", e)
+        # подгрузим чанки из манифеста
+        data = self._load_manifest()
+        words = self._extract_words(query)
+        if not words:
+            return []
 
-        # fallback: локальный путь
-        local_root = self.yadisk_root if os.path.isdir(self.yadisk_root) else self.index_dir
-        for root, _, files in os.walk(local_root):
-            for fn in files:
-                ext = os.path.splitext(fn)[1].lower()
-                if ext not in self.allowed_ext:
-                    continue
-                path = os.path.join(root, fn)
-                try:
-                    st = os.stat(path)
-                    yield ManifestDoc(path=path, name=fn, size=st.st_size, mtime=st.st_mtime)
-                except FileNotFoundError:
-                    continue
+        results: List[KBChunk] = []
+        for d in data["documents"]:
+            ext_id = d.get("ext_id") or d.get("id") or d.get("path")
+            if not ext_id or ext_id not in selected_ext_ids:
+                continue
+            title = d.get("title") or "Документ"
+            source_path = d.get("path")
 
-    def _flatten_yadisk(self, ya, item) -> Iterable[ManifestDoc]:
-        """
-        Рекурсивно обходим папки Я.Диска; отдаём только поддерживаемые документы.
-        """
-        if item["type"] == "dir":
-            for sub in ya.listdir(item["path"]):
-                yield from self._flatten_yadisk(ya, sub)
-            return
-        # файл
-        name = item["name"]
-        ext = os.path.splitext(name)[1].lower()
-        if ext not in self.allowed_ext:
-            return
-        size = int(item.get("size", 0))
-        # у Я.Диска 'modified' может быть строкой времени; приводим к ts
-        mtime = item.get("modified")
-        if isinstance(mtime, str):
-            try:
-                # 2024-06-10T12:34:56+00:00
-                from datetime import datetime
-                mtime = datetime.fromisoformat(mtime.replace("Z", "+00:00")).timestamp()
-            except Exception:
-                mtime = time.time()
-        elif not isinstance(mtime, (int, float)):
-            mtime = time.time()
+            for ch in d.get("chunks", []):
+                text = ch.get("content") or ""
+                page = ch.get("page")
+                score = self._score(text, words)
+                if score > 0:
+                    results.append(
+                        KBChunk(
+                            ext_id=ext_id,
+                            title=title,
+                            content=text,
+                            score=float(score),
+                            page=page,
+                            source_path=source_path,
+                        )
+                    )
 
-        yield ManifestDoc(path=item["path"], name=name, size=size, mtime=float(mtime))
+        results.sort(key=lambda x: x.score, reverse=True)
+        return results[:top_k]
+
+    # ---------- Utilities ----------
+
+    _word_re = re.compile(r"[A-Za-zА-Яа-я0-9]+")
+
+    def _extract_words(self, text: str) -> List[str]:
+        return [w.lower() for w in self._word_re.findall(text)]
+
+    def _score(self, text: str, words: List[str]) -> int:
+        if not text:
+            return 0
+        lt = text.lower()
+        s = 0
+        for w in words:
+            # очень простая метрика: число вхождений
+            s += lt.count(w)
+        return s
