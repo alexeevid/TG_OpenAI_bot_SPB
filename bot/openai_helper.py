@@ -192,4 +192,40 @@ class OpenAIHelper:
         """
         size_kb = len(bytes_data) / 1024
         ext = filename.split(".")[-1].lower() if "." in filename else "unknown"
-        hint = "Похоже на документ." if ext in {"pdf", "doc", "docx", "txt
+        hint = "Похоже на документ." if ext in {"pdf", "doc", "docx", "txt"} else "Тип файла не распознан."
+        return f"Имя: {filename}\nРазмер: ~{size_kb:.1f} КБ\nТип: {ext}\nКомментарий: {hint}"
+
+    def describe_image(self, image_bytes: bytes) -> str:
+        """
+        Накидной вариант: можно отправить картинку в Vision-модель, но чтобы не усложнять — даем stub.
+        """
+        return "Изображение получено. (Анализ содержимого можно расширить через Vision-модель при необходимости.)"
+
+    # ---------- Веб-поиск ----------
+    def web_answer(self, query: str) -> Tuple[str, List[str]]:
+        """
+        Простой веб-поиск через DuckDuckGo HTML с follow_redirects.
+        Возвращает (сводка_модели, [url, ...]).
+        """
+        try:
+            # 1) Поиск
+            q = requests.utils.quote(query)
+            url = f"https://duckduckgo.com/html/?q={q}"
+            html = requests.get(url, timeout=30, allow_redirects=True).text
+
+            # 2) Извлечь ссылки (наивно)
+            links = re.findall(r'href="(https?://[^"]+)"', html)
+            # Отфильтруем ссылки на сам DuckDuckGo и служебные
+            sources = [u for u in links if "duckduckgo.com" not in u]
+            sources = list(dict.fromkeys(sources))  # уникальные, сохраняя порядок
+            sources = sources[:5]
+
+            # 3) Сформировать короткую сводку (можно упростить — без загрузки контента по каждой ссылке)
+            summary = (
+                f"По запросу «{query}» найдено {len(sources)} источников. "
+                "Сформулирую ответ кратко на основе доступных сниппетов и общих знаний."
+            )
+            return summary, sources
+        except Exception as e:
+            logger.exception("web_answer failed: %s", e)
+            raise
