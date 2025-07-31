@@ -4,144 +4,166 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Tuple
+import time
+from dataclasses import dataclass, asdict
+from typing import Iterable, List, Tuple
 
-import yadisk
+try:
+    import yadisk  # установлен в requirements
+except Exception:
+    yadisk = None  # работаем без YaDisk, если его нет
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_INDEX_DIR = "/data/kb"  # куда кладём manifest.json если не задано иное
+
 
 @dataclass
-class KBMeta:
-    id: str
-    title: str
+class ManifestDoc:
     path: str
-    encrypted: bool
-    updated_at: datetime | None
-    pages: int | None = None
+    name: str
+    size: int
+    mtime: float
 
 
 class KnowledgeBaseIndexer:
     """
-    Минимально-инвазивная реализация синхронизации с папкой на Яндекс.Диске.
-    - Хранит локальный файл индекса: ./data/kb_index.json
-    - Синхронизация: сравнивает файлы на диске и локальный индекс — считает added/updated/deleted/unchanged.
-    - list_documents: возвращает KBMeta для меню выбора в /kb.
+    Простая реализация индексатора:
+      - при sync() перечисляет документы в корне Я.Диска (или локально) и пишет manifest.json
+      - возвращает счётчики added/updated/deleted/unchanged
+    Не занимается эмбеддингами — это обязанность Retriever/ingestor.
     """
 
-    def __init__(self, settings):
+    def __init__(self, settings) -> None:
         self.settings = settings
-        self.disk = yadisk.Client(token=settings.yandex_disk_token)
-        self.folder = getattr(settings, "yandex_disk_folder", "База Знаний")
-        self.data_dir = os.path.abspath("./data")
-        os.makedirs(self.data_dir, exist_ok=True)
-        self.index_file = os.path.join(self.data_dir, "kb_index.json")
+        # где хранить манифест
+        self.index_dir = getattr(settings, "kb_index_dir", None) or DEFAULT_INDEX_DIR
+        os.makedirs(self.index_dir, exist_ok=True)
+        self.manifest_path = os.path.join(self.index_dir, "manifest.json")
 
-    def _load_local_index(self) -> dict:
-        if not os.path.exists(self.index_file):
-            return {"files": {}}
-        with open(self.index_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        # параметры Я.Диска
+        self.yadisk_token = getattr(settings, "yandex_disk_token", None)
+        self.yadisk_root = getattr(settings, "yandex_root_path", "/База Знаний")
 
-    def _save_local_index(self, idx: dict) -> None:
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(idx, f, ensure_ascii=False, indent=2)
+        # допустимые расширения
+        self.allowed_ext = {".pdf", ".docx", ".txt", ".md", ".pptx"}
 
-    def _remote_listing(self) -> dict[str, dict]:
-        """
-        Возвращает словарь {id: {path, title, modified, encrypted}}.
-        Для простоты используем path как id (стабильно и человекочитаемо).
-        """
-        result = {}
-        try:
-            folder_path = f"disk:/{self.folder}"
-            res = self.disk.get_meta(folder_path, fields="name,_embedded.items.name,_embedded.items.modified,_embedded.items.path,_embedded.items.type")
-            if not res or "_embedded" not in res or "items" not in res["_embedded"]:
-                return result
-            for it in res["_embedded"]["items"]:
-                # Фильтруем только файлы
-                if it.get("type") != "file":
-                    continue
-                path = it.get("path", "")
-                name = it.get("name", os.path.basename(path))
-                modified = it.get("modified")
-                # Я.Диск отдает modified как строку ISO
-                updated_at = None
-                if modified:
-                    try:
-                        updated_at = datetime.fromisoformat(modified.replace("Z", "+00:00"))
-                    except Exception:
-                        updated_at = None
-                # Простая эвристика шифрования: по расширению или имени
-                encrypted = name.lower().endswith(".pdf") and "encrypted" in name.lower()
-                doc_id = path  # используем путь как id
-                result[doc_id] = {
-                    "id": doc_id,
-                    "path": path,
-                    "title": name,
-                    "updated_at": updated_at.isoformat() if updated_at else None,
-                    "encrypted": encrypted,
-                }
-        except Exception as e:
-            logger.exception("KB: remote listing failed: %s", e)
-        return result
-
+    # ---------- публичный API ----------
     def sync(self) -> Tuple[int, int, int, int]:
         """
-        Возвращает (added, updated, deleted, unchanged).
-        Для минимальной инвазивности — без скачивания и парсинга контента (это можно добавить позже).
+        Сканирует источник (Я.Диск / локальный каталог) и обновляет manifest.json.
+        Возвращает: added, updated, deleted, unchanged
         """
-        local = self._load_local_index()
-        remote = self._remote_listing()
+        prev = self._load_manifest()
+        prev_by_path = {d["path"]: d for d in prev}
 
-        local_files = local.get("files", {})
-        added = updated = deleted = unchanged = 0
+        current = list(self._scan_documents())
+        cur_by_path = {d.path: d for d in current}
 
-        # Найти добавленные/обновленные
-        for doc_id, meta in remote.items():
-            if doc_id not in local_files:
+        added = 0
+        updated = 0
+        deleted = 0
+        unchanged = 0
+
+        # сравнение
+        for p, cur in cur_by_path.items():
+            if p not in prev_by_path:
                 added += 1
             else:
-                # сравним updated_at
-                if local_files[doc_id].get("updated_at") != meta.get("updated_at"):
+                old = prev_by_path[p]
+                if int(old.get("size", 0)) != cur.size or float(old.get("mtime", 0)) != cur.mtime:
                     updated += 1
                 else:
                     unchanged += 1
 
-        # Найти удаленные
-        for doc_id in list(local_files.keys()):
-            if doc_id not in remote:
+        for p in prev_by_path.keys():
+            if p not in cur_by_path:
                 deleted += 1
 
-        # Обновить локальный индекс
-        self._save_local_index({"files": remote})
+        # сохраняем манифест
+        self._save_manifest([asdict(d) for d in current])
 
-        logger.info("KB sync: added=%s updated=%s deleted=%s unchanged=%s", added, updated, deleted, unchanged)
+        logger.info("KB sync: added=%s updated=%s deleted=%s unchanged=%s",
+                    added, updated, deleted, unchanged)
         return added, updated, deleted, unchanged
 
-    def list_documents(self) -> List[KBMeta]:
-        idx = self._load_local_index()
-        files = idx.get("files", {})
-        docs: List[KBMeta] = []
-        for v in files.values():
-            updated = None
-            if v.get("updated_at"):
+    def list_manifest_docs(self) -> List[str]:
+        """Возвращает список имён документов из manifest.json (для UI)."""
+        data = self._load_manifest()
+        return [d.get("name") or d.get("path") for d in data]
+
+    # ---------- внутренняя логика ----------
+    def _load_manifest(self) -> List[dict]:
+        if not os.path.exists(self.manifest_path):
+            return []
+        try:
+            with open(self.manifest_path, "r", encoding="utf-8") as f:
+                return json.load(f).get("documents", [])
+        except Exception as e:
+            logger.warning("Cannot read manifest: %s", e)
+            return []
+
+    def _save_manifest(self, docs: List[dict]) -> None:
+        tmp = self.manifest_path + ".tmp"
+        payload = {"updated_at": time.time(), "documents": docs}
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.manifest_path)
+
+    def _scan_documents(self) -> Iterable[ManifestDoc]:
+        """
+        Возвращает список ManifestDoc из источника.
+        Если доступен yadisk и есть токен — сканируем папку на диске.
+        Иначе смотрим локальную папку self.yadisk_root (если это путь) и берём файлы оттуда.
+        """
+        if yadisk and self.yadisk_token:
+            try:
+                ya = yadisk.YaDisk(token=self.yadisk_token)
+                # рекурсивный обход файлов в self.yadisk_root
+                for item in ya.listdir(self.yadisk_root):
+                    yield from self._flatten_yadisk(ya, item)
+                return
+            except Exception as e:
+                logger.warning("YaDisk scan failed, fallback to local: %s", e)
+
+        # fallback: локальный путь
+        local_root = self.yadisk_root if os.path.isdir(self.yadisk_root) else self.index_dir
+        for root, _, files in os.walk(local_root):
+            for fn in files:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in self.allowed_ext:
+                    continue
+                path = os.path.join(root, fn)
                 try:
-                    updated = datetime.fromisoformat(v["updated_at"])
-                except Exception:
-                    updated = None
-            docs.append(
-                KBMeta(
-                    id=v["id"],
-                    title=v["title"],
-                    path=v["path"],
-                    encrypted=bool(v.get("encrypted", False)),
-                    updated_at=updated,
-                    pages=None,
-                )
-            )
-        # Сортировка: по дате убыв.
-        docs.sort(key=lambda d: d.updated_at or datetime.fromtimestamp(0), reverse=True)
-        return docs
+                    st = os.stat(path)
+                    yield ManifestDoc(path=path, name=fn, size=st.st_size, mtime=st.st_mtime)
+                except FileNotFoundError:
+                    continue
+
+    def _flatten_yadisk(self, ya, item) -> Iterable[ManifestDoc]:
+        """
+        Рекурсивно обходим папки Я.Диска; отдаём только поддерживаемые документы.
+        """
+        if item["type"] == "dir":
+            for sub in ya.listdir(item["path"]):
+                yield from self._flatten_yadisk(ya, sub)
+            return
+        # файл
+        name = item["name"]
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in self.allowed_ext:
+            return
+        size = int(item.get("size", 0))
+        # у Я.Диска 'modified' может быть строкой времени; приводим к ts
+        mtime = item.get("modified")
+        if isinstance(mtime, str):
+            try:
+                # 2024-06-10T12:34:56+00:00
+                from datetime import datetime
+                mtime = datetime.fromisoformat(mtime.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                mtime = time.time()
+        elif not isinstance(mtime, (int, float)):
+            mtime = time.time()
+
+        yield ManifestDoc(path=item["path"], name=name, size=size, mtime=float(mtime))
