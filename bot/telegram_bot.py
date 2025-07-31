@@ -31,10 +31,10 @@ KB_AVAILABLE = True
 try:
     from bot.knowledge_base.indexer import KnowledgeBaseIndexer
     from bot.knowledge_base.retriever import KnowledgeBaseRetriever
+    from bot.knowledge_base.context_manager import ContextManager
 except Exception as e:
     KB_AVAILABLE = False
     logger.warning("KB unavailable: %s", e)
-
 
 # --- Диалог ---
 @dataclass
@@ -59,7 +59,16 @@ class ChatGPTTelegramBot:
         self._current_dialog_by_user: Dict[int, int] = {}
         self._next_dialog_id = 1
 
-        self.kb_indexer: Optional[KnowledgeBaseIndexer] = None
+        self.kb_indexer = self.kb_retriever = self.kb_ctx = None
+        if KB_AVAILABLE:
+            try:
+                self.kb_indexer = KnowledgeBaseIndexer(settings)
+                self.kb_retriever = KnowledgeBaseRetriever(settings)
+                self.kb_ctx = ContextManager()
+            except Exception as e:
+                KB_AVAILABLE = False
+                logger.exception("KB init failed: %s", e)
+
         self.kb_retriever: Optional[KnowledgeBaseRetriever] = None
         if KB_AVAILABLE:
             try:
