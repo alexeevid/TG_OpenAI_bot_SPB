@@ -1,147 +1,90 @@
-# bot/knowledge_base/retriever.py
+# bot/knowledge_base/indexer.py
 from __future__ import annotations
 
 import json
 import logging
 import os
-import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-from .types import KBDocument, KBChunk
+from .types import KBDocument
 
 logger = logging.getLogger(__name__)
 
 
 def _default_kb_dir(settings) -> str:
-    # Каталог для локального манифеста (на Railway можно монтировать volume)
+    """
+    Каталог, где лежит индекс БЗ (manifest.json).
+    На Railway удобно указывать volume: /data/kb
+    """
     return getattr(settings, "kb_index_dir", "/data/kb")
 
 
-class KnowledgeBaseRetriever:
+class KnowledgeBaseIndexer:
     """
-    Упрощённый retriever:
-    - читает manifest.json, созданный Indexer'ом;
-    - отдаёт список документов для UI;
-    - делает простую keyword-релевантность по чанкам.
-    Позже сюда добавим pgvector (DB) путь как приоритетный.
+    Упрощённый индексер:
+    - Хранит manifest.json (список документов и чанков).
+    - Метод sync() возвращает счетчики изменений.
+    Здесь демо-реализация (ничего не меняет), чтобы починить ваш UI и импорты.
+    Реальную синхронизацию с Яндекс.Диском/фс можно подключить позже, главное —
+    поддерживать формат manifest.json, который читает retriever.
     """
 
     def __init__(self, settings) -> None:
         self.settings = settings
         self.kb_dir = _default_kb_dir(settings)
         self.manifest_path = os.path.join(self.kb_dir, "manifest.json")
-        self._manifest_cache: Optional[Dict] = None
 
-        if not os.path.isdir(self.kb_dir):
-            os.makedirs(self.kb_dir, exist_ok=True)
-
+        os.makedirs(self.kb_dir, exist_ok=True)
         if not os.path.isfile(self.manifest_path):
-            # создадим пустой манифест, чтобы UI не падал
-            logger.warning("KB Retriever: manifest.json not found, creating empty.")
             with open(self.manifest_path, "w", encoding="utf-8") as f:
                 json.dump({"documents": []}, f, ensure_ascii=False, indent=2)
 
-    # ---------- внутреннее ----------
+    # --------- чтение/запись манифеста ---------
 
     def _load_manifest(self) -> Dict:
-        if self._manifest_cache is not None:
-            return self._manifest_cache
         try:
             with open(self.manifest_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if "documents" not in data or not isinstance(data["documents"], list):
                 data = {"documents": []}
-        except Exception as e:
-            logger.exception("KB Retriever: failed to read manifest: %s", e)
+        except Exception:
             data = {"documents": []}
-        self._manifest_cache = data
         return data
 
-    # ---------- API для бота ----------
+    def _save_manifest(self, data: Dict) -> None:
+        with open(self.manifest_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    # --------- API, которое вызывает бот ---------
+
+    def sync(self) -> Tuple[int, int, int, int]:
+        """
+        Синхронизация состава документов.
+        Возвращает: (added, updated, deleted, unchanged)
+
+        Демо: ничего не меняем и считаем, что всё "без изменений".
+        Подключите сюда вашу логику с Я.Диском: вычислите дельту и
+        обновите data["documents"], затем сохраните через _save_manifest().
+        """
+        data = self._load_manifest()
+
+        added = updated = deleted = 0
+        unchanged = len(data.get("documents", []))
+
+        self._save_manifest(data)
+        return added, updated, deleted, unchanged
 
     def list_documents(self) -> List[KBDocument]:
-        """
-        Возвращает список документов из локального манифеста.
-        """
         data = self._load_manifest()
-        docs: List[KBDocument] = []
-        for d in data["documents"]:
-            try:
-                docs.append(
-                    KBDocument(
-                        ext_id=d.get("ext_id") or d.get("id") or d.get("path") or d.get("title", "doc"),
-                        title=d.get("title") or os.path.basename(d.get("path", "")) or "Документ",
-                        source_path=d.get("path"),
-                        size_bytes=d.get("size_bytes"),
-                        mtime_ts=d.get("mtime_ts"),
-                    )
+        out: List[KBDocument] = []
+        for d in data.get("documents", []):
+            out.append(
+                KBDocument(
+                    ext_id=d.get("ext_id") or d.get("id") or d.get("path") or d.get("title", "doc"),
+                    title=d.get("title") or os.path.basename(d.get("path", "")) or "Документ",
+                    source_path=d.get("path"),
+                    size_bytes=d.get("size_bytes"),
+                    mtime_ts=d.get("mtime_ts"),
                 )
-            except Exception as e:
-                logger.warning("KB Retriever: skip bad doc entry: %s (err=%s)", d, e)
-        return docs
-
-    def retrieve(
-        self,
-        query: str,
-        selected_ext_ids: List[str],
-        top_k: Optional[int] = None,
-    ) -> List[KBChunk]:
-        """
-        Простая релевантность без векторов:
-        - токенизируем запрос на ключевые слова
-        - ранжируем чанки по количеству вхождений
-        """
-        if not query.strip() or not selected_ext_ids:
-            return []
-
-        top_k = top_k or int(getattr(self.settings, "rag_top_k", 5))
-
-        # подгрузим чанки из манифеста
-        data = self._load_manifest()
-        words = self._extract_words(query)
-        if not words:
-            return []
-
-        results: List[KBChunk] = []
-        for d in data["documents"]:
-            ext_id = d.get("ext_id") or d.get("id") or d.get("path")
-            if not ext_id or ext_id not in selected_ext_ids:
-                continue
-            title = d.get("title") or "Документ"
-            source_path = d.get("path")
-
-            for ch in d.get("chunks", []):
-                text = ch.get("content") or ""
-                page = ch.get("page")
-                score = self._score(text, words)
-                if score > 0:
-                    results.append(
-                        KBChunk(
-                            ext_id=ext_id,
-                            title=title,
-                            content=text,
-                            score=float(score),
-                            page=page,
-                            source_path=source_path,
-                        )
-                    )
-
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:top_k]
-
-    # ---------- Utilities ----------
-
-    _word_re = re.compile(r"[A-Za-zА-Яа-я0-9]+")
-
-    def _extract_words(self, text: str) -> List[str]:
-        return [w.lower() for w in self._word_re.findall(text)]
-
-    def _score(self, text: str, words: List[str]) -> int:
-        if not text:
-            return 0
-        lt = text.lower()
-        s = 0
-        for w in words:
-            # очень простая метрика: число вхождений
-            s += lt.count(w)
-        return s
+            )
+        return out
