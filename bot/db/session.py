@@ -1,41 +1,42 @@
+# bot/db/session.py
 from __future__ import annotations
 
+import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
-from bot.config import load_settings
+from bot.settings import Settings
+from bot.db.utils import normalize_db_url
 
-# Загружаем настройки и нормализованный DATABASE_URL
-settings = load_settings()
+settings = Settings()
 
-# Railway часто подставляет postgresql:// - SQLAlchemy сам подберет подходящий драйвер (psycopg)
-engine = create_engine(
-    settings.database_url,
-    pool_pre_ping=True,
-    future=True,
+# Собираем URL из настроек/переменных (оставляем гибкость под ваши имена)
+raw_url = (
+    getattr(settings, "database_url", None)
+    or getattr(settings, "postgres_url", None)
+    or os.getenv("DATABASE_URL")
+    or os.getenv("POSTGRES_URL")
 )
 
-# Фабрика сессий
-SessionLocal = sessionmaker(
-    bind=engine,
-    expire_on_commit=False,
-    autoflush=False,
-    autocommit=False,
-)
+db_url = normalize_db_url(raw_url)
 
-def init_db(base=None) -> None:
+if not db_url:
+    raise RuntimeError(
+        "DATABASE_URL/POSTGRES_URL не задан. Установите переменную Railway или проверьте Settings."
+    )
+
+# ВАЖНО: теперь URL уже в виде postgresql+psycopg2://...
+engine = create_engine(db_url, pool_pre_ping=True)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+def init_db():
     """
-    Инициализация схемы БД.
-
-    Совместима с двумя стилями вызова:
-      - init_db()                      # новый стиль (Base определяется из моделей)
-      - init_db(Base)                  # старый стиль (передается DeclarativeBase)
-
-    :param base: DeclarativeBase (опционально)
+    Если у вас есть модели — импортируйте их ниже, чтобы Base.metadata.create_all
+    увидел таблицы. Иначе оставьте как есть.
     """
-    if base is None:
-        # Импортируем здесь, чтобы избежать циклических импортов
-        from .models import Base as _Base
-        base = _Base
-
-    base.metadata.create_all(bind=engine)
+    # from bot.db import models  # пример
+    Base.metadata.create_all(bind=engine)
