@@ -7,4 +7,6 @@ pydantic-settings>=2.2.1
 requests>=2.31.0
 sqlalchemy>=2.0.29
 psycopg2-binary>=2.9.9
+pgvector>=0.2.5
+numpy>=1.26,<2
 yadisk>=3.4.0
