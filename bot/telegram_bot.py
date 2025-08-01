@@ -384,14 +384,6 @@ class ChatGPTTelegramBot:
             try:
                 chunks = await asyncio.to_thread(self.kb_retriever.retrieve, user_text, st.kb_selected_docs)
                 kb_ctx = self.kb_ctx.build_context(chunks)
-                import os
-                kb_sources = []
-                try:
-                    kb_sources = sorted({getattr(c, "source", None) or getattr(c, "path", None) for c in chunks if c})
-                    kb_sources = [s for s in kb_sources if s]
-                except Exception:
-                    kb_sources = []
-
             except Exception as e:
                 logger.warning("KB retrieve failed: %s", e)
 
@@ -404,8 +396,6 @@ class ChatGPTTelegramBot:
                 st.style,
                 kb_ctx,
             )
-            if os.getenv("KB_DEBUG", "0") == "1" and kb_sources:
-                reply = f"{reply}\n\n📚 Источники (БЗ):\n" + "\n".join(f"• {s}" for s in kb_sources[:10])
             await update.effective_message.reply_text(reply)
         except Exception as e:
             logger.exception("text chat failed: %s", e)
