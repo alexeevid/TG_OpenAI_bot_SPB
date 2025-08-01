@@ -2,268 +2,182 @@
 from __future__ import annotations
 
 import base64
-import io
 import logging
+import os
 from typing import List, Optional, Tuple
 
-from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai import OpenAI, APIError, BadRequestError  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAIHelper:
     """
-    Узел интеграции с OpenAI.
-    ВАЖНО: оставляем прежние сигнатуры публичных методов, чтобы не трогать остальную логику бота.
+    Обёртка над OpenAI SDK с единым интерфейсом для бота.
+    Основной сценарий — Chat Completions; Responses API намеренно не используем
+    как primary, чтобы избежать ошибок несовместимости.
     """
 
-    def __init__(
-        self,
-        api_key: str,
-        default_model: Optional[str] = None,
-        image_model: Optional[str] = None,
-        default_temperature: float = 0.2,
-        enable_image_generation: bool = True,
-    ):
-        self.client = OpenAI(api_key=api_key)
-        # Алиас для обратной совместимости (в коде бота встречается self._client)
-        self._client = self.client
+    def __init__(self, api_key: str):
+        if not api_key:
+            raise ValueError("OpenAI API key is required")
+        # Клиент v1 (openai>=1.30.0)
+        self._client = OpenAI(api_key=api_key)
 
-        self.default_model = default_model or "gpt-4o"
-        self.image_model = image_model or "gpt-image-1"
-        self.default_temperature = default_temperature
-        self.enable_image_generation = enable_image_generation
+        # Базовые модели по умолчанию
+        self.default_chat_model = os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.default_image_model = os.getenv("IMAGE_MODEL", "gpt-image-1")
+        self.default_embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 
-        # Набор «меню» моделей — с «о» линейкой по вашему ТЗ
-        self._menu_models = [
-            # reasoning / o-series
-            "o3-mini",
-            "o3",
-            "o1-mini",
-            "o1",
-            "o4-mini",
-            "o4",
-            # gpt-4o семья
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4o-audio-preview",
-            "gpt-4o-audio-preview-2024-10-01",
-            # универсальные малые
-            "gpt-3.5-turbo",
-        ]
+        # Белый список моделей для меню (по желанию через переменную окружения)
+        # Пример: "gpt-4o,gpt-4o-mini,o4-mini"
+        self._whitelist_env = os.getenv("ALLOWED_MODELS_WHITELIST", "")
 
-    # ----------------- Сервисные -----------------
+    # ---------------------------------------------------------------------
+    # Публичный API, которым пользуется Telegram-бот
+    # ---------------------------------------------------------------------
 
     def list_models_for_menu(self) -> List[str]:
         """
-        Возвращает предустановленный список моделей для меню выбора.
-        (Запрос к /models иногда «шумный» и не нужен для UX.)
+        Короткий список моделей для меню выбора в боте.
+        Если задан ALLOWED_MODELS_WHITELIST — берём его.
+        Иначе возвращаем безопасный набор.
         """
-        return self._menu_models[:]
+        if self._whitelist_env.strip():
+            items = [m.strip() for m in self._whitelist_env.split(",") if m.strip()]
+            return items or [self.default_chat_model]
 
-    # ----------------- Чат -----------------
-
-    def _style_system_preamble(self, style: str) -> str:
-        """
-        Короткая настройка голоса/стиля. Можно расширять по ТЗ.
-        """
-        style = (style or "Pro").lower()
-        if style in ("pro", "профессиональный", "профессиональный стиль"):
-            return (
-                "Ты отвечаешь кратко и по делу, указываешь допущения. "
-                "Если вопрос двусмысленный — уточняешь."
-            )
-        if style in ("expert", "эксперт", "экспертный"):
-            return (
-                "Отвечай как эксперт-методолог. Добавляй ссылки на разделы стандартов, "
-                "если они упомянуты в контексте."
-            )
-        if style in ("user", "пользовательский"):
-            return "Отвечай простым языком, без жаргона."
-        if style == "ceo":
-            return "Отвечай как руководитель: стратегично, кратко, с фокусом на рисках и эффектах."
-        return "Будь полезным, точным и кратким."
+        return [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "o4-mini",
+            "o4",
+        ]
 
     def chat(
         self,
         user_text: str,
         model: Optional[str] = None,
-        temperature: Optional[float] = None,
+        temperature: float = 0.2,
         style: str = "Pro",
-        kb_context: Optional[str] = None,
+        kb_ctx: Optional[str] = None,
     ) -> str:
         """
-        Единая точка для текстового ответа.
-        - Если передан kb_context — аккуратно подмешиваем его в system и отдельным сообщением '[KB]'.
-        - Используем Chat Completions (надежнее, чем Responses для текста).
+        Унифицированный чат-вызов.
+        ВАЖНО: если передан kb_ctx — подмешиваем в system с сильной инструкцией.
         """
-        model_name = model or self.default_model
-        temp = self._safe_temperature(temperature)
+        chat_model = model or self.default_chat_model
 
-        system_parts: List[str] = [self._style_system_preamble(style)]
-        if kb_context:
-            system_parts.append(
-                "Если в контексте '[KB]' есть сведения по вопросу — опирайся на них в первую очередь. "
-                "Если в '[KB]' нет ответа, скажи об этом и продолжай как обычно."
-            )
-        system_prompt = "\n".join(system_parts)
-
-        messages: List[ChatCompletionMessageParam] = [
-            {"role": "system", "content": system_prompt}
+        # Базовый system-подсказ
+        system_msg = [
+            "You are a helpful assistant.",
+            f"Answer concisely with a {style} tone.",
         ]
-        if kb_context:
-            # добавляем KB отдельным сообщением от «assistant», чтобы дать высокий приоритет
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"[KB]\n{kb_context}",
-                }
+
+        # Если есть контекст из БЗ — просим модель опираться ТОЛЬКО на него
+        if kb_ctx:
+            system_msg.append(
+                "You MUST answer using ONLY the knowledge snippets below. "
+                "If the snippets are not relevant or do not contain the answer, say you don't know.\n"
+                "### KNOWLEDGE SNIPPETS START ###\n"
+                f"{kb_ctx}\n"
+                "### KNOWLEDGE SNIPPETS END ###"
             )
-        messages.append({"role": "user", "content": user_text})
+
+        system_text = "\n".join(system_msg)
+
+        messages = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_text},
+        ]
 
         try:
-            resp = self.client.chat.completions.create(
-                model=model_name,
+            resp = self._client.chat.completions.create(
+                model=chat_model,
                 messages=messages,
-                temperature=temp,
+                temperature=float(temperature or 0.2),
             )
-            text = (resp.choices[0].message.content or "").strip()
-            return text or "Ответ пуст."
-        except Exception as e:
-            logger.exception("chat() failed: %s", e)
-            # Небольшой fallback в «самый совместимый» формат
-            try:
-                resp = self._client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=temp,
-                )
-                text = (resp.choices[0].message.content or "").strip()
-                return text or "Ответ пуст."
-            except Exception as ee:
-                logger.exception("chat() failed in fallback: %s", ee)
-                raise
+            out = (resp.choices[0].message.content or "").strip()
+            if out:
+                return out
+        except BadRequestError as e:
+            logger.error("chat() BadRequest: %s", e)
+        except APIError as e:
+            logger.error("chat() APIError: %s", e)
+        except Exception as e:  # pragma: no cover
+            logger.error("chat() failed: %s", e)
 
-    def _safe_temperature(self, temperature: Optional[float]) -> float:
-        try:
-            if temperature is None:
-                return self.default_temperature
-            t = float(temperature)
-            # Страхуемся от некорректных значений окружения
-            if t < 0:
-                t = 0.0
-            if t > 2:
-                t = 2.0
-            return t
-        except Exception:
-            return self.default_temperature
+        return "Извините, не удалось получить ответ от модели."
 
-    # ----------------- Изображения -----------------
+    # --- Изображения ---
 
-    def generate_image(self, prompt: str, size: Optional[str]) -> Tuple[bytes, str]:
+    def generate_image(self, prompt: str, size: Optional[str] = None) -> Tuple[bytes, str]:
         """
-        Генерация изображения. Возвращает (png_bytes, used_prompt).
+        Генерирует изображение через Images API.
+        Возвращает кортеж (raw_png_bytes, used_prompt).
         """
-        if not self.enable_image_generation:
-            raise RuntimeError("Image generation disabled in settings.")
+        model = self.default_image_model
+        img_size = size or "1024x1024"
 
-        used_prompt = prompt.strip()
         try:
-            size = (size or "1024x1024").strip()
-            result = self.client.images.generate(
-                model=self.image_model,
-                prompt=used_prompt,
-                size=size,
-                response_format="b64_json",
+            res = self._client.images.generate(
+                model=model,
+                prompt=prompt,
+                size=img_size,
             )
-            b64 = result.data[0].b64_json
-            png_bytes = base64.b64decode(b64)
-            return png_bytes, used_prompt
+            b64 = res.data[0].b64_json
+            png_bytes = base64.b64decode(b64) if b64 else b""
+            return png_bytes, prompt
         except Exception as e:
-            logger.warning(
-                "Primary image model '%s' failed: %s", self.image_model, e
-            )
-            # простой дауншифт: попробуем стандартный размер
-            result = self.client.images.generate(
-                model=self.image_model,
-                prompt=used_prompt,
-                size="1024x1024",
-                response_format="b64_json",
-            )
-            b64 = result.data[0].b64_json
-            png_bytes = base64.b64decode(b64)
-            return png_bytes, used_prompt
+            logger.error("generate_image() failed: %s", e)
+            raise
 
-    # ----------------- Аудио -----------------
+    # --- Аудио ---
 
     def transcribe_audio(self, audio_bytes: bytes) -> str:
         """
-        Транскрипция аудио через whisper-1 (надежный вариант).
+        Транскрипция через Whisper.
         """
         try:
-            buf = io.BytesIO(audio_bytes)
-            buf.name = "audio.ogg"
-            buf.seek(0)
-            tr = self.client.audio.transcriptions.create(
-                model="whisper-1",
-                file=buf,
-                response_format="text",
-            )
-            return tr.strip()
+            # Сохраняем во временный файл (httpx в SDK ожидает file-like)
+            tmp = "/tmp/voice.ogg"
+            with open(tmp, "wb") as f:
+                f.write(audio_bytes)
+
+            with open(tmp, "rb") as f:
+                tr = self._client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                )
+            text = getattr(tr, "text", "") or ""
+            return text.strip()
         except Exception as e:
-            logger.exception("transcribe_audio failed: %s", e)
+            logger.error("transcribe_audio() failed: %s", e)
             raise
 
-    # ----------------- Описания вложений (упрощенно) -----------------
+    # --- Простые описатели для вложений ---
 
     def describe_file(self, file_bytes: bytes, filename: str) -> str:
         """
-        Быстрая эвристика для описания файла (без вытаскивания текста из PDF/Office).
-        Ничего не ломаем — оставляем как было по духу.
+        Очень простой «описатель» файла без реального vision.
+        Для PDF/текста можно добавить локальные эвристики.
         """
-        kb = len(file_bytes) / 1024.0
-        return f"Файл '{filename}', ~{kb:.1f} KB. Могу использовать содержимое в качестве контекста, если его распарсить в БЗ."
+        name = filename or "file"
+        size_kb = len(file_bytes) // 1024
+        return f"Файл: {name}, размер ~{size_kb} KB. Поддержка глубокой семантической выжимки не включена."
 
     def describe_image(self, image_bytes: bytes) -> str:
-        """
-        Короткое описание изображения через vision (опционально можно расширить).
-        """
-        try:
-            b64 = base64.b64encode(image_bytes).decode("utf-8")
-            messages: List[ChatCompletionMessageParam] = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Опиши изображение кратко."},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64}"},
-                        },
-                    ],
-                }
-            ]
-            resp = self.client.chat.completions.create(
-                model=self.default_model,
-                messages=messages,
-                temperature=0.2,
-            )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as e:
-            logger.exception("describe_image failed: %s", e)
-            return "Не удалось описать изображение."
+        size_kb = len(image_bytes) // 1024
+        return f"Изображение получено ({size_kb} KB). Анализ изображений в этой сборке минимален."
 
-    # ----------------- Веб (как было) -----------------
+    # --- Веб-поиск (заглушка) ---
 
     def web_answer(self, query: str) -> Tuple[str, List[str]]:
         """
-        Заглушка под вашу текущую реализацию веб-поиска (если она была).
-        Возвращаем ответ и список источников (может быть пустым).
+        Заглушка. При необходимости подключим внешний сервис/инструмент.
         """
-        # Сохраняем совместимость: бот ожидает кортеж (answer, sources)
-        # Здесь просто отвечаем, что прямого веба нет.
-        return (
-            "Поиск в вебе в этой сборке ограничен: я могу ответить своими словами. "
-            "Если нужны ссылки — уточните запрос.",
-            [],
+        answer = (
+            "В этой сборке веб-поиск отключён. "
+            "Могу ответить на основании вашего контекста/БЗ, если он включён."
         )
+        return answer, []
