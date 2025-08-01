@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -33,15 +34,19 @@ logger = logging.getLogger(__name__)
 # ---------- База знаний (KB) — безопасный импорт ----------
 KB_MOD_AVAILABLE = True
 try:
-    # Единая точка входа пакета БЗ (см. bot/knowledge_base/__init__.py)
-    from bot.knowledge_base import (
-        KnowledgeBaseIndexer,
-        KnowledgeBaseRetriever,
-        KBChunk,
-        KBDocument,
-    )
+    # Единая точка входа для компонентов БЗ.
+    # Внутри вашего пакета может реэкспортироваться KnowledgeBaseRetriever.
+    from bot.knowledge_base.indexer import KnowledgeBaseIndexer, IndexedDoc
+    try:
+        from bot.knowledge_base.retriever import KnowledgeBaseRetriever, KBChunk  # type: ignore
+    except Exception as e:
+        KnowledgeBaseRetriever = None  # type: ignore
+        KB_MOD_AVAILABLE = True  # индексатор есть, ретривера может не быть — меню всё равно работает
+        logger.warning("KB retriever import warning: %s", e)
 except Exception as e:
     KB_MOD_AVAILABLE = False
+    KnowledgeBaseIndexer = None  # type: ignore
+    KnowledgeBaseRetriever = None  # type: ignore
     logger.warning("KB unavailable (import): %s", e)
 
 
@@ -54,7 +59,8 @@ class DialogState:
     updated_at_ts: float = 0.0
     model: Optional[str] = None
     style: str = "Pro"
-    kb_selected_docs: List[str] = field(default_factory=list)  # список ext_id выбранных документов
+    # список выбранных документов: ИД = path (например "disk:/База Знаний/book.pdf")
+    kb_selected_docs: List[str] = field(default_factory=list)
 
 
 # ======================================================================
@@ -84,13 +90,14 @@ class ChatGPTTelegramBot:
 
         # БЗ
         self.kb_available: bool = KB_MOD_AVAILABLE
-        self.kb_indexer: Optional[KnowledgeBaseIndexer] = None
-        self.kb_retriever: Optional[KnowledgeBaseRetriever] = None
+        self.kb_indexer: Optional[KnowledgeBaseIndexer] = None  # type: ignore[assignment]
+        self.kb_retriever: Optional[KnowledgeBaseRetriever] = None  # type: ignore[assignment]
 
-        if self.kb_available:
+        if self.kb_available and KnowledgeBaseIndexer:
             try:
                 self.kb_indexer = KnowledgeBaseIndexer(settings)
-                self.kb_retriever = KnowledgeBaseRetriever(settings)
+                if KnowledgeBaseRetriever:
+                    self.kb_retriever = KnowledgeBaseRetriever(settings)  # type: ignore[call-arg]
             except Exception as e:
                 self.kb_available = False
                 logger.exception("KB init failed: %s", e)
@@ -122,7 +129,7 @@ class ChatGPTTelegramBot:
         except Exception:
             pass
 
-        # Гарантированно убираем webhook, чтобы не было конфликтов режимов
+        # Убираем webhook, чтобы не было конфликтов polling/webhook
         try:
             await app.bot.delete_webhook(drop_pending_updates=True)
         except Exception as e:
@@ -193,55 +200,35 @@ class ChatGPTTelegramBot:
         except Exception:
             pass
 
-    def _kb_all_documents(self) -> List[KBDocument]:
+    def _kb_all_documents(self) -> List[IndexedDoc | dict]:
         """
-        Универсальный доступ к списку документов, чтобы не зависеть от разных названий методов
-        в реализации модуля БЗ (retriever/indexer).
-        Приоритет вызовов:
-        1) retriever.list_documents()
-        2) indexer.list_documents() / list_all() / list_docs() / get_documents()
-        Возвращает список KBDocument (или аналогичных объектов/словарей с ext_id/title).
+        Возвращает список документов из индексатора.
+        ИД документа = path. Для показа в UI берём os.path.basename(path).
         """
-        if not self.kb_available:
+        if not (self.kb_available and self.kb_indexer):
             return []
 
-        # 1) Попробуем через retriever
+        # Базовый путь — строго через indexer.list_documents()
         try:
-            if self.kb_retriever and hasattr(self.kb_retriever, "list_documents"):
-                docs = self.kb_retriever.list_documents()  # type: ignore[attr-defined]
-                return list(docs or [])
+            docs = self.kb_indexer.list_documents()  # type: ignore[call-arg]
+            if isinstance(docs, list):
+                return docs
         except Exception as e:
-            logger.debug("KB retriever.list_documents failed: %s", e)
+            logger.debug("KB indexer.list_documents failed: %s", e)
 
-        # 2) Попробуем разные названия у indexer
-        candidates = ("list_documents", "list_all", "list_docs", "get_documents")
-        for name in candidates:
+        # На всякий случай — фоллбеки на возможные альтернативные имена
+        for alt in ("list_all", "list_docs", "get_documents"):
             try:
-                if self.kb_indexer and hasattr(self.kb_indexer, name):
-                    func = getattr(self.kb_indexer, name)
+                if hasattr(self.kb_indexer, alt):
+                    func = getattr(self.kb_indexer, alt)
                     docs = func()
-                    return list(docs or [])
+                    if isinstance(docs, list):
+                        return docs
             except Exception as e:
-                logger.debug("KB indexer.%s failed: %s", name, e)
+                logger.debug("KB indexer.%s failed: %s", alt, e)
 
-        logger.warning("KB: no list_* method found to enumerate documents")
+        logger.warning("KB: no method to enumerate documents")
         return []
-
-    def _prepare_kb_context(self, chunks: List[KBChunk]) -> str:
-        if not chunks:
-            return ""
-        lines: List[str] = []
-        lines.append("Ниже даны выдержки из выбранных документов базы знаний (используй их с приоритетом):")
-        for i, ch in enumerate(chunks, 1):
-            src = getattr(ch, "source_path", None) or getattr(ch, "ext_id", "")
-            page = getattr(ch, "page", None)
-            page_txt = f", стр. {page}" if page is not None else ""
-            title = getattr(ch, "title", "") or (getattr(ch, "ext_id", "") or "Документ")
-            content = getattr(ch, "content", "") or ""
-            lines.append(f"[{i}] {title}{page_txt} ({src})")
-            lines.append(str(content).strip())
-            lines.append("-" * 80)
-        return "\n".join(lines)
 
     def _kb_render_menu(self, st: DialogState) -> InlineKeyboardMarkup:
         docs = self._kb_all_documents()
@@ -252,17 +239,32 @@ class ChatGPTTelegramBot:
             rows.append([InlineKeyboardButton("— Документов нет —", callback_data="kb:nop")])
         else:
             for d in docs:
-                # Документ может быть KBDocument или словарь
-                ext_id = getattr(d, "ext_id", None) or (d.get("ext_id") if isinstance(d, dict) else None)
-                title = getattr(d, "title", None) or (d.get("title") if isinstance(d, dict) else None) or ext_id
-                if not ext_id:
-                    # если нет нормального идентификатора — пропустим элемент
+                # d — IndexedDoc (имеет .path) или словарь с key "path"
+                path = getattr(d, "path", None) or (d.get("path") if isinstance(d, dict) else None)
+                if not path:
                     continue
-                checked = "✅" if ext_id in st.kb_selected_docs else "⬜"
-                rows.append([InlineKeyboardButton(f"{checked} {title}", callback_data=f"kb:toggle:{ext_id}")])
+                title = os.path.basename(path) or path
+                checked = "✅" if path in st.kb_selected_docs else "⬜"
+                rows.append([InlineKeyboardButton(f"{checked} {title}", callback_data=f"kb:toggle:{path}")])
 
         rows.append([InlineKeyboardButton("✅ Готово", callback_data="kb:close")])
         return InlineKeyboardMarkup(rows)
+
+    def _prepare_kb_context(self, chunks: List["KBChunk"]) -> str:  # type: ignore[name-defined]
+        if not chunks:
+            return ""
+        lines: List[str] = []
+        lines.append("Ниже даны выдержки из выбранных документов базы знаний (используй их с приоритетом):")
+        for i, ch in enumerate(chunks, 1):
+            src = getattr(ch, "source_path", None) or getattr(ch, "ext_id", "") or ""
+            page = getattr(ch, "page", None)
+            page_txt = f", стр. {page}" if page is not None else ""
+            title = os.path.basename(src) if src else "Документ"
+            content = getattr(ch, "content", "") or ""
+            lines.append(f"[{i}] {title}{page_txt} ({src})")
+            lines.append(str(content).strip())
+            lines.append("-" * 80)
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     #                              Команды
@@ -297,7 +299,7 @@ class ChatGPTTelegramBot:
 
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
-        kb_list = ", ".join(st.kb_selected_docs) if st.kb_selected_docs else "—"
+        kb_list = ", ".join(os.path.basename(p) for p in st.kb_selected_docs) if st.kb_selected_docs else "—"
         text = (
             "📊 Статистика:\n"
             f"- Диалог: {st.title}\n"
@@ -387,14 +389,13 @@ class ChatGPTTelegramBot:
 
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
-
-        if not (self.kb_available and self.kb_indexer and self.kb_retriever):
+        if not (self.kb_available and self.kb_indexer):
             await update.effective_message.reply_text("Модуль базы знаний недоступен в этой сборке.")
             return
 
         # 1) Синхронизация при входе в меню
         try:
-            added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)
+            added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)  # type: ignore[arg-type]
             sync_msg = (
                 "Синхронизация БЗ завершена:\n"
                 f"• Добавлено: {added}\n• Обновлено: {updated_cnt}\n• Удалено: {deleted}\n• Без изменений: {unchanged}\n\n"
@@ -408,13 +409,12 @@ class ChatGPTTelegramBot:
         await update.effective_message.reply_text(sync_msg, reply_markup=kb_markup)
 
     async def cmd_kbdebug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not (self.kb_indexer and self.kb_retriever):
+        if not self.kb_indexer:
             await update.effective_message.reply_text("KB недоступна в этой сборке.")
             return
         try:
-            # Диагностический отчёт из indexer (реализуйте у себя при необходимости)
             if hasattr(self.kb_indexer, "diagnose"):
-                report = await asyncio.to_thread(self.kb_indexer.diagnose)  # type: ignore[attr-defined]
+                report = await asyncio.to_thread(self.kb_indexer.diagnose)  # type: ignore[call-arg]
             else:
                 report = "diagnose() не реализован в indexer"
             max_len = 3900
@@ -438,10 +438,11 @@ class ChatGPTTelegramBot:
         await self._send_typing(update.effective_chat.id, context)
 
         kb_ctx_text = ""
-        if self.kb_available and self.kb_retriever and st.kb_selected_docs:
+        if self.kb_retriever and st.kb_selected_docs:
             try:
+                # ВАЖНО: передаём список path (идентификаторы из IndexedDoc.path)
                 chunks = await asyncio.to_thread(
-                    self.kb_retriever.retrieve, user_text, st.kb_selected_docs
+                    self.kb_retriever.retrieve, user_text, st.kb_selected_docs  # type: ignore[arg-type]
                 )
                 kb_ctx_text = self._prepare_kb_context(chunks)
             except Exception as e:
@@ -475,10 +476,10 @@ class ChatGPTTelegramBot:
             return
 
         kb_ctx_text = ""
-        if self.kb_available and self.kb_retriever and st.kb_selected_docs:
+        if self.kb_retriever and st.kb_selected_docs:
             try:
                 chunks = await asyncio.to_thread(
-                    self.kb_retriever.retrieve, transcript, st.kb_selected_docs
+                    self.kb_retriever.retrieve, transcript, st.kb_selected_docs  # type: ignore[arg-type]
                 )
                 kb_ctx_text = self._prepare_kb_context(chunks)
             except Exception as e:
@@ -582,11 +583,11 @@ class ChatGPTTelegramBot:
 
         # --------- KB -------------------
         if data == "kb:sync":
-            if not (self.kb_available and self.kb_indexer and self.kb_retriever):
+            if not (self.kb_indexer and self.kb_available):
                 await query.edit_message_text("Модуль базы знаний недоступен.")
                 return
             try:
-                added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)
+                added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)  # type: ignore[arg-type]
                 prefix = (
                     "Синхронизация завершена:\n"
                     f"• Добавлено: {added}\n• Обновлено: {updated_cnt}\n• Удалено: {deleted}\n• Без изменений: {unchanged}\n\n"
@@ -603,11 +604,11 @@ class ChatGPTTelegramBot:
             if not self.kb_available:
                 await query.edit_message_text("Модуль базы знаний недоступен.")
                 return
-            ext_id = data.split(":", 2)[2]
-            if ext_id in st.kb_selected_docs:
-                st.kb_selected_docs.remove(ext_id)
+            path = data.split(":", 2)[2]
+            if path in st.kb_selected_docs:
+                st.kb_selected_docs.remove(path)
             else:
-                st.kb_selected_docs.append(ext_id)
+                st.kb_selected_docs.append(path)
             try:
                 await query.edit_message_reply_markup(reply_markup=self._kb_render_menu(st))
             except Exception:
@@ -640,5 +641,4 @@ class ChatGPTTelegramBot:
             except Exception:
                 pass
             return
-
         logger.exception("Unhandled error: %s", err)
