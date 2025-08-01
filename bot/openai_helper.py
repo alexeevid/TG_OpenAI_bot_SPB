@@ -66,160 +66,102 @@ class OpenAIHelper:
 
     # ===================== ТЕКСТОВЫЙ ДИАЛОГ =====================
 
-    # ВАЖНО: вставьте этот метод целиком вместо текущего chat() в bot/openai_helper.py
-
-    def chat(self, user_text: str,
-             model: Optional[str] = None,
-             temperature: float = 0.2,
-             style: str = "Pro",
-             kb_ctx: Optional[Dict[str, Any]] = None) -> str:
+    def chat(
+        self,
+        user_text: str,
+        model: Optional[str],
+        temperature: float,
+        style: str,
+        kb_ctx: Optional[str] = None,
+    ) -> str:
         """
-        Единая точка диалога. Если есть kb_ctx, отвечаем строго по БЗ.
-        kb_ctx ожидается формата:
-            {
-              "text": "<склеенные выдержки>",
-              "sources": ["disk:/...pdf", "disk:/...pdf", ...]   # опционально
-            }
+        Унифицированный чат. Если передан kb_ctx — приоритет ответов по БЗ:
+        отвечаем ТОЛЬКО на основе фрагментов БЗ; если не нашли — честно говорим.
         """
+        # 1) Собираем систему/сообщения
+        messages: List[Dict[str, str]] = []
     
-        use_model = model or self.default_model or "gpt-4o"
-        temp = max(0.0, min(1.0, temperature))
-    
-        # --- Формируем системный промпт ---
-        sys_parts = []
-    
-        # Базовый тон (по стилю), очень краткий
-        if style.lower() in ("pro", "professional"):
-            sys_parts.append("Отвечай коротко, по делу, структурируй списками только когда это помогает.")
-        elif style.lower() in ("expert", "экспертный"):
-            sys_parts.append("Ты эксперт-практик. Отвечай точно, с минимальными пояснениями.")
-        elif style.lower() in ("ceo",):
-            sys_parts.append("Отвечай управленческим языком, фокус на решениях и рисках.")
+        if kb_ctx:
+            system_instr = (
+                "Ты консультант с доступом к локальной Базе знаний (БЗ).\n"
+                "ОТВЕЧАЙ ТОЛЬКО на основе приведённых фрагментов БЗ ниже.\n"
+                "Если ответа в БЗ нет — ответь фразой: «Не нашёл в выбранных документах БЗ» "
+                "и предложи уточнить вопрос или выбрать другие документы.\n\n"
+                "=== БЗ ФРАГМЕНТЫ ===\n"
+                f"{kb_ctx}\n"
+                "=== КОНЕЦ БЗ ===\n"
+                "Формат: короткий ответ и, по возможности, перечисли источники (имя файла/страница)."
+            )
+            messages.append({"role": "system", "content": system_instr})
         else:
-            sys_parts.append("Отвечай нейтрально и кратко.")
+            messages.append({"role": "system", "content": "Отвечай кратко и по делу."})
     
-        kb_mode = bool(kb_ctx and isinstance(kb_ctx, dict) and kb_ctx.get("text"))
-        if kb_mode:
-            # Жёсткий приоритет БЗ
-            sys_parts.append(
-                "Используй ТОЛЬКО приведённые ниже выдержки из Базы знаний (БЗ). "
-                "Если выдержек недостаточно для точного ответа, напиши: "
-                "«Недостаточно контекста из БЗ для точного ответа» и поясни, чего не хватает."
-            )
-            sys_parts.append("БЗ:\n" + str(kb_ctx.get("text")))
+        # (опционально — стиль, если у вас используется)
+        if style:
+            messages.append({"role": "system", "content": f"Стиль ответа: {style}."})
     
-            # Для снижения фантазии
-            temp = min(temp, 0.3)
+        messages.append({"role": "user", "content": user_text})
     
-        system_prompt = "\n\n".join(sys_parts).strip()
-    
-        # --- Собираем messages для Chat Completions ---
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text.strip()},
-        ]
-    
-        # --- Пытаемся через Responses API (если у вас это используется), иначе — Chat Completions ---
-        # Здесь оставляем ваш текущий «fallback» к chat.completions, но подставляем messages выше.
+        # 2) Пытаемся через Responses API (если у вас это уже есть)
         try:
-            # Если у вас есть быстрая ветка через Responses API — можете её оставить,
-            # главное: передайте system+user в нужном формате. Иначе просто используем чат-комплишнс.
-            pass
-        except Exception:
-            pass
+            if hasattr(self, "_client") and hasattr(self._client, "responses"):
+                resp = self._client.responses.create(
+                    model=model or self.default_model,
+                    input=[{"role": "user", "content": [{"type": "input_text", "text": user_text}]}]
+                    if not kb_ctx else
+                    [
+                        {"role": "system", "content": [{"type": "input_text", "text": messages[0]["content"]}]},
+                        {"role": "user", "content": [{"type": "input_text", "text": user_text}]},
+                    ],
+                    temperature=temperature,
+                )
     
-        # Chat Completions (надёжно и просто)
+                # Унифицированное извлечение текста из Responses API
+                out_text_parts: List[str] = []
+                for item in getattr(resp, "output", []) or []:
+                    if getattr(item, "type", None) == "message":
+                        for c in getattr(item, "content", []) or []:
+                            if getattr(c, "type", None) in ("output_text", "text"):
+                                out_text_parts.append(getattr(c, "text", "") or getattr(c, "value", ""))
+                if out_text_parts:
+                    return "\n".join(t for t in out_text_parts if t)
+    
+        except Exception as e:
+            # Логируем и идём в fallback Chat Completions
+            logging.getLogger(__name__).warning("Responses.create failed: %s. Trying Chat Completions fallback...", e)
+    
+        # 3) Fallback — Chat Completions (максимально сохраняем вашу прежнюю механику)
         try:
-            resp = self.client.chat.completions.create(
-                model=use_model,
+            cc = self._client.chat.completions.create(
+                model=model or self.default_model,
+                temperature=temperature,
                 messages=messages,
-                temperature=temp,
             )
-            reply = resp.choices[0].message.content if resp and resp.choices else ""
+            return (cc.choices[0].message.content or "").strip()
         except Exception as e:
-            logger.error("chat.completions failed: %s", e)
+            logging.getLogger(__name__).error("chat() failed in fallback: %s", e)
             raise
     
-        reply = reply or ""
+        # ===================== РЕЧЬ =====================
     
-        # Хвост со списком источников, если включён KB_DEBUG
-        try:
-            import os
-            if kb_mode and os.getenv("KB_DEBUG", "0") == "1":
-                sources = kb_ctx.get("sources") or []
-                sources = [s for s in sources if s]
-                if sources:
-                    tail = "\n\n📚 Источники (БЗ):\n" + "\n".join(f"• {s}" for s in sources[:10])
-                    reply += tail
-        except Exception:
-            pass
-    
-        return reply
-
-    # ===================== ИЗОБРАЖЕНИЯ =====================
-
-    def generate_image(self, prompt: str, model: Optional[str] = None) -> Tuple[bytes, str]:
-        """
-        Генерирует изображение. Возвращает (bytes_png, used_prompt).
-        Точечная правка: всегда просим base64 (response_format='b64_json') и валидируем.
-        Сохраняем fallback на 'dall-e-3', если primary недоступна.
-        """
-        primary = model or self.image_model or "gpt-image-1"
-        fallbacks = ["dall-e-3"] if primary != "dall-e-3" else []
-
-        last_err: Optional[Exception] = None
-
-        def _call(img_model: str) -> bytes:
-            res = self.client.images.generate(
-                model=img_model,
-                prompt=prompt,
-                n=1,
-                size="1024x1024",
-                response_format="b64_json",  # критично для стабильности
-            )
-            data = res.data[0]
-            b64 = getattr(data, "b64_json", None)
-            if not b64:
-                raise RuntimeError("Images API did not return base64 image.")
-            return base64.b64decode(b64)
-
-        # Сначала пробуем primary
-        try:
-            return _call(primary), prompt
-        except Exception as e:
-            logger.warning("Primary image model '%s' failed: %s", primary, e)
-            last_err = e
-
-        # Затем — fallback-и
-        for fb in fallbacks:
+        def transcribe_audio(self, audio_bytes: bytes) -> str:
+            """
+            Транскрипция аудио (Whisper-1). Поддерживает bytes, не меняем интерфейс.
+            """
             try:
-                return _call(fb), prompt
+                audio_io = io.BytesIO(audio_bytes)
+                audio_io.name = "audio.ogg"  # подсказка формата
+                tr = self.client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_io,
+                )
+                text = getattr(tr, "text", None)
+                if not text:
+                    text = str(tr)
+                return text.strip()
             except Exception as e:
-                logger.error("Fallback image model '%s' failed: %s", fb, e)
-                last_err = e
-
-        raise RuntimeError(f"Image generation failed: {last_err}")
-
-    # ===================== РЕЧЬ =====================
-
-    def transcribe_audio(self, audio_bytes: bytes) -> str:
-        """
-        Транскрипция аудио (Whisper-1). Поддерживает bytes, не меняем интерфейс.
-        """
-        try:
-            audio_io = io.BytesIO(audio_bytes)
-            audio_io.name = "audio.ogg"  # подсказка формата
-            tr = self.client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_io,
-            )
-            text = getattr(tr, "text", None)
-            if not text:
-                text = str(tr)
-            return text.strip()
-        except Exception as e:
-            logger.error("transcribe_audio failed: %s", e)
-            raise
+                logger.error("transcribe_audio failed: %s", e)
+                raise
 
     # ===================== АНАЛИЗ ФАЙЛОВ/ИЗОБРАЖЕНИЙ =====================
 
