@@ -28,7 +28,6 @@ from telegram.ext import (
 )
 from telegram.error import Conflict
 
-# ---------- Логирование ----------
 logger = logging.getLogger(__name__)
 
 # ---------- База знаний (KB) — безопасный импорт ----------
@@ -113,23 +112,6 @@ class ChatGPTTelegramBot:
             BotCommand("web", "веб-поиск"),
         ]
 
-    async def cmd_kbdebug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not (self.kb_indexer and self.kb_retriever):
-            await update.effective_message.reply_text("KB недоступна в этой сборке.")
-            return
-        try:
-            report = await asyncio.to_thread(self.kb_indexer.diagnose)
-            # Телеграм ограничивает длину сообщения ~4096 символов
-            max_len = 3900
-            if len(report) <= max_len:
-                await update.effective_message.reply_text(f"```\n{report}\n```", parse_mode="Markdown")
-            else:
-                await update.effective_message.reply_text(f"```\n{report[:max_len]}\n... (truncated)\n```",
-                                                          parse_mode="Markdown")
-        except Exception as e:
-            logger.exception("kbdebug failed: %s", e)
-            await update.effective_message.reply_text(f"Ошибка диагностики KB: {e}")
-    
     async def setup_commands_and_cleanup(self, app: Application) -> None:
         """
         Колбэк для Application.post_init — сначала чистим webhook (на всякий),
@@ -178,7 +160,6 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("web", self.cmd_web))
         app.add_handler(CommandHandler("kbdebug", self.cmd_kbdebug))
 
-
         # Сообщения
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_or_photo))
@@ -186,6 +167,9 @@ class ChatGPTTelegramBot:
 
         # Inline callbacks
         app.add_handler(CallbackQueryHandler(self.on_callback))
+
+        # Error handler
+        app.add_error_handler(self.on_error)
 
     # ------------------------------------------------------------------
     #                           Вспомогательные
@@ -210,13 +194,38 @@ class ChatGPTTelegramBot:
             pass
 
     def _kb_all_documents(self) -> List[KBDocument]:
-        if not (self.kb_available and self.kb_retriever):
+        """
+        Универсальный доступ к списку документов, чтобы не зависеть от разных названий методов
+        в реализации модуля БЗ (retriever/indexer).
+        Приоритет вызовов:
+        1) retriever.list_documents()
+        2) indexer.list_documents() / list_all() / list_docs() / get_documents()
+        Возвращает список KBDocument (или аналогичных объектов/словарей с ext_id/title).
+        """
+        if not self.kb_available:
             return []
+
+        # 1) Попробуем через retriever
         try:
-            return self.kb_retriever.list_documents()
+            if self.kb_retriever and hasattr(self.kb_retriever, "list_documents"):
+                docs = self.kb_retriever.list_documents()  # type: ignore[attr-defined]
+                return list(docs or [])
         except Exception as e:
-            logger.exception("KB list_documents failed: %s", e)
-            return []
+            logger.debug("KB retriever.list_documents failed: %s", e)
+
+        # 2) Попробуем разные названия у indexer
+        candidates = ("list_documents", "list_all", "list_docs", "get_documents")
+        for name in candidates:
+            try:
+                if self.kb_indexer and hasattr(self.kb_indexer, name):
+                    func = getattr(self.kb_indexer, name)
+                    docs = func()
+                    return list(docs or [])
+            except Exception as e:
+                logger.debug("KB indexer.%s failed: %s", name, e)
+
+        logger.warning("KB: no list_* method found to enumerate documents")
+        return []
 
     def _prepare_kb_context(self, chunks: List[KBChunk]) -> str:
         if not chunks:
@@ -224,10 +233,13 @@ class ChatGPTTelegramBot:
         lines: List[str] = []
         lines.append("Ниже даны выдержки из выбранных документов базы знаний (используй их с приоритетом):")
         for i, ch in enumerate(chunks, 1):
-            src = ch.source_path or ch.ext_id
-            page = f", стр. {ch.page}" if ch.page is not None else ""
-            lines.append(f"[{i}] {ch.title}{page} ({src})")
-            lines.append(ch.content.strip())
+            src = getattr(ch, "source_path", None) or getattr(ch, "ext_id", "")
+            page = getattr(ch, "page", None)
+            page_txt = f", стр. {page}" if page is not None else ""
+            title = getattr(ch, "title", "") or (getattr(ch, "ext_id", "") or "Документ")
+            content = getattr(ch, "content", "") or ""
+            lines.append(f"[{i}] {title}{page_txt} ({src})")
+            lines.append(str(content).strip())
             lines.append("-" * 80)
         return "\n".join(lines)
 
@@ -240,11 +252,14 @@ class ChatGPTTelegramBot:
             rows.append([InlineKeyboardButton("— Документов нет —", callback_data="kb:nop")])
         else:
             for d in docs:
-                checked = "✅" if d.ext_id in st.kb_selected_docs else "⬜"
-                title = d.title or d.ext_id
-                rows.append([
-                    InlineKeyboardButton(f"{checked} {title}", callback_data=f"kb:toggle:{d.ext_id}")
-                ])
+                # Документ может быть KBDocument или словарь
+                ext_id = getattr(d, "ext_id", None) or (d.get("ext_id") if isinstance(d, dict) else None)
+                title = getattr(d, "title", None) or (d.get("title") if isinstance(d, dict) else None) or ext_id
+                if not ext_id:
+                    # если нет нормального идентификатора — пропустим элемент
+                    continue
+                checked = "✅" if ext_id in st.kb_selected_docs else "⬜"
+                rows.append([InlineKeyboardButton(f"{checked} {title}", callback_data=f"kb:toggle:{ext_id}")])
 
         rows.append([InlineKeyboardButton("✅ Готово", callback_data="kb:close")])
         return InlineKeyboardMarkup(rows)
@@ -391,6 +406,27 @@ class ChatGPTTelegramBot:
 
         kb_markup = self._kb_render_menu(st)
         await update.effective_message.reply_text(sync_msg, reply_markup=kb_markup)
+
+    async def cmd_kbdebug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not (self.kb_indexer and self.kb_retriever):
+            await update.effective_message.reply_text("KB недоступна в этой сборке.")
+            return
+        try:
+            # Диагностический отчёт из indexer (реализуйте у себя при необходимости)
+            if hasattr(self.kb_indexer, "diagnose"):
+                report = await asyncio.to_thread(self.kb_indexer.diagnose)  # type: ignore[attr-defined]
+            else:
+                report = "diagnose() не реализован в indexer"
+            max_len = 3900
+            if len(report) <= max_len:
+                await update.effective_message.reply_text(f"```\n{report}\n```", parse_mode="Markdown")
+            else:
+                await update.effective_message.reply_text(
+                    f"```\n{report[:max_len]}\n... (truncated)\n```", parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.exception("kbdebug failed: %s", e)
+            await update.effective_message.reply_text(f"Ошибка диагностики KB: {e}")
 
     # ------------------------------------------------------------------
     #                             Сообщения
@@ -599,7 +635,6 @@ class ChatGPTTelegramBot:
                 "Conflict: another getUpdates request is running. "
                 "Проверьте, что бот не запущен вторым процессом."
             )
-            # Мягко остановим приложение, чтобы избежать спама retry
             try:
                 await context.application.stop()
             except Exception:
