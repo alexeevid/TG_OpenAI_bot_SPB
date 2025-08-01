@@ -4,129 +4,209 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
-from typing import Dict, List, Optional
-
-from .types import KBDocument, KBChunk
+from typing import Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def _default_kb_dir(settings) -> str:
-    return getattr(settings, "kb_index_dir", "/data/kb")
-
-
 class KnowledgeBaseRetriever:
     """
-    Упрощённый retriever без pgvector:
-    - читает manifest.json, созданный индексером;
-    - отдаёт список документов для UI;
-    - делает очень простой keyword-score по чанкам.
-    Позже сюда легко встраивается путь с pgvector (как приоритетный).
+    Ретривер фрагментов из Базы знаний.
+
+    Источник по умолчанию — JSON-манифест вида:
+    {
+      "chunks": [
+        {"text": "...", "source": "disk:/База/.../file.pdf", "page": 12},
+        ...
+      ]
+    }
+
+    Если доступен векторный поиск, реализуйте _vector_search()
+    и выставьте self._vector_ready = True.
     """
 
-    def __init__(self, settings) -> None:
-        self.settings = settings
-        self.kb_dir = _default_kb_dir(settings)
-        self.manifest_path = os.path.join(self.kb_dir, "manifest.json")
-        self._manifest_cache: Optional[Dict] = None
+    def __init__(self, settings):
+        # Путь к манифесту можно задать переменной окружения или в settings
+        self.manifest_path: str = (
+            getattr(settings, "kb_manifest_path", None)
+            or os.getenv("KB_MANIFEST_PATH")
+            or os.path.join("data", "kb", "manifest.json")
+        )
 
-        os.makedirs(self.kb_dir, exist_ok=True)
-        if not os.path.isfile(self.manifest_path):
-            logger.warning("KB Retriever: manifest.json not found, creating empty.")
-            with open(self.manifest_path, "w", encoding="utf-8") as f:
-                json.dump({"documents": []}, f, ensure_ascii=False, indent=2)
+        # Признак готовности векторного поиска (по умолчанию нет)
+        self._vector_ready: bool = False
 
-    # ---------- внутреннее ----------
+        # Данные манифеста в памяти
+        self._manifest: Dict = {}
 
-    def _load_manifest(self) -> Dict:
-        if self._manifest_cache is not None:
-            return self._manifest_cache
-        try:
-            with open(self.manifest_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if "documents" not in data or not isinstance(data["documents"], list):
-                data = {"documents": []}
-        except Exception as e:
-            logger.exception("KB Retriever: failed to read manifest: %s", e)
-            data = {"documents": []}
-        self._manifest_cache = data
-        return data
+        # Загружаем/создаём манифест
+        self._ensure_manifest()
 
-    # ---------- API для бота ----------
+    # -------------------- Публичные методы --------------------
 
-    def list_documents(self) -> List[KBDocument]:
-        data = self._load_manifest()
-        docs: List[KBDocument] = []
-        for d in data["documents"]:
-            try:
-                docs.append(
-                    KBDocument(
-                        ext_id=d.get("ext_id") or d.get("id") or d.get("path") or d.get("title", "doc"),
-                        title=d.get("title") or os.path.basename(d.get("path", "")) or "Документ",
-                        source_path=d.get("path"),
-                        size_bytes=d.get("size_bytes"),
-                        mtime_ts=d.get("mtime_ts"),
-                    )
-                )
-            except Exception as e:
-                logger.warning("KB Retriever: skip bad doc entry: %s (err=%s)", d, e)
-        return docs
+    def refresh_manifest(self) -> None:
+        """Принудительно перечитать manifest.json с диска."""
+        self._load_manifest()
 
-    def retrieve(self, query: str, selected_ext_ids: List[str], top_k: Optional[int] = None) -> List[KBChunk]:
+    def retrieve(
+        self,
+        query: str,
+        selected_docs: Optional[List[str]] = None,
+        top_k: int = 8,
+        min_score: float = 0.30,
+    ) -> List[dict]:
         """
-        Простая релевантность без векторов:
-        - токенизируем запрос на ключевые слова
-        - ранжируем чанки по количеству вхождений
+        Возвращает список чанков вида:
+        { "text": str, "source": str, "page": Optional[int], "score": float }
+
+        - Фильтр по selected_docs (если задан)
+        - Сначала пробуем векторный поиск (если включён)
+        - При недоступности векторов — подстрочный скоринг с эвристиками
+        - Отсечка по min_score и ограничение top_k
         """
-        if not query.strip() or not selected_ext_ids:
+        q = (query or "").strip()
+        if not q:
             return []
 
-        top_k = top_k or int(getattr(self.settings, "rag_top_k", 5))
-        data = self._load_manifest()
-        words = self._extract_words(query)
-        if not words:
-            return []
+        sel_set = set(selected_docs or [])
 
-        results: List[KBChunk] = []
-        for d in data["documents"]:
-            ext_id = d.get("ext_id") or d.get("id") or d.get("path")
-            if not ext_id or ext_id not in selected_ext_ids:
+        # 1) Собираем корпус кандидатов (все или только выбранные документы)
+        corpus: List[dict] = []
+        for ch in self._iter_all_chunks():
+            src = ch.get("source") or "unknown"
+            if sel_set and src not in sel_set:
                 continue
-            title = d.get("title") or "Документ"
-            source_path = d.get("path")
+            text = ch.get("text") or ""
+            page = ch.get("page")
+            corpus.append({"text": text, "source": src, "page": page})
 
-            for ch in d.get("chunks", []):
-                text = ch.get("content") or ""
-                page = ch.get("page")
-                score = self._score(text, words)
+        if not corpus:
+            return []
+
+        results: List[dict] = []
+
+        # 2) Попытка векторного поиска (если реализован)
+        if self._vector_ready and hasattr(self, "_vector_search"):
+            try:
+                vec_hits = self._vector_search(q, selected_docs=sel_set, top_k=top_k * 2)  # небольшой запас
+                for h in vec_hits or []:
+                    results.append({
+                        "text": getattr(h, "text", "") or h.get("text", ""),
+                        "source": getattr(h, "source", None) or h.get("source", "unknown"),
+                        "page": getattr(h, "page", None) or h.get("page", None),
+                        "score": float(getattr(h, "score", 0.0) or h.get("score", 0.0)),
+                    })
+            except Exception as e:
+                logger.warning("Vector search failed, fallback to substring scoring: %s", e)
+                results = []
+
+        # 3) Фолбэк: подстрочный/эвристический скоринг
+        if not results:
+            q_low = q.lower()
+
+            # Простое расширение ключей для акронимов (пример WoW)
+            expand_keys: List[str] = [q_low]
+            if len(q.split()) <= 4:
+                if "wow" in q_low:
+                    expand_keys += [
+                        "choose your wow",            # полное название книги/метода
+                        "ways of working",            # расшифровка акронима в контексте DA
+                        "wow definition",             # подсказка для определений в тексте
+                        "disciplined agile wow",      # уточнение контекста
+                        "choose your way of working", # альтернативная формулировка
+                    ]
+
+            scored: List[dict] = []
+            for ch in corpus:
+                text_low = ch["text"].lower()
+                score = 0.0
+
+                # Частотный подстрочный скоринг по расширенным ключам
+                for k in expand_keys:
+                    if not k:
+                        continue
+                    if k in text_low:
+                        score += text_low.count(k) * 0.6
+
+                # Бонусы за «определенческие» паттерны
+                if "wow" in q_low:
+                    if "wow —" in text_low or "wow -" in text_low or "wow (" in text_low:
+                        score += 1.0
+                    if "choose your wow" in text_low:
+                        score += 0.8
+
                 if score > 0:
-                    results.append(
-                        KBChunk(
-                            ext_id=ext_id,
-                            title=title,
-                            content=text,
-                            score=float(score),
-                            page=page,
-                            source_path=source_path,
-                        )
-                    )
+                    scored.append({**ch, "score": score})
 
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:top_k]
+            # Нормировка 0..1
+            if scored:
+                m = max(s["score"] for s in scored)
+                if m > 0:
+                    for s in scored:
+                        s["score"] = s["score"] / m
+                results = scored
 
-    # ---------- utils ----------
+        # 4) Сортировка и отсечка
+        results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        results = [r for r in results if r.get("score", 0.0) >= min_score][:top_k]
 
-    _word_re = re.compile(r"[A-Za-zА-Яа-я0-9]+")
+        return results
 
-    def _extract_words(self, text: str) -> List[str]:
-        return [w.lower() for w in self._word_re.findall(text)]
+    # -------------------- Внутренние функции --------------------
 
-    def _score(self, text: str, words: List[str]) -> int:
-        if not text:
-            return 0
-        lt = text.lower()
-        s = 0
-        for w in words:
-            s += lt.count(w)
-        return s
+    def _ensure_manifest(self) -> None:
+        """Проверяет наличие manifest.json и загружает/создаёт его."""
+        try:
+            self._load_manifest()
+        except FileNotFoundError:
+            # Создадим пустой манифест и папку
+            os.makedirs(os.path.dirname(self.manifest_path), exist_ok=True)
+            self._manifest = {"chunks": []}
+            with open(self.manifest_path, "w", encoding="utf-8") as f:
+                json.dump(self._manifest, f, ensure_ascii=False, indent=2)
+            logger.warning("KB Retriever: manifest.json not found, creating empty.")
+        except Exception as e:
+            logger.warning("KB Retriever: failed to load manifest: %s", e)
+            self._manifest = {"chunks": []}
+
+    def _load_manifest(self) -> None:
+        """Читает manifest.json с диска в self._manifest."""
+        with open(self.manifest_path, "r", encoding="utf-8") as f:
+            self._manifest = json.load(f)
+        if not isinstance(self._manifest, dict):
+            self._manifest = {"chunks": []}
+
+    def _iter_all_chunks(self) -> Iterable[dict]:
+        """
+        Итерирует по всем чанкам корпуса из манифеста.
+        Каждый чанк — словарь: {text, source, page}.
+        """
+        chunks = (self._manifest or {}).get("chunks", []) or []
+        for item in chunks:
+            # Защита от кривых записей
+            if not isinstance(item, dict):
+                continue
+            yield {
+                "text": item.get("text", "") or "",
+                "source": item.get("source", "unknown") or "unknown",
+                "page": item.get("page"),
+            }
+
+    # --------- Заглушка под векторный поиск (опционально подключаемая) ---------
+
+    def _vector_search(
+        self,
+        query: str,
+        selected_docs: Optional[set] = None,
+        top_k: int = 8,
+    ) -> List[dict]:
+        """
+        Заглушка. Если у вас есть БД с pgvector/FAISS и т.п.,
+        реализуйте здесь реальный поиск и выставляйте self._vector_ready = True
+        в __init__ при успешной инициализации движка.
+
+        Возвращаемый формат списка:
+        [{ "text": str, "source": str, "page": Optional[int], "score": float }, ...]
+        """
+        # По умолчанию — нет векторного поиска.
+        return []
