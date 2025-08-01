@@ -1,46 +1,89 @@
 # bot/knowledge_base/context_manager.py
 from __future__ import annotations
-from bot.knowledge_base.retriever import KBChunk
 
-# bot/knowledge_base/context_manager.py
-
+import logging
 from typing import Iterable, List, Optional
 
-class ContextManager:
-    # ваш __init__ оставьте как есть
+logger = logging.getLogger(__name__)
 
-    def build_context(self, chunks: Optional[Iterable]) -> Optional[str]:
+
+class ContextManager:
+    """
+    Формирует текстовый контекст для LLM из чанков БЗ.
+    Совместим с вызовом ContextManager(settings) из telegram_bot.py.
+    """
+
+    def __init__(self, settings=None):
+        # Настройки можно использовать в будущем (лимиты, формат, локаль и т.д.)
+        self.settings = settings
+        # Базовые лимиты по умолчанию — можно вынести в settings при желании
+        self.max_chars: int = getattr(settings, "kb_context_max_chars", 6000) if settings else 6000
+        self.max_chunks: int = getattr(settings, "kb_context_max_chunks", 8) if settings else 8
+
+    def build_context(self, chunks: Optional[Iterable[dict]]) -> str:
         """
-        Принимает список чанков (объекты/словари) и формирует компактный блок контекста.
-        Поддерживает поля: text, source, page, score (если есть).
+        Принимает список чанков формата:
+          { "text": str, "source": str, "page": Optional[int], "score": float }
+        Возвращает единый текстовый блок для подсказки модели.
         """
         if not chunks:
-            return None
+            return ""
 
-        lines: List[str] = []
-        for i, ch in enumerate(chunks, 1):
-            # универсальный доступ к полям, чтобы не зависеть от точного типа
-            text = getattr(ch, "text", None) or (ch.get("text") if isinstance(ch, dict) else None) or ""
-            source = getattr(ch, "source", None) or (ch.get("source") if isinstance(ch, dict) else None) or "unknown"
-            page = getattr(ch, "page", None) or (ch.get("page") if isinstance(ch, dict) else None)
-            score = getattr(ch, "score", None) or (ch.get("score") if isinstance(ch, dict) else None)
+        # Сортируем по score по убыванию (если он есть)
+        def _score(c: dict) -> float:
+            try:
+                return float(c.get("score", 0.0))
+            except Exception:
+                return 0.0
 
-            header = f"[doc: {source}"
+        items: List[dict] = sorted(list(chunks), key=_score, reverse=True)
+
+        # Обрезаем до max_chunks
+        items = items[: self.max_chunks]
+
+        parts: List[str] = []
+        used_chars = 0
+
+        for i, ch in enumerate(items, 1):
+            text = (ch.get("text") or "").strip()
+            if not text:
+                continue
+            src = ch.get("source") or "unknown"
+            page = ch.get("page")
+            score = ch.get("score")
+
+            header_bits = [f"[{i}] {src}"]
             if page is not None:
-                header += f" | p.{page}"
+                header_bits.append(f"стр. {page}")
             if score is not None:
                 try:
-                    header += f" | score={float(score):.3f}"
+                    header_bits.append(f"score={float(score):.2f}")
                 except Exception:
                     pass
-            header += "]"
 
-            lines.append(header)
-            # ограничим каждый кусок ~800–1000 символов, чтобы не «забить» окно контекста
-            snippet = (text or "").strip()
-            if len(snippet) > 1000:
-                snippet = snippet[:1000] + " …"
-            lines.append(snippet)
-            lines.append("")  # пустая строка-разделитель
+            header = " | ".join(header_bits)
+            block = f"{header}\n{text}\n"
 
-        return "\n".join(lines).strip()
+            # Контроль суммарной длины
+            if used_chars + len(block) > self.max_chars:
+                remain = self.max_chars - used_chars
+                if remain <= 0:
+                    break
+                # аккуратно обрежем блок
+                block = block[:remain]
+                parts.append(block)
+                used_chars += len(block)
+                break
+
+            parts.append(block)
+            used_chars += len(block)
+
+        if not parts:
+            return ""
+
+        # Итоговый контекст, который будет добавлен в system/assistant промпт
+        context = (
+            "Ниже приведены выдержки из Базы знаний (цитаты и ссылки на источник):\n\n"
+            + "\n".join(parts)
+        )
+        return context
