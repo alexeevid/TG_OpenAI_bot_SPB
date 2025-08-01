@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from telegram.ext import Application
+from telegram import BotCommand
 
 from bot.config import load_settings
 from bot.telegram_bot import ChatGPTTelegramBot
@@ -15,22 +16,44 @@ logging.basicConfig(level=logging.INFO)
 def build_application() -> Application:
     settings = load_settings()
 
-    # Создаем OpenAI helper (не меняем сигнатуры вашего класса)
+    # OpenAI helper в вашем формате
     openai = OpenAIHelper(api_key=settings.openai_api_key)
 
-    # Создаем объект бота (наш класс с обработчиками)
+    # Наш класс бота с хендлерами
     bot = ChatGPTTelegramBot(openai=openai, settings=settings)
 
-    # post_init — выполняется один раз перед началом polling
     async def _post_init(app: Application):
-        # 1) На всякий случай убираем webhook и сбрасываем «зависшие» апдейты
+        # 1) Гарантированно гасим вебхук и сбрасываем «зависшие» апдейты
         await app.bot.delete_webhook(drop_pending_updates=True)
-        # 2) Логируем, под каким ботом мы подключены
         me = await app.bot.get_me()
         logger.info("🤖 Connected as @%s (id=%s)", me.username, me.id)
-        # 3) Выставляем команды (ваш метод)
+
+        # 2) Ставим команды:
         try:
-            await bot.setup_commands(app)
+            if hasattr(bot, "setup_commands") and callable(getattr(bot, "setup_commands")):
+                # Если в вашем классе вдруг появится метод setup_commands(app)
+                await bot.setup_commands(app)
+            elif hasattr(bot, "_post_init") and callable(getattr(bot, "_post_init")):
+                # Если уже есть внутренний _post_init(app), отдадим ему право всё настроить
+                await bot._post_init(app)  # type: ignore[attr-defined]
+            elif hasattr(bot, "_apply_bot_commands") and callable(getattr(bot, "_apply_bot_commands")):
+                # Старое приватное API —  установит команды во всех scope
+                await bot._apply_bot_commands(app.bot, lang=getattr(bot.settings, "bot_language", None))  # type: ignore[attr-defined]
+            else:
+                # Фолбэк: минимальный набор команд на всякий случай
+                commands = [
+                    BotCommand("help", "помощь"),
+                    BotCommand("reset", "сброс контекста"),
+                    BotCommand("stats", "статистика"),
+                    BotCommand("kb", "база знаний"),
+                    BotCommand("model", "выбор модели"),
+                    BotCommand("mode", "стиль ответов"),
+                    BotCommand("dialogs", "диалоги"),
+                    BotCommand("img", "сгенерировать изображение"),
+                    BotCommand("web", "веб-поиск"),
+                ]
+                await app.bot.set_my_commands(commands=commands)
+                logger.info("✅ Команды установлены (fallback)")
         except Exception as e:
             logger.exception("setup_commands failed: %s", e)
 
@@ -42,8 +65,9 @@ def build_application() -> Application:
     )
     app = builder.build()
 
-    # Регистрируем хендлеры
+    # Регистрируем все хендлеры
     bot.install(app)
+
     return app
 
 
@@ -52,9 +76,7 @@ def main() -> None:
     app = build_application()
     logger.info("🚀 Бот запускается (run_polling)...")
 
-    # Важные параметры:
-    # - drop_pending_updates=True — выкидываем «старые» апдейты,
-    # - allowed_updates=None — разрешаем все типы апдейтов (по умолчанию PTB сам выберет нужные)
+    # ВАЖНО: запускаем единственный инстанс, сбрасываем подвешенные апдейты, разрешаем все типы
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=None,
