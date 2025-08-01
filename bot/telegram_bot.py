@@ -113,6 +113,23 @@ class ChatGPTTelegramBot:
             BotCommand("web", "веб-поиск"),
         ]
 
+    async def cmd_kbdebug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not (self.kb_indexer and self.kb_retriever):
+            await update.effective_message.reply_text("KB недоступна в этой сборке.")
+            return
+        try:
+            report = await asyncio.to_thread(self.kb_indexer.diagnose)
+            # Телеграм ограничивает длину сообщения ~4096 символов
+            max_len = 3900
+            if len(report) <= max_len:
+                await update.effective_message.reply_text(f"```\n{report}\n```", parse_mode="Markdown")
+            else:
+                await update.effective_message.reply_text(f"```\n{report[:max_len]}\n... (truncated)\n```",
+                                                          parse_mode="Markdown")
+        except Exception as e:
+            logger.exception("kbdebug failed: %s", e)
+            await update.effective_message.reply_text(f"Ошибка диагностики KB: {e}")
+    
     async def setup_commands_and_cleanup(self, app: Application) -> None:
         """
         Колбэк для Application.post_init — сначала чистим webhook (на всякий),
@@ -159,6 +176,8 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("dialogs", self.cmd_dialogs))
         app.add_handler(CommandHandler("img", self.cmd_img))
         app.add_handler(CommandHandler("web", self.cmd_web))
+        app.add_handler(CommandHandler("kbdebug", self.cmd_kbdebug))
+
 
         # Сообщения
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
