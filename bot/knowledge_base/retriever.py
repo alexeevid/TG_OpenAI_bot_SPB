@@ -4,9 +4,17 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, TypedDict
 
 logger = logging.getLogger(__name__)
+
+
+class KBChunk(TypedDict, total=False):
+    """Тип единицы контента, который возвращает ретривер."""
+    text: str
+    source: str
+    page: Optional[int]
+    score: float
 
 
 class KnowledgeBaseRetriever:
@@ -21,19 +29,19 @@ class KnowledgeBaseRetriever:
       ]
     }
 
-    Если доступен векторный поиск, реализуйте _vector_search()
-    и выставьте self._vector_ready = True.
+    Если появится векторный поиск, реализуйте _vector_search()
+    и установите self._vector_ready = True.
     """
 
     def __init__(self, settings):
-        # Путь к манифесту можно задать переменной окружения или в settings
+        # Путь к манифесту: env KB_MANIFEST_PATH, Settings.kb_manifest_path или data/kb/manifest.json
         self.manifest_path: str = (
             getattr(settings, "kb_manifest_path", None)
             or os.getenv("KB_MANIFEST_PATH")
             or os.path.join("data", "kb", "manifest.json")
         )
 
-        # Признак готовности векторного поиска (по умолчанию нет)
+        # Флаг готовности векторного поиска (по умолчанию выключен)
         self._vector_ready: bool = False
 
         # Данные манифеста в памяти
@@ -54,14 +62,14 @@ class KnowledgeBaseRetriever:
         selected_docs: Optional[List[str]] = None,
         top_k: int = 8,
         min_score: float = 0.30,
-    ) -> List[dict]:
+    ) -> List[KBChunk]:
         """
-        Возвращает список чанков вида:
+        Возвращает список чанков:
         { "text": str, "source": str, "page": Optional[int], "score": float }
 
         - Фильтр по selected_docs (если задан)
-        - Сначала пробуем векторный поиск (если включён)
-        - При недоступности векторов — подстрочный скоринг с эвристиками
+        - Если есть векторный поиск — используем его (top_k с запасом)
+        - Иначе — фолбэк: подстрочный скоринг + лёгкие эвристики
         - Отсечка по min_score и ограничение top_k
         """
         q = (query or "").strip()
@@ -70,8 +78,8 @@ class KnowledgeBaseRetriever:
 
         sel_set = set(selected_docs or [])
 
-        # 1) Собираем корпус кандидатов (все или только выбранные документы)
-        corpus: List[dict] = []
+        # 1) Корпус кандидатов
+        corpus: List[KBChunk] = []
         for ch in self._iter_all_chunks():
             src = ch.get("source") or "unknown"
             if sel_set and src not in sel_set:
@@ -83,9 +91,9 @@ class KnowledgeBaseRetriever:
         if not corpus:
             return []
 
-        results: List[dict] = []
+        results: List[KBChunk] = []
 
-        # 2) Попытка векторного поиска (если реализован)
+        # 2) Векторный поиск (если включён)
         if self._vector_ready and hasattr(self, "_vector_search"):
             try:
                 vec_hits = self._vector_search(q, selected_docs=sel_set, top_k=top_k * 2)  # небольшой запас
@@ -100,7 +108,7 @@ class KnowledgeBaseRetriever:
                 logger.warning("Vector search failed, fallback to substring scoring: %s", e)
                 results = []
 
-        # 3) Фолбэк: подстрочный/эвристический скоринг
+        # 3) Фолбэк-скоринг
         if not results:
             q_low = q.lower()
 
@@ -109,46 +117,46 @@ class KnowledgeBaseRetriever:
             if len(q.split()) <= 4:
                 if "wow" in q_low:
                     expand_keys += [
-                        "choose your wow",            # полное название книги/метода
-                        "ways of working",            # расшифровка акронима в контексте DA
-                        "wow definition",             # подсказка для определений в тексте
-                        "disciplined agile wow",      # уточнение контекста
-                        "choose your way of working", # альтернативная формулировка
+                        "choose your wow",
+                        "ways of working",
+                        "wow definition",
+                        "disciplined agile wow",
+                        "choose your way of working",
                     ]
 
-            scored: List[dict] = []
+            scored: List[KBChunk] = []
             for ch in corpus:
-                text_low = ch["text"].lower()
+                text_low = (ch["text"] or "").lower()
                 score = 0.0
 
                 # Частотный подстрочный скоринг по расширенным ключам
                 for k in expand_keys:
-                    if not k:
-                        continue
-                    if k in text_low:
+                    if k and k in text_low:
                         score += text_low.count(k) * 0.6
 
                 # Бонусы за «определенческие» паттерны
                 if "wow" in q_low:
-                    if "wow —" in text_low or "wow -" in text_low or "wow (" in text_low:
-                        score += 1.0
                     if "choose your wow" in text_low:
                         score += 0.8
+                    if "wow —" in text_low or "wow -" in text_low or "wow (" in text_low:
+                        score += 1.0
 
                 if score > 0:
-                    scored.append({**ch, "score": score})
+                    c = dict(ch)  # copy
+                    c["score"] = score  # type: ignore[typeddict-item]
+                    scored.append(c)    # type: ignore[arg-type]
 
             # Нормировка 0..1
             if scored:
-                m = max(s["score"] for s in scored)
+                m = max(s["score"] for s in scored)  # type: ignore[index]
                 if m > 0:
                     for s in scored:
-                        s["score"] = s["score"] / m
+                        s["score"] = s["score"] / m  # type: ignore[index]
                 results = scored
 
         # 4) Сортировка и отсечка
-        results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
-        results = [r for r in results if r.get("score", 0.0) >= min_score][:top_k]
+        results.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        results = [r for r in results if float(r.get("score", 0.0)) >= min_score][:top_k]
 
         return results
 
@@ -159,7 +167,6 @@ class KnowledgeBaseRetriever:
         try:
             self._load_manifest()
         except FileNotFoundError:
-            # Создадим пустой манифест и папку
             os.makedirs(os.path.dirname(self.manifest_path), exist_ok=True)
             self._manifest = {"chunks": []}
             with open(self.manifest_path, "w", encoding="utf-8") as f:
@@ -176,14 +183,13 @@ class KnowledgeBaseRetriever:
         if not isinstance(self._manifest, dict):
             self._manifest = {"chunks": []}
 
-    def _iter_all_chunks(self) -> Iterable[dict]:
+    def _iter_all_chunks(self) -> Iterable[KBChunk]:
         """
         Итерирует по всем чанкам корпуса из манифеста.
         Каждый чанк — словарь: {text, source, page}.
         """
         chunks = (self._manifest or {}).get("chunks", []) or []
         for item in chunks:
-            # Защита от кривых записей
             if not isinstance(item, dict):
                 continue
             yield {
@@ -192,21 +198,16 @@ class KnowledgeBaseRetriever:
                 "page": item.get("page"),
             }
 
-    # --------- Заглушка под векторный поиск (опционально подключаемая) ---------
+    # --------- Заглушка под векторный поиск ---------
 
     def _vector_search(
         self,
         query: str,
         selected_docs: Optional[set] = None,
         top_k: int = 8,
-    ) -> List[dict]:
+    ) -> List[KBChunk]:
         """
-        Заглушка. Если у вас есть БД с pgvector/FAISS и т.п.,
-        реализуйте здесь реальный поиск и выставляйте self._vector_ready = True
-        в __init__ при успешной инициализации движка.
-
-        Возвращаемый формат списка:
-        [{ "text": str, "source": str, "page": Optional[int], "score": float }, ...]
+        Если подключите pgvector/FAISS, реализуйте реальный поиск
+        и выставляйте self._vector_ready = True в __init__.
         """
-        # По умолчанию — нет векторного поиска.
         return []
