@@ -66,85 +66,95 @@ class OpenAIHelper:
 
     # ===================== ТЕКСТОВЫЙ ДИАЛОГ =====================
 
-    def chat(
-        self,
-        prompt: str,
-        model: Optional[str] = None,
-        temperature: float = 0.2,
-        style: str = "Pro",
-        kb_context: Optional[str] = None,
-    ) -> str:
+    # ВАЖНО: вставьте этот метод целиком вместо текущего chat() в bot/openai_helper.py
+
+    def chat(self, user_text: str,
+             model: Optional[str] = None,
+             temperature: float = 0.2,
+             style: str = "Pro",
+             kb_ctx: Optional[Dict[str, Any]] = None) -> str:
         """
-        Возвращает текстовый ответ модели.
-        Точечная правка: корректный парсинг ответа Responses API (без out.message).
+        Единая точка диалога. Если есть kb_ctx, отвечаем строго по БЗ.
+        kb_ctx ожидается формата:
+            {
+              "text": "<склеенные выдержки>",
+              "sources": ["disk:/...pdf", "disk:/...pdf", ...]   # опционально
+            }
         """
-        mdl = model or self.default_chat_model
-
-        # Формируем system из стиля и KB-контекста
-        system_parts: List[dict] = [
-            {"type": "text", "text": self._style_to_system_prompt(style)}
-        ]
-        if kb_context:
-            system_parts.append({
-                "type": "text",
-                "text": (
-                    "Ниже приведены выдержки из базы знаний. Используй их как первоисточник фактов. "
-                    "Если сведений недостаточно — скажи явно.\n\n"
-                    f"{kb_context}"
-                ),
-            })
-
-        # Responses API
-        inputs = [
-            {"role": "system", "content": system_parts},
-            {"role": "user", "content": [{"type": "text", "text": prompt}]},
-        ]
-
-        try:
-            resp = self.client.responses.create(
-                model=mdl,
-                input=inputs,
-                temperature=temperature,
+    
+        use_model = model or self.default_model or "gpt-4o"
+        temp = max(0.0, min(1.0, temperature))
+    
+        # --- Формируем системный промпт ---
+        sys_parts = []
+    
+        # Базовый тон (по стилю), очень краткий
+        if style.lower() in ("pro", "professional"):
+            sys_parts.append("Отвечай коротко, по делу, структурируй списками только когда это помогает.")
+        elif style.lower() in ("expert", "экспертный"):
+            sys_parts.append("Ты эксперт-практик. Отвечай точно, с минимальными пояснениями.")
+        elif style.lower() in ("ceo",):
+            sys_parts.append("Отвечай управленческим языком, фокус на решениях и рисках.")
+        else:
+            sys_parts.append("Отвечай нейтрально и кратко.")
+    
+        kb_mode = bool(kb_ctx and isinstance(kb_ctx, dict) and kb_ctx.get("text"))
+        if kb_mode:
+            # Жёсткий приоритет БЗ
+            sys_parts.append(
+                "Используй ТОЛЬКО приведённые ниже выдержки из Базы знаний (БЗ). "
+                "Если выдержек недостаточно для точного ответа, напиши: "
+                "«Недостаточно контекста из БЗ для точного ответа» и поясни, чего не хватает."
             )
+            sys_parts.append("БЗ:\n" + str(kb_ctx.get("text")))
+    
+            # Для снижения фантазии
+            temp = min(temp, 0.3)
+    
+        system_prompt = "\n\n".join(sys_parts).strip()
+    
+        # --- Собираем messages для Chat Completions ---
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text.strip()},
+        ]
+    
+        # --- Пытаемся через Responses API (если у вас это используется), иначе — Chat Completions ---
+        # Здесь оставляем ваш текущий «fallback» к chat.completions, но подставляем messages выше.
+        try:
+            # Если у вас есть быстрая ветка через Responses API — можете её оставить,
+            # главное: передайте system+user в нужном формате. Иначе просто используем чат-комплишнс.
+            pass
+        except Exception:
+            pass
+    
+        # Chat Completions (надёжно и просто)
+        try:
+            resp = self.client.chat.completions.create(
+                model=use_model,
+                messages=messages,
+                temperature=temp,
+            )
+            reply = resp.choices[0].message.content if resp and resp.choices else ""
         except Exception as e:
-            # Фолбэк на Chat Completions (на случай несовместимой модели)
-            logger.warning("Responses.create failed (%s). Trying Chat Completions fallback...", e)
-            try:
-                cc = self.client.chat.completions.create(
-                    model=mdl,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "\n".join(p["text"] for p in system_parts if p.get("type") == "text"),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=temperature,
-                )
-                return (cc.choices[0].message.content or "").strip()
-            except Exception as ee:
-                logger.error("Chat Completions fallback failed: %s", ee)
-                raise
-
-        # ✅ Основной путь: безопасное извлечение текста
-        txt = getattr(resp, "output_text", None)
-        if txt:
-            return txt.strip()
-
-        # Ручной разбор (на случай, если output_text отсутствует)
-        chunks: List[str] = []
-        for out in (getattr(resp, "output", []) or []):
-            if getattr(out, "type", None) == "message":
-                for part in (getattr(out, "content", []) or []):
-                    if getattr(part, "type", None) == "text":
-                        t = getattr(part, "text", None)
-                        if t:
-                            chunks.append(t)
-        if chunks:
-            return "\n".join(chunks).strip()
-
-        logger.warning("Responses API returned no text content.")
-        return "⚠️ Модель не вернула текст ответа."
+            logger.error("chat.completions failed: %s", e)
+            raise
+    
+        reply = reply or ""
+    
+        # Хвост со списком источников, если включён KB_DEBUG
+        try:
+            import os
+            if kb_mode and os.getenv("KB_DEBUG", "0") == "1":
+                sources = kb_ctx.get("sources") or []
+                sources = [s for s in sources if s]
+                if sources:
+                    tail = "\n\n📚 Источники (БЗ):\n" + "\n".join(f"• {s}" for s in sources[:10])
+                    reply += tail
+        except Exception:
+            pass
+    
+        return reply
 
     # ===================== ИЗОБРАЖЕНИЯ =====================
 
