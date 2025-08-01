@@ -1,12 +1,11 @@
 # bot/knowledge_base/indexer.py
 from __future__ import annotations
 
-import io
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     import yadisk  # type: ignore
@@ -26,29 +25,92 @@ class IndexedDoc:
     mtime: Optional[int] = None  # unixtime
 
 
+def _normalize_root_path(raw: Optional[str]) -> str:
+    """
+    Приводит любое входное значение к формату, понятному API Я.Диска:
+    - Если None/пусто -> 'disk:/'
+    - Если начинается с 'disk:/' -> оставляем
+    - Если начинается с '/' -> добавляем 'disk:' -> 'disk:/...'
+    - Иначе -> считаем относительным именем папки в корне -> 'disk:/<raw>'
+    Также схлопываем лишние слэши.
+    """
+    if not raw:
+        return "disk:/"
+
+    s = raw.strip()
+
+    # Уберём повторяющиеся пробелы по краям — внутри пути пробелы допустимы
+    # Нормализация префикса
+    if s.startswith("disk:/"):
+        norm = s
+    elif s.startswith("/"):
+        norm = "disk:" + s
+    else:
+        # относительный путь превращаем в путь в корне
+        norm = "disk:/" + s
+
+    # Схлопнуть дублирующиеся слэши после 'disk:'
+    # Пример: 'disk:////База  Знаний' -> 'disk:/База  Знаний'
+    prefix = "disk:"
+    rest = norm[len(prefix):]
+    while "//" in rest:
+        rest = rest.replace("//", "/")
+    norm = prefix + rest
+
+    # Удалить завершающий слэш, кроме корня
+    if norm != "disk:/" and norm.endswith("/"):
+        norm = norm[:-1]
+
+    return norm
+
+
+def _normalize_ext_list(raw_csv: str) -> List[str]:
+    """
+    '.pdf,.docx, txt' -> ['.pdf', '.docx', '.txt']
+    """
+    out: List[str] = []
+    for part in (raw_csv or "").split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        if not p.startswith("."):
+            p = "." + p
+        out.append(p)
+    return out
+
+
 class KnowledgeBaseIndexer:
     """
     Отвечает за:
       - обход папки Yandex.Disk;
       - решение: добавлять/обновлять/пропускать;
-      - возврат статистики синка (added, updated, deleted, unchanged);
-    Хранилище индекса — простое in-memory + responsibility вызывать внешние сохранения.
+      - возврат статистики синка (added, updated, deleted, unchanged).
+    Хранилище индекса — простое in-memory (для демо). В реальном проекте
+    хранили бы в БД.
     """
 
     def __init__(self, settings):
         self.settings = settings
-        self._root = (getattr(settings, "yandex_root_path", None)
-                      or getattr(settings, "yadisk_folder", None)
-                      or "disk:/")
-        self._token = getattr(settings, "yandex_disk_token", None) or getattr(settings, "yadisk_token", None)
-        self._allowed_ext = os.getenv("KB_ALLOWED_EXT", ".pdf,.docx,.txt,.md,.pptx,.xlsx").lower().split(",")
 
-        # Простой внутренний «каталог» уже индексированных документов
-        # В реальной системе вы бы тянули это из БД; тут оставляем in-memory
+        raw_root = (
+            getattr(settings, "yandex_root_path", None)
+            or getattr(settings, "yadisk_folder", None)
+            or "disk:/"
+        )
+        self._root = _normalize_root_path(raw_root)
+
+        self._token = getattr(settings, "yandex_disk_token", None) or getattr(settings, "yadisk_token", None)
+        self._allowed_ext = _normalize_ext_list(
+            os.getenv("KB_ALLOWED_EXT", ".pdf,.docx,.txt,.md,.pptx,.xlsx")
+        )
+
+        # Внутренний «каталог» уже индексированных документов
         self._index: Dict[str, IndexedDoc] = {}
 
-        logger.debug("KB Indexer init: root=%r, allowed_ext=%r, token_exists=%s",
-                     self._root, self._allowed_ext, bool(self._token))
+        logger.info(
+            "KB Indexer init: raw_root=%r -> normalized=%r; allowed_ext=%r; token_exists=%s",
+            raw_root, self._root, self._allowed_ext, bool(self._token),
+        )
 
         if yadisk is None:
             logger.warning("yadisk module is not available; sync will fail.")
@@ -57,7 +119,7 @@ class KnowledgeBaseIndexer:
 
     def sync(self) -> Tuple[int, int, int, int]:
         """
-        Обходит папку на Диске, решает diff c текущим self._index,
+        Обходит папку на Диске, решает diff с текущим self._index,
         возвращает кортеж (added, updated, deleted, unchanged).
         """
         t0 = time.time()
@@ -89,13 +151,16 @@ class KnowledgeBaseIndexer:
         """Возвращает список документов из текущего индекса."""
         return list(self._index.values())
 
-    # Утилита: подробный отчёт, что видим на диске и как фильтруем.
     def diagnose(self, max_items: int = 200) -> str:
+        """
+        Подробная диагностика: какой корень, как нормализован, какие файлы видим,
+        какие отфильтровали по расширению, и т.д.
+        """
         lines: List[str] = []
-        lines.append(f"KB diagnostics")
-        lines.append(f"- Root: {self._root}")
-        lines.append(f"- Token exists: {bool(self._token)}")
+        lines.append("KB diagnostics")
+        lines.append(f"- Root (normalized): {self._root}")
         lines.append(f"- Allowed EXT: {', '.join(self._allowed_ext)}")
+        lines.append(f"- Token exists: {bool(self._token)}")
         if yadisk is None:
             lines.append("ERROR: yadisk is not installed.")
             return "\n".join(lines)
@@ -123,12 +188,14 @@ class KnowledgeBaseIndexer:
 
         def walk(path: str):
             try:
-                res = y.get_meta(path, fields="items.name,items.path,items.type,items.size,items.etag,items.modified,limit,offset,_embedded.items")  # type: ignore
+                res = y.get_meta(
+                    path,
+                    fields="items.name,items.path,items.type,items.size,items.etag,items.modified,limit,offset,_embedded.items",  # type: ignore
+                )
             except Exception as e:
                 logger.error("get_meta failed for %s: %s", path, e)
                 return
 
-            # API Yandex Disk: у папок _embedded.items — список содержимого
             embedded = getattr(res, "_embedded", None)
             items = []
             if embedded and hasattr(embedded, "items"):
@@ -154,11 +221,8 @@ class KnowledgeBaseIndexer:
                     etag = getattr(it, "etag", None)
                     mtime = None
                     try:
-                        # modified: '2025-07-29T08:14:03+00:00'
-                        mod = getattr(it, "modified", None)
+                        mod = getattr(it, "modified", None)  # '2025-07-29T08:14:03+00:00'
                         if mod:
-                            # простая попытка перевести в unixtime
-                            # делаем без dateutil, чтобы не добавлять зависимость
                             mtime = int(time.mktime(time.strptime(str(mod)[:19], "%Y-%m-%dT%H:%M:%S")))
                     except Exception:
                         pass
@@ -182,7 +246,6 @@ class KnowledgeBaseIndexer:
           - путь есть, но изменился etag/size/mtime → updated
           - в индексе был, а в дереве нет → deleted
           - остальное → unchanged
-        Здесь мы только ведём in-memory self._index (как демонстрация).
         """
         current_paths = {d.path for d in files}
         index_paths = set(self._index.keys())
@@ -195,7 +258,7 @@ class KnowledgeBaseIndexer:
             if d.path in self._index:
                 old = self._index[d.path]
                 if (d.etag and d.etag != old.etag) or (d.size is not None and d.size != old.size) or (
-                        d.mtime and d.mtime != old.mtime
+                    d.mtime and d.mtime != old.mtime
                 ):
                     to_update.append(d)
                 else:
@@ -206,7 +269,6 @@ class KnowledgeBaseIndexer:
         logger.debug("Diff result: add=%d, update=%d, delete=%d, unchanged=%d",
                      len(to_add), len(to_update), len(to_delete), unchanged)
 
-        # Применяем
         for d in to_add:
             self._index[d.path] = d
         for d in to_update:
