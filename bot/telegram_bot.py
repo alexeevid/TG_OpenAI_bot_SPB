@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import os
+import time
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +17,7 @@ from telegram import (
     BotCommandScopeDefault,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllChatAdministrators,
+    InputFile,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -27,115 +28,112 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import Conflict
 
 logger = logging.getLogger(__name__)
 
-# ---------- База знаний (KB) — безопасный импорт ----------
-KB_MOD_AVAILABLE = True
+# --- Опциональная База Знаний (KB) ---
+KB_AVAILABLE = True
 try:
-    # Единая точка входа для компонентов БЗ.
-    # Внутри вашего пакета может реэкспортироваться KnowledgeBaseRetriever.
     from bot.knowledge_base.indexer import KnowledgeBaseIndexer, IndexedDoc
-    try:
-        from bot.knowledge_base.retriever import KnowledgeBaseRetriever, KBChunk  # type: ignore
-    except Exception as e:
-        KnowledgeBaseRetriever = None  # type: ignore
-        KB_MOD_AVAILABLE = True  # индексатор есть, ретривера может не быть — меню всё равно работает
-        logger.warning("KB retriever import warning: %s", e)
+    from bot.knowledge_base.retriever import KnowledgeBaseRetriever
+    from bot.knowledge_base.context_manager import ContextManager
 except Exception as e:
-    KB_MOD_AVAILABLE = False
-    KnowledgeBaseIndexer = None  # type: ignore
-    KnowledgeBaseRetriever = None  # type: ignore
+    KB_AVAILABLE = False
     logger.warning("KB unavailable (import): %s", e)
 
 
-# ---------- Состояние диалога ----------
+# --- Простая модель диалогов в памяти ---
 @dataclass
 class DialogState:
     dialog_id: int
     title: str = "Диалог"
-    created_at_ts: float = 0.0
-    updated_at_ts: float = 0.0
+    created_at_ts: float = field(default_factory=lambda: time.time())
+    updated_at_ts: float = field(default_factory=lambda: time.time())
     model: Optional[str] = None
     style: str = "Pro"
-    # список выбранных документов: ИД = path (например "disk:/База Знаний/book.pdf")
-    kb_selected_docs: List[str] = field(default_factory=list)
+    kb_selected_docs: List[str] = field(default_factory=list)  # пути файлов
+    # Признак использования БЗ теперь не нужен — сам факт наличия выбранных доков = включено
 
 
-# ======================================================================
-#                                БОТ
-# ======================================================================
 class ChatGPTTelegramBot:
     def __init__(self, openai, settings):
         self.openai = openai
         self.settings = settings
 
-        # Разрешения (опционально)
-        self.admin_ids = set(
-            getattr(settings, "admin_user_ids", [])
-            or getattr(settings, "admin_set", [])
-            or []
-        )
-        self.allowed_ids = set(
-            getattr(settings, "allowed_user_ids", [])
-            or getattr(settings, "allowed_set", [])
-            or []
-        )
+        # Разрешения
+        self.admin_ids = set(getattr(settings, "admin_user_ids", []) or getattr(settings, "admin_set", []) or [])
+        self.allowed_ids = set(getattr(settings, "allowed_user_ids", []) or getattr(settings, "allowed_set", []) or [])
 
-        # Диалоги на пользователя (in-memory)
-        self._dialogs_by_user: Dict[int, Dict[int, DialogState]] = {}
-        self._current_dialog_by_user: Dict[int, int] = {}
+        # Состояние пользователей (наивная in-memory реализация)
+        self._dialogs_by_user: Dict[int, Dict[int, DialogState]] = {}  # user_id -> {dialog_id -> DialogState}
+        self._current_dialog_by_user: Dict[int, int] = {}              # user_id -> dialog_id
         self._next_dialog_id: int = 1
 
-        # БЗ
-        self.kb_available: bool = KB_MOD_AVAILABLE
-        self.kb_indexer: Optional[KnowledgeBaseIndexer] = None  # type: ignore[assignment]
-        self.kb_retriever: Optional[KnowledgeBaseRetriever] = None  # type: ignore[assignment]
+        # --- Compact callback payload store (чтобы callback_data < 64b) ---
+        self._cb_store: Dict[str, Any] = {}         # token -> payload
+        self._cb_store_ts: Dict[str, float] = {}    # token -> ts (для очистки)
+        self._cb_ttl_sec: int = 3600                # хранить 1 час
+        self._cb_prefix: str = "c"                  # чтобы легко отличать наши токены
 
-        if self.kb_available and KnowledgeBaseIndexer:
+        # KB
+        self.kb_indexer: Optional[KnowledgeBaseIndexer] = None
+        self.kb_retriever: Optional[KnowledgeBaseRetriever] = None
+        self.kb_ctx: Optional[ContextManager] = None
+        if KB_AVAILABLE:
             try:
                 self.kb_indexer = KnowledgeBaseIndexer(settings)
-                if KnowledgeBaseRetriever:
-                    self.kb_retriever = KnowledgeBaseRetriever(settings)  # type: ignore[call-arg]
+                self.kb_retriever = KnowledgeBaseRetriever(settings)
+                self.kb_ctx = ContextManager(settings)
             except Exception as e:
-                self.kb_available = False
-                logger.exception("KB init failed: %s", e)
+                logger.error("KB init failed: %s", e)
 
-    # ------------------------------------------------------------------
-    #                     Регистрация команд в меню
-    # ------------------------------------------------------------------
+    # ========== Вспомогательное: compact callback payloads ==========
+    def _cb_put(self, payload: Any) -> str:
+        """Кладём payload и возвращаем короткий токен <= 64 bytes."""
+        # ~10 байт токена достаточно, добавим префикс 'c'
+        token = f"{self._cb_prefix}{secrets.token_urlsafe(6)}"  # ~9-10 ascii
+        # на случай редких коллизий
+        while token in self._cb_store:
+            token = f"{self._cb_prefix}{secrets.token_urlsafe(6)}"
+        self._cb_store[token] = payload
+        self._cb_store_ts[token] = time.time()
+        # уберём старые
+        self._cb_sweep()
+        return token
+
+    def _cb_get(self, token: str) -> Optional[Any]:
+        """Достаём payload по токену."""
+        return self._cb_store.get(token)
+
+    def _cb_sweep(self):
+        now = time.time()
+        to_del = [t for t, ts in self._cb_store_ts.items() if now - ts > self._cb_ttl_sec]
+        for t in to_del:
+            self._cb_store.pop(t, None)
+            self._cb_store_ts.pop(t, None)
+
+    # ========== Команды/меню ==========
     def _build_commands(self) -> List[BotCommand]:
         return [
-            BotCommand("start", "запуск/меню"),
             BotCommand("help", "помощь"),
             BotCommand("reset", "сброс контекста"),
             BotCommand("stats", "статистика"),
             BotCommand("kb", "база знаний"),
-            BotCommand("model", "выбор модели"),
-            BotCommand("mode", "стиль ответа"),
+            BotCommand("model", "выбор модели OpenAI"),
+            BotCommand("mode", "стиль ответов"),
             BotCommand("dialogs", "список диалогов"),
-            BotCommand("img", "создать изображение"),
+            BotCommand("img", "сгенерировать изображение"),
             BotCommand("web", "веб-поиск"),
         ]
 
-    async def setup_commands_and_cleanup(self, app: Application) -> None:
-        """
-        Колбэк для Application.post_init — сначала чистим webhook (на всякий),
-        затем устанавливаем команды во всех scope.
-        """
+    async def _apply_bot_commands(self, bot, lang: Optional[str] = None) -> None:
+        commands = self._build_commands()
+
         try:
-            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         except Exception:
             pass
 
-        # Убираем webhook, чтобы не было конфликтов polling/webhook
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-        except Exception as e:
-            logger.warning("delete_webhook failed: %s", e)
-
-        commands = self._build_commands()
         scopes = [
             BotCommandScopeDefault(),
             BotCommandScopeAllPrivateChats(),
@@ -143,31 +141,37 @@ class ChatGPTTelegramBot:
         ]
         for scope in scopes:
             try:
-                await app.bot.delete_my_commands(scope=scope)
+                await bot.delete_my_commands(scope=scope)
             except Exception:
                 pass
-            await app.bot.set_my_commands(commands=commands, scope=scope)
+            await bot.set_my_commands(commands=commands, scope=scope, language_code=lang)
 
+    async def _post_init(self, app: Application):
+        lang = getattr(self.settings, "bot_language", None)
+        await self._apply_bot_commands(app.bot, lang=None)
+        if lang:
+            await self._apply_bot_commands(app.bot, lang=lang)
         logger.info("✅ Команды установлены (global scopes)")
 
-    # ------------------------------------------------------------------
-    #                      Регистрация обработчиков
-    # ------------------------------------------------------------------
+    # Если main.py захочет вызывать setup_commands — дадим совместимость
+    async def setup_commands(self, app: Application):
+        await self._post_init(app)
+
+    # ========== Регистрация обработчиков ==========
     def install(self, app: Application) -> None:
         # Команды
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("reset", self.cmd_reset))
         app.add_handler(CommandHandler("stats", self.cmd_stats))
-        app.add_handler(CommandHandler("kb", self.cmd_kb))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("mode", self.cmd_mode))
         app.add_handler(CommandHandler("dialogs", self.cmd_dialogs))
         app.add_handler(CommandHandler("img", self.cmd_img))
         app.add_handler(CommandHandler("web", self.cmd_web))
-        app.add_handler(CommandHandler("kbdebug", self.cmd_kbdebug))
+        app.add_handler(CommandHandler("kb", self.cmd_kb))
 
-        # Сообщения
+        # Сообщения пользователя
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_or_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
@@ -175,12 +179,7 @@ class ChatGPTTelegramBot:
         # Inline callbacks
         app.add_handler(CallbackQueryHandler(self.on_callback))
 
-        # Error handler
-        app.add_error_handler(self.on_error)
-
-    # ------------------------------------------------------------------
-    #                           Вспомогательные
-    # ------------------------------------------------------------------
+    # ========== Вспомогательные ==========
     def _ensure_dialog(self, user_id: int) -> DialogState:
         user_dialogs = self._dialogs_by_user.setdefault(user_id, {})
         if user_id not in self._current_dialog_by_user:
@@ -200,87 +199,18 @@ class ChatGPTTelegramBot:
         except Exception:
             pass
 
-    def _kb_all_documents(self) -> List[IndexedDoc | dict]:
-        """
-        Возвращает список документов из индексатора.
-        ИД документа = path. Для показа в UI берём os.path.basename(path).
-        """
-        if not (self.kb_available and self.kb_indexer):
-            return []
-
-        # Базовый путь — строго через indexer.list_documents()
-        try:
-            docs = self.kb_indexer.list_documents()  # type: ignore[call-arg]
-            if isinstance(docs, list):
-                return docs
-        except Exception as e:
-            logger.debug("KB indexer.list_documents failed: %s", e)
-
-        # На всякий случай — фоллбеки на возможные альтернативные имена
-        for alt in ("list_all", "list_docs", "get_documents"):
-            try:
-                if hasattr(self.kb_indexer, alt):
-                    func = getattr(self.kb_indexer, alt)
-                    docs = func()
-                    if isinstance(docs, list):
-                        return docs
-            except Exception as e:
-                logger.debug("KB indexer.%s failed: %s", alt, e)
-
-        logger.warning("KB: no method to enumerate documents")
-        return []
-
-    def _kb_render_menu(self, st: DialogState) -> InlineKeyboardMarkup:
-        docs = self._kb_all_documents()
-        rows: List[List[InlineKeyboardButton]] = []
-        rows.append([InlineKeyboardButton("🔄 Синхронизировать", callback_data="kb:sync")])
-
-        if not docs:
-            rows.append([InlineKeyboardButton("— Документов нет —", callback_data="kb:nop")])
-        else:
-            for d in docs:
-                # d — IndexedDoc (имеет .path) или словарь с key "path"
-                path = getattr(d, "path", None) or (d.get("path") if isinstance(d, dict) else None)
-                if not path:
-                    continue
-                title = os.path.basename(path) or path
-                checked = "✅" if path in st.kb_selected_docs else "⬜"
-                rows.append([InlineKeyboardButton(f"{checked} {title}", callback_data=f"kb:toggle:{path}")])
-
-        rows.append([InlineKeyboardButton("✅ Готово", callback_data="kb:close")])
-        return InlineKeyboardMarkup(rows)
-
-    def _prepare_kb_context(self, chunks: List["KBChunk"]) -> str:  # type: ignore[name-defined]
-        if not chunks:
-            return ""
-        lines: List[str] = []
-        lines.append("Ниже даны выдержки из выбранных документов базы знаний (используй их с приоритетом):")
-        for i, ch in enumerate(chunks, 1):
-            src = getattr(ch, "source_path", None) or getattr(ch, "ext_id", "") or ""
-            page = getattr(ch, "page", None)
-            page_txt = f", стр. {page}" if page is not None else ""
-            title = os.path.basename(src) if src else "Документ"
-            content = getattr(ch, "content", "") or ""
-            lines.append(f"[{i}] {title}{page_txt} ({src})")
-            lines.append(str(content).strip())
-            lines.append("-" * 80)
-        return "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    #                              Команды
-    # ------------------------------------------------------------------
+    # ========== Команды ==========
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self._ensure_dialog(update.effective_user.id)
         await update.effective_message.reply_text(
-            "Привет! Я готов к работе.\n"
-            "Команды: /help, /reset, /stats, /kb, /model, /mode, /dialogs, /img, /web"
+            "Привет! Я готов к работе.\nКоманды: /help, /reset, /stats, /kb, /model, /mode, /dialogs, /img, /web"
         )
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             "/reset — сброс контекста (новый диалог)\n"
             "/stats — статистика\n"
-            "/kb — база знаний (синхронизация и выбор документов)\n"
+            "/kb — база знаний (синхрон. + выбор документов)\n"
             "/model — выбор модели OpenAI\n"
             "/mode — стиль ответов\n"
             "/dialogs — список диалогов (открыть/удалить)\n"
@@ -299,21 +229,21 @@ class ChatGPTTelegramBot:
 
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
-        kb_list = ", ".join(os.path.basename(p) for p in st.kb_selected_docs) if st.kb_selected_docs else "—"
+        kb_list = ", ".join(st.kb_selected_docs) if st.kb_selected_docs else "—"
         text = (
             "📊 Статистика:\n"
             f"- Диалог: {st.title}\n"
             f"- Модель: {st.model or getattr(self.settings, 'openai_model', 'gpt-4o')}\n"
             f"- Стиль: {st.style}\n"
-            f"- Документов в контексте: {len(st.kb_selected_docs)}\n"
-            f"- Выбрано: {kb_list}"
+            f"- Документов выбрано: {len(st.kb_selected_docs)}\n"
+            f"- В контексте: {kb_list}"
         )
         await update.effective_message.reply_text(text)
 
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
         try:
-            models = self.openai.list_models_for_menu()
+            models = self.openai.list_models_for_menu()  # ожидается список строк
         except Exception as e:
             logger.exception("list_models failed: %s", e)
             await update.effective_message.reply_text("Не удалось получить список моделей.")
@@ -363,9 +293,10 @@ class ChatGPTTelegramBot:
         await self._send_typing(update.effective_chat.id, context)
         try:
             img_bytes, used_prompt = await asyncio.to_thread(self.openai.generate_image, prompt, None)
-            bio = io.BytesIO(img_bytes)
-            bio.name = "image.png"
-            await update.effective_message.reply_photo(photo=bio, caption=f"🖼️ Сгенерировано по prompt:\n{used_prompt}")
+            await update.effective_message.reply_photo(
+                photo=InputFile(img_bytes, filename="image.png"),
+                caption=f"🖼️ Сгенерировано по prompt:\n{used_prompt}",
+            )
         except Exception as e:
             logger.exception("Image generation failed: %s", e)
             await update.effective_message.reply_text(f"Ошибка генерации изображения: {e}")
@@ -388,63 +319,71 @@ class ChatGPTTelegramBot:
             await update.effective_message.reply_text(f"Ошибка веб-поиска: {e}")
 
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """KB меню: сразу запускаем синхронизацию + показываем список документов для выбора."""
         st = self._ensure_dialog(update.effective_user.id)
-        if not (self.kb_available and self.kb_indexer):
+
+        if not (KB_AVAILABLE and self.kb_indexer and self.kb_retriever and self.kb_ctx):
             await update.effective_message.reply_text("Модуль базы знаний недоступен в этой сборке.")
             return
 
-        # 1) Синхронизация при входе в меню
+        await self._send_typing(update.effective_chat.id, context)
+
+        # 1) Синхронизация (админ запускает автоматически при входе)
+        sync_msg = "Синхронизация…"
         try:
-            added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)  # type: ignore[arg-type]
+            added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)
             sync_msg = (
-                "Синхронизация БЗ завершена:\n"
-                f"• Добавлено: {added}\n• Обновлено: {updated_cnt}\n• Удалено: {deleted}\n• Без изменений: {unchanged}\n\n"
-                "Выберите документы для контекста:"
+                f"Синхронизация завершена: +{added}, обновлено {updated_cnt}, удалено {deleted}, без изменений {unchanged}."
             )
         except Exception as e:
             logger.exception("KB sync failed: %s", e)
-            sync_msg = "Не удалось синхронизировать БЗ. Можно выбрать из текущего списка."
+            sync_msg = f"Синхронизация не удалась: {e}"
 
-        kb_markup = self._kb_render_menu(st)
-        await update.effective_message.reply_text(sync_msg, reply_markup=kb_markup)
-
-    async def cmd_kbdebug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.kb_indexer:
-            await update.effective_message.reply_text("KB недоступна в этой сборке.")
-            return
+        # 2) Список документов
+        docs: List[IndexedDoc] = []
         try:
-            if hasattr(self.kb_indexer, "diagnose"):
-                report = await asyncio.to_thread(self.kb_indexer.diagnose)  # type: ignore[call-arg]
-            else:
-                report = "diagnose() не реализован в indexer"
-            max_len = 3900
-            if len(report) <= max_len:
-                await update.effective_message.reply_text(f"```\n{report}\n```", parse_mode="Markdown")
-            else:
-                await update.effective_message.reply_text(
-                    f"```\n{report[:max_len]}\n... (truncated)\n```", parse_mode="Markdown"
-                )
+            docs = self.kb_indexer.list_documents()
         except Exception as e:
-            logger.exception("kbdebug failed: %s", e)
-            await update.effective_message.reply_text(f"Ошибка диагностики KB: {e}")
+            logger.exception("KB list_documents failed: %s", e)
 
-    # ------------------------------------------------------------------
-    #                             Сообщения
-    # ------------------------------------------------------------------
+        rows: List[List[InlineKeyboardButton]] = []
+        if docs:
+            # Кнопки выбора документов (галочка если выбран)
+            for d in docs:
+                title = d.path.split("/")[-1] if d.path else "document"
+                is_selected = d.path in st.kb_selected_docs
+                mark = "✅ " if is_selected else "☐ "
+                # готовим короткий токен
+                token = self._cb_put({"t": "kb_toggle", "path": d.path})
+                rows.append([InlineKeyboardButton(f"{mark}{title}", callback_data=token)])
+        else:
+            rows.append([InlineKeyboardButton("Нет документов в БЗ", callback_data=self._cb_put({"t": "noop"}))])
+
+        # Кнопки действий
+        rows.append([
+            InlineKeyboardButton("💾 Сохранить выбор", callback_data=self._cb_put({"t": "kb_apply"})),
+            InlineKeyboardButton("🔄 Повторить синхронизацию", callback_data=self._cb_put({"t": "kb_sync"})),
+        ])
+
+        kb_markup = InlineKeyboardMarkup(rows)
+        try:
+            await update.effective_message.reply_text(sync_msg, reply_markup=kb_markup)
+        except Exception as e:
+            # На случай неожиданных проблем с кнопками
+            logger.exception("KB reply failed: %s", e)
+            await update.effective_message.reply_text(sync_msg + "\n(Кнопки недоступны, попробуйте ещё раз.)")
+
+    # ========== Сообщения ==========
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         st = self._ensure_dialog(update.effective_user.id)
         user_text = update.effective_message.text
 
         await self._send_typing(update.effective_chat.id, context)
-
-        kb_ctx_text = ""
-        if self.kb_retriever and st.kb_selected_docs:
+        kb_ctx = None
+        if st.kb_selected_docs and KB_AVAILABLE and self.kb_retriever and self.kb_ctx:
             try:
-                # ВАЖНО: передаём список path (идентификаторы из IndexedDoc.path)
-                chunks = await asyncio.to_thread(
-                    self.kb_retriever.retrieve, user_text, st.kb_selected_docs  # type: ignore[arg-type]
-                )
-                kb_ctx_text = self._prepare_kb_context(chunks)
+                chunks = await asyncio.to_thread(self.kb_retriever.retrieve, user_text, st.kb_selected_docs)
+                kb_ctx = self.kb_ctx.build_context(chunks)
             except Exception as e:
                 logger.warning("KB retrieve failed: %s", e)
 
@@ -455,7 +394,7 @@ class ChatGPTTelegramBot:
                 st.model or getattr(self.settings, "openai_model", None),
                 getattr(self.settings, "openai_temperature", 0.2),
                 st.style,
-                kb_ctx_text,
+                kb_ctx,
             )
             await update.effective_message.reply_text(reply)
         except Exception as e:
@@ -475,13 +414,11 @@ class ChatGPTTelegramBot:
             await update.effective_message.reply_text(f"Не удалось распознать аудио: {e}")
             return
 
-        kb_ctx_text = ""
-        if self.kb_retriever and st.kb_selected_docs:
+        kb_ctx = None
+        if st.kb_selected_docs and KB_AVAILABLE and self.kb_retriever and self.kb_ctx:
             try:
-                chunks = await asyncio.to_thread(
-                    self.kb_retriever.retrieve, transcript, st.kb_selected_docs  # type: ignore[arg-type]
-                )
-                kb_ctx_text = self._prepare_kb_context(chunks)
+                chunks = await asyncio.to_thread(self.kb_retriever.retrieve, transcript, st.kb_selected_docs)
+                kb_ctx = self.kb_ctx.build_context(chunks)
             except Exception as e:
                 logger.warning("KB retrieve failed: %s", e)
 
@@ -492,7 +429,7 @@ class ChatGPTTelegramBot:
                 st.model or getattr(self.settings, "openai_model", None),
                 getattr(self.settings, "openai_temperature", 0.2),
                 st.style,
-                kb_ctx_text,
+                kb_ctx,
             )
             await update.effective_message.reply_text(f"🎙️ Вы сказали: {transcript}\n\nОтвет:\n{reply}")
         except Exception as e:
@@ -501,8 +438,8 @@ class ChatGPTTelegramBot:
 
     async def on_file_or_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
-        При получении файла/фото: анализируем и даём краткое описание.
-        Добавление в БЗ делается через /kb (выбор документов), НЕ автоматически.
+        При получении файла/фото бот ТОЛЬКО анализирует и описывает,
+        а в БЗ добавление делается через /kb (не автоматически).
         """
         message = update.effective_message
         await self._send_typing(update.effective_chat.id, context)
@@ -511,9 +448,7 @@ class ChatGPTTelegramBot:
             if message.document:
                 file = await message.document.get_file()
                 content = await file.download_as_bytearray()
-                summary = await asyncio.to_thread(
-                    self.openai.describe_file, bytes(content), message.document.file_name
-                )
+                summary = await asyncio.to_thread(self.openai.describe_file, bytes(content), message.document.file_name)
                 await message.reply_text(f"📄 Файл получен: {message.document.file_name}\nАнализ:\n{summary}")
             elif message.photo:
                 file = await message.photo[-1].get_file()
@@ -524,9 +459,7 @@ class ChatGPTTelegramBot:
             logger.exception("file/photo analyze failed: %s", e)
             await message.reply_text(f"Не удалось проанализировать вложение: {e}")
 
-    # ------------------------------------------------------------------
-    #                          Inline callbacks
-    # ------------------------------------------------------------------
+    # ========== Inline callbacks ==========
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not query:
@@ -537,21 +470,62 @@ class ChatGPTTelegramBot:
         user_id = update.effective_user.id
         st = self._ensure_dialog(user_id)
 
-        # --------- model:<name> ---------
+        # --- Новый компактный формат: токен в data ---
+        if data.startswith(self._cb_prefix):
+            payload = self._cb_get(data)
+            if not payload:
+                await query.edit_message_text("Действие недоступно (истёк срок кнопки). Откройте /kb ещё раз.")
+                return
+
+            t = payload.get("t")
+
+            # toggle doc
+            if t == "kb_toggle":
+                path = payload.get("path")
+                if path:
+                    if path in st.kb_selected_docs:
+                        st.kb_selected_docs.remove(path)
+                    else:
+                        st.kb_selected_docs.append(path)
+                # Обновим отметку в списке (перерисуем интерфейс через cmd_kb)
+                await self.cmd_kb(update, context)
+                return
+
+            # apply selection (ничего не делаем дополнительно — просто подтверждаем)
+            if t == "kb_apply":
+                await query.edit_message_text(
+                    f"Выбрано документов: {len(st.kb_selected_docs)}. "
+                    f"{'Буду использовать БЗ.' if st.kb_selected_docs else 'БЗ отключена (нет выбранных документов).'}"
+                )
+                return
+
+            # re-sync
+            if t == "kb_sync":
+                # Перезапустим KB меню (оно само делает sync в начале)
+                await self.cmd_kb(update, context)
+                return
+
+            # noop — ничего
+            if t == "noop":
+                return
+
+            # Неподдерживаемый payload
+            await query.edit_message_text("Неизвестное действие.")
+            return
+
+        # --- Legacy колбэки (короткие строки) ---
         if data.startswith("model:"):
             name = data.split(":", 1)[1]
             st.model = name
             await query.edit_message_text(f"Модель установлена: {name}")
             return
 
-        # --------- mode:<name> ----------
         if data.startswith("mode:"):
             name = data.split(":", 1)[1]
             st.style = name
             await query.edit_message_text(f"Стиль установлен: {name}")
             return
 
-        # --------- dialogs --------------
         if data == "newdlg":
             dlg_id = self._next_dialog_id
             self._next_dialog_id += 1
@@ -575,70 +549,11 @@ class ChatGPTTelegramBot:
                 del self._dialogs_by_user[user_id][dlg_id]
                 if self._current_dialog_by_user.get(user_id) == dlg_id:
                     rest = list(self._dialogs_by_user.get(user_id, {}).keys())
-                    self._current_dialog_by_user[user_id] = rest[0] if rest else None
+                    self._current_dialog_by_user[user_id] = rest[0] if rest else None  # type: ignore[assignment]
                 await query.edit_message_text(f"Диалог #{dlg_id} удален.")
             else:
                 await query.edit_message_text("Диалог не найден.")
             return
 
-        # --------- KB -------------------
-        if data == "kb:sync":
-            if not (self.kb_indexer and self.kb_available):
-                await query.edit_message_text("Модуль базы знаний недоступен.")
-                return
-            try:
-                added, updated_cnt, deleted, unchanged = await asyncio.to_thread(self.kb_indexer.sync)  # type: ignore[arg-type]
-                prefix = (
-                    "Синхронизация завершена:\n"
-                    f"• Добавлено: {added}\n• Обновлено: {updated_cnt}\n• Удалено: {deleted}\n• Без изменений: {unchanged}\n\n"
-                    "Выберите документы:"
-                )
-            except Exception as e:
-                logger.exception("KB sync failed: %s", e)
-                prefix = "Не удалось синхронизировать. Выберите документы из текущего списка."
-            await query.edit_message_text(prefix)
-            await query.message.reply_text("Документы:", reply_markup=self._kb_render_menu(st))
-            return
-
-        if data.startswith("kb:toggle:"):
-            if not self.kb_available:
-                await query.edit_message_text("Модуль базы знаний недоступен.")
-                return
-            path = data.split(":", 2)[2]
-            if path in st.kb_selected_docs:
-                st.kb_selected_docs.remove(path)
-            else:
-                st.kb_selected_docs.append(path)
-            try:
-                await query.edit_message_reply_markup(reply_markup=self._kb_render_menu(st))
-            except Exception:
-                await query.message.reply_text("Документы:", reply_markup=self._kb_render_menu(st))
-            return
-
-        if data == "kb:close":
-            await query.edit_message_text(
-                f"Готово. Выбрано документов: {len(st.kb_selected_docs)}."
-            )
-            return
-
-        if data == "kb:nop":
-            return
-
-        await query.edit_message_text("Неизвестное действие.")
-
-    # ------------------------------------------------------------------
-    #                        Error handler (важно!)
-    # ------------------------------------------------------------------
-    async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        err = context.error
-        if isinstance(err, Conflict):
-            logger.error(
-                "Conflict: another getUpdates request is running. "
-                "Проверьте, что бот не запущен вторым процессом."
-            )
-            try:
-                await context.application.stop()
-            except Exception:
-                pass
-            return
-        logger.exception("Unhandled error: %s", err)
+        # Если сюда дошли — это что-то неизвестное
+        await query.edit_message_text("Нераспознанная кнопка.")
