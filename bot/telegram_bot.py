@@ -28,7 +28,9 @@ from telegram.ext import (
 )
 
 logger = logging.getLogger(__name__)
-
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("bot.knowledge_base.retriever").setLevel(logging.DEBUG)
+logging.getLogger("bot.knowledge_base.indexer").setLevel(logging.DEBUG)
 # --- Опциональная База Знаний (KB) ---
 KB_AVAILABLE = True
 try:
@@ -362,17 +364,24 @@ class ChatGPTTelegramBot:
         await self._send_typing(update.effective_chat.id, context)
 
         # Построение KB-контекста (если выбранные документы есть)
+        # ...
         kb_ctx = None
         if KB_AVAILABLE and self.kb_retriever and st.kb_selected_docs:
             try:
-                # Возвращаем объединённый контекст из выбранных документов,
-                # передавая пароли (в рамках сессии!)
+                logger.debug(
+                    "KB call: docs=%s, passwords=%s",
+                    st.kb_selected_docs,
+                    {k: "***" for k in st.kb_passwords.keys()}  # не логируем сами пароли
+                )
                 chunks = await asyncio.to_thread(
-                    self.kb_retriever.retrieve, user_text, list(st.kb_selected_docs), st.kb_passwords
+                    self.kb_retriever.retrieve,
+                    user_text,
+                    list(st.kb_selected_docs),
+                    st.kb_passwords
                 )
                 if chunks:
-                    # Простой конкат: короткие выдержки
                     kb_ctx = "\n\n".join(chunks)
+                logger.debug("KB result: chunks=%d, ctx_len=%d", len(chunks or []), len(kb_ctx or ""))
             except Exception as e:
                 logger.warning("KB retrieve failed: %s", e)
 
@@ -407,11 +416,20 @@ class ChatGPTTelegramBot:
         kb_ctx = None
         if KB_AVAILABLE and self.kb_retriever and st.kb_selected_docs:
             try:
+                logger.debug(
+                    "KB call: docs=%s, passwords=%s",
+                    st.kb_selected_docs,
+                    {k: "***" for k in st.kb_passwords.keys()}  # не логируем сами пароли
+                )
                 chunks = await asyncio.to_thread(
-                    self.kb_retriever.retrieve, transcript, list(st.kb_selected_docs), st.kb_passwords
+                    self.kb_retriever.retrieve,
+                    user_text,
+                    list(st.kb_selected_docs),
+                    st.kb_passwords
                 )
                 if chunks:
                     kb_ctx = "\n\n".join(chunks)
+                logger.debug("KB result: chunks=%d, ctx_len=%d", len(chunks or []), len(kb_ctx or ""))
             except Exception as e:
                 logger.warning("KB retrieve failed: %s", e)
 
