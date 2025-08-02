@@ -472,24 +472,24 @@ class ChatGPTTelegramBot:
         if not query:
             return
         await query.answer()
-
+    
         data = (query.data or "").strip()
         user_id = update.effective_user.id
         st = self._ensure_dialog(user_id)
-
-        # Работа с моделью/режимом/диалогами (как было)
+    
+        # ========== Model, Mode, Dialog controls ==========
         if data.startswith("model:"):
             name = data.split(":", 1)[1]
             st.model = name
             await query.edit_message_text(f"Модель установлена: {name}")
             return
-
+    
         if data.startswith("mode:"):
             name = data.split(":", 1)[1]
             st.style = name
             await query.edit_message_text(f"Стиль установлен: {name}")
             return
-
+    
         if data == "newdlg":
             dlg_id = self._next_dialog_id
             self._next_dialog_id += 1
@@ -497,7 +497,7 @@ class ChatGPTTelegramBot:
             self._current_dialog_by_user[user_id] = dlg_id
             await query.edit_message_text("Создан новый диалог.")
             return
-
+    
         if data.startswith("open:"):
             dlg_id = int(data.split(":", 1)[1])
             if dlg_id in self._dialogs_by_user.get(user_id, {}):
@@ -506,7 +506,7 @@ class ChatGPTTelegramBot:
             else:
                 await query.edit_message_text("Диалог не найден.")
             return
-
+    
         if data.startswith("del:"):
             dlg_id = int(data.split(":", 1)[1])
             if dlg_id in self._dialogs_by_user.get(user_id, {}):
@@ -518,21 +518,24 @@ class ChatGPTTelegramBot:
             else:
                 await query.edit_message_text("Диалог не найден.")
             return
-
-        # ===== KB callbacks =====
+    
+        # ======== Knowledge Base (KB) callbacks ========
         if data == "kb:resync":
-            # просто перезапускаем /kb
+            # Перезапустить выбор БЗ
             await self.cmd_kb(update, context)
             return
-
+    
+        # Сохранить выбор и сразу включить KB
         if data == "kb:save":
+            st.kb_enabled = True
             await query.edit_message_text(f"Выбрано документов: {len(st.kb_selected_docs)}. Буду использовать БЗ.")
             return
-
-        # map индексов
-        kb_idx_map = context.chat_data.get("kb_idx_map") or {}
-        paths: Dict[int, str] = (kb_idx_map.get("paths") or {}) if isinstance(kb_idx_map, dict) else {}
-
+    
+        # Получаем карту индексов (idx → путь) из chat_data
+        kb_idx_map = context.chat_data.get("kb_idx_map", {})
+        paths: Dict[int, str] = kb_idx_map.get("paths", {})
+    
+        # Переключить галочку выбора документа
         if data.startswith("kb:toggle:"):
             try:
                 idx = int(data.split(":", 2)[2])
@@ -542,14 +545,15 @@ class ChatGPTTelegramBot:
                     return
                 if path in st.kb_selected_docs:
                     st.kb_selected_docs.remove(path)
-                    st.kb_passwords.pop(path, None)  # пароль стираем, если сняли выбор
+                    st.kb_passwords.pop(path, None)
                 else:
                     st.kb_selected_docs.append(path)
                 await query.answer("Ок")
             except Exception as e:
                 await query.answer(f"Ошибка: {e}", show_alert=True)
             return
-
+    
+        # Запросить пароль для запароленного PDF
         if data.startswith("kb:pwd:"):
             try:
                 idx = int(data.split(":", 2)[2])
@@ -560,11 +564,15 @@ class ChatGPTTelegramBot:
                 if path not in st.kb_selected_docs:
                     await query.answer("Сначала отметьте документ галочкой.", show_alert=True)
                     return
+                # Запоминаем, для какого path ожидаем пароль
                 st.kb_await_pwd_for_path = path
                 await query.edit_message_text(
-                    f"🔑 Введите пароль для файла: {path.split('/')[-1]}\n"
-                    f"Ответьте сообщением с паролем. Пароль сохранится только в рамках текущего диалога."
+                    f"🔑 Введите пароль для файла: {os.path.basename(path)}\n"
+                    "Ответьте сообщением с паролем. "
+                    "Пароль сохранится только в рамках текущего диалога."
                 )
             except Exception as e:
                 await query.answer(f"Ошибка: {e}", show_alert=True)
             return
+    
+        # Любой другой callback — игнорируем
