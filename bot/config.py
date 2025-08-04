@@ -15,7 +15,7 @@ try:
 except Exception:
     PdfReader = None
 
-from bot.config import settings  # added: use dynamic chunking parameters
+from bot.config import settings  # Используем параметры из настроек
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +25,12 @@ class KnowledgeBaseRetriever:
     Упрощённый ретривер:
       - скачивает файлы с Я.Диска по точному пути disk:/... через Client.download(path, local_path)
       - извлекает текст (PDF, TXT/MD, DOCX)
-      - режет на простые чанки и возвращает список строк
+      - режет на чанки по настройкам из bot.config.settings и возвращает список строк
     Пароли к PDF передаются в параметре passwords[path] и живут только в сессии.
     """
 
-    def __init__(self, settings):
-        self._token = getattr(settings, "yandex_disk_token", None) or getattr(settings, "yadisk_token", None)
+    def __init__(self):
+        self._token = settings.yandex_disk_token or getattr(settings, "yadisk_token", None)
         if not self._token:
             logger.warning("KB Retriever: Yandex token not found")
         if yadisk is None:
@@ -65,10 +65,10 @@ class KnowledgeBaseRetriever:
                 logger.debug("KB Retriever: no text extracted from %s", disk_path)
                 continue
 
-            # use dynamic settings for chunking
-            chunk_size = settings.chunk_size        # e.g. 1600
-            overlap    = settings.chunk_overlap     # e.g. 200
-            max_chunks = settings.max_kb_chunks     # e.g. 6
+            # Используем динамические настройки для нарезки
+            chunk_size = settings.chunk_size       # по умолчанию 1600
+            overlap    = settings.chunk_overlap    # по умолчанию 200
+            max_chunks = settings.max_kb_chunks    # по умолчанию 6
             chunks = self._chunk(
                 text,
                 chunk_size=chunk_size,
