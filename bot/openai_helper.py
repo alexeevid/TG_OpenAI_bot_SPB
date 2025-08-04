@@ -67,12 +67,21 @@ class OpenAIHelper:
         Если передан kb_ctx — добавляем контекст отдельным сообщением, чтобы повысить релевантность.
         """
         chat_model = model or self.default_chat_model
-    
+
         if kb_ctx:
             messages = [
-                {"role": "system", "content": "Ты помощник, который отвечает на вопросы пользователя, используя нижеуказанный контекст из базы знаний. Если в контексте нет ответа, честно скажи, что не знаешь."},
-                {"role": "user", "content": f"Контекст:\n{kb_ctx}"},
-                {"role": "user", "content": user_text},
+                {
+                    "role": "system",
+                    "content": "Ты помощник, который отвечает на вопросы пользователя, используя нижеуказанный контекст из базы знаний. Если в контексте нет ответа, честно скажи, что не знаешь."
+                },
+                {
+                    "role": "user",
+                    "content": f"Контекст:\n{kb_ctx}"
+                },
+                {
+                    "role": "user",
+                    "content": user_text
+                },
             ]
         else:
             system_msg = [
@@ -84,7 +93,12 @@ class OpenAIHelper:
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
             ]
-    
+
+        # Включаем логирование промпта/messages для отладки
+        logger.debug("PROMPT to OpenAI:\n%s", messages)
+        # Если хочешь видеть сразу — можешь раскомментировать:
+        # print("PROMPT to OpenAI:\n", messages)
+
         try:
             resp = self._client.chat.completions.create(
                 model=chat_model,
@@ -100,7 +114,7 @@ class OpenAIHelper:
             logger.error("chat() APIError: %s", e)
         except Exception as e:  # pragma: no cover
             logger.error("chat() failed: %s", e)
-    
+
         return "Извините, не удалось получить ответ от модели."
 
     # --- Изображения ---
