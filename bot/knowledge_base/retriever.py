@@ -15,6 +15,8 @@ try:
 except Exception:
     PdfReader = None
 
+from bot.config import settings  # added: use dynamic chunking parameters
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,7 +65,17 @@ class KnowledgeBaseRetriever:
                 logger.debug("KB Retriever: no text extracted from %s", disk_path)
                 continue
 
-            chunks = self._chunk(text, chunk_size=1600, overlap=200, max_chunks=6)
+            # use dynamic settings for chunking
+            chunk_size = settings.chunk_size        # e.g. 1600
+            overlap    = settings.chunk_overlap     # e.g. 200
+            max_chunks = settings.max_kb_chunks     # e.g. 6
+            chunks = self._chunk(
+                text,
+                chunk_size=chunk_size,
+                overlap=overlap,
+                max_chunks=max_chunks
+            )
+
             logger.debug(
                 "KB Retriever: %s -> text_len=%d, chunks=%d",
                 disk_path, len(text), len(chunks)
@@ -78,8 +90,6 @@ class KnowledgeBaseRetriever:
         """Скачивает disk_path во временный файл и извлекает текст по типу."""
         suffix = os.path.splitext(disk_path)[1].lower() or ""
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-            # ВАЖНО: используем НАДЁЖНЫЙ путь — прямой download по path,
-            # без get_download_link (он иногда даёт 404 на сложных путях).
             try:
                 logger.debug("KB Retriever: download %s -> %s", disk_path, tmp.name)
                 y.download(disk_path, tmp.name)  # type: ignore
@@ -113,7 +123,6 @@ class KnowledgeBaseRetriever:
                     logger.warning("KB Retriever: read docx error %s: %s", disk_path, e)
                     return ""
             else:
-                # пока пропускаем прочие форматы
                 return ""
 
     def _extract_pdf(self, file_path: str, disk_path: str, password: Optional[str]) -> str:
@@ -128,8 +137,8 @@ class KnowledgeBaseRetriever:
                         logger.warning("KB Retriever: %s is encrypted, no password", disk_path)
                         return ""
                     try:
-                        res = reader.decrypt(password)  # may return int/None; главное — доступ к pages
-                        _ = reader.pages[0]  # принудительно проверяем доступ
+                        res = reader.decrypt(password)
+                        _ = reader.pages[0]
                         logger.debug("KB Retriever: %s decrypt result=%s", disk_path, res)
                     except Exception:
                         logger.warning("KB Retriever: %s wrong password", disk_path)
