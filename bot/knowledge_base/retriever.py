@@ -75,7 +75,10 @@ class KnowledgeBaseRetriever:
                 overlap=overlap,
                 max_chunks=max_chunks
             )
-
+            # --- диагностика: печать первых 5 чанков
+            for idx, chunk in enumerate(chunks[:5]):
+                logger.debug("🧩 Retriever chunk #%d preview: «%s»", idx, chunk[:120].replace("\n", " "))
+            # -----------------------------------------------
             logger.debug(
                 "KB Retriever: %s -> text_len=%d, chunks=%d",
                 disk_path, len(text), len(chunks)
