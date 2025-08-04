@@ -64,33 +64,27 @@ class OpenAIHelper:
     ) -> str:
         """
         Унифицированный чат-вызов.
-        ВАЖНО: если передан kb_ctx — подмешиваем в system с сильной инструкцией.
+        Если передан kb_ctx — добавляем контекст отдельным сообщением, чтобы повысить релевантность.
         """
         chat_model = model or self.default_chat_model
-
-        # Базовый system-подсказ
-        system_msg = [
-            "You are a helpful assistant.",
-            f"Answer concisely with a {style} tone.",
-        ]
-
-        # Если есть контекст из БЗ — просим модель опираться ТОЛЬКО на него
+    
         if kb_ctx:
-            system_msg.append(
-                "You MUST answer using ONLY the knowledge snippets below. "
-                "If the snippets are not relevant or do not contain the answer, say you don't know.\n"
-                "### KNOWLEDGE SNIPPETS START ###\n"
-                f"{kb_ctx}\n"
-                "### KNOWLEDGE SNIPPETS END ###"
-            )
-
-        system_text = "\n".join(system_msg)
-
-        messages = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
-        ]
-
+            messages = [
+                {"role": "system", "content": "Ты помощник, который отвечает на вопросы пользователя, используя нижеуказанный контекст из базы знаний. Если в контексте нет ответа, честно скажи, что не знаешь."},
+                {"role": "user", "content": f"Контекст:\n{kb_ctx}"},
+                {"role": "user", "content": user_text},
+            ]
+        else:
+            system_msg = [
+                "You are a helpful assistant.",
+                f"Answer concisely with a {style} tone.",
+            ]
+            system_text = "\n".join(system_msg)
+            messages = [
+                {"role": "system", "content": system_text},
+                {"role": "user", "content": user_text},
+            ]
+    
         try:
             resp = self._client.chat.completions.create(
                 model=chat_model,
@@ -106,7 +100,7 @@ class OpenAIHelper:
             logger.error("chat() APIError: %s", e)
         except Exception as e:  # pragma: no cover
             logger.error("chat() failed: %s", e)
-
+    
         return "Извините, не удалось получить ответ от модели."
 
     # --- Изображения ---
