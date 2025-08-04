@@ -12,7 +12,7 @@ psycopg2-binary>=2.9.9,<3
 yadisk>=3.4.0
 
 # Для работы БЗ/парсинга документов:
-pypdf>=4.2.0
-PyPDF2>=3.0.0
+pypdf>=4.8.0
+faiss-cpu>=1.7.4 
 python-docx>=1.1.0
 numpy>=1.26.0
