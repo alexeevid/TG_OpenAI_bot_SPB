@@ -1,8 +1,10 @@
 # bot/knowledge_base/context_manager.py
 from __future__ import annotations
 
+import logging
 from typing import Iterable, List
 
+logger = logging.getLogger(__name__)
 
 class ContextManager:
     """
@@ -10,7 +12,7 @@ class ContextManager:
     Если в будущем появится векторный БД/цитирование — можно заменить здесь.
     """
 
-    def __init__(self, settings = None):
+    def __init__(self, settings=None):
         self.settings = settings
 
     def build_context(self, chunks: Iterable[str]) -> str:
@@ -19,4 +21,7 @@ class ContextManager:
             if not ch:
                 continue
             parts.append(f"[CHUNK {i}]\n{ch}")
-        return "\n\n".join(parts)
+        context = "\n\n".join(parts)
+        # --- диагностика: вывод полного контекста перед формированием prompt ---
+        logger.debug("🧠 Built context from %d chunks:\n%s", len(parts), context)
+        return context
