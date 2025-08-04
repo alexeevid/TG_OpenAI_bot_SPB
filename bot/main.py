@@ -1,6 +1,4 @@
 # bot/main.py
-from __future__ import annotations
-
 import logging
 from telegram.ext import Application
 from telegram import BotCommand
@@ -9,9 +7,13 @@ from bot.config import load_settings
 from bot.telegram_bot import ChatGPTTelegramBot
 from bot.openai_helper import OpenAIHelper
 
+# ——— Включаем DEBUG-логи для всего приложения ——————————————————
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)-5s %(name)s: %(message)s"
+)
+# ——————————————————————————————————————————————————————————
 
 def build_application() -> Application:
     settings = load_settings()
