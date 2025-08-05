@@ -5,6 +5,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from bot.dialog_manager import DialogManager
+dialog_manager = DialogManager()
 
 from telegram import (
     Update,
@@ -134,7 +136,7 @@ class ChatGPTTelegramBot:
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_or_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
-
+        app.add_handler(CommandHandler("kb_diag", kb_diag))
         # Inline callbacks
         app.add_handler(CallbackQueryHandler(self.on_callback))
 
