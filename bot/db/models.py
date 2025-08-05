@@ -1,28 +1,23 @@
-from datetime import datetime
-from typing import Optional
-from sqlalchemy.orm import declarative_base, Mapped, mapped_column
-from sqlalchemy import Integer, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, Text, BigInteger, TIMESTAMP
+from sqlalchemy.ext.declarative import declarative_base
 
 Base = declarative_base()
 
-class Document(Base):
-    __tablename__ = "documents"
+class Dialog(Base):
+    __tablename__ = "dialogs"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, nullable=False)
+    dialog_id = Column(String(64), nullable=False)
+    created_at = Column(TIMESTAMP, nullable=False)
+    documents = Column(Text)  # храним список id документов в json или str
+    status = Column(String(32), default="active")
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    path: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False)
-    title: Mapped[str] = mapped_column(String(512), nullable=False)
-    # 👇 Новое поле — маппинг на существующую колонку в БД
-    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-
-    mime: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    chat_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
-    title: Mapped[str] = mapped_column(String(256), default="Диалог", nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+class Message(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True)
+    dialog_id = Column(String(64), nullable=False)
+    message_id = Column(String(64))
+    role = Column(String(16))
+    text = Column(Text)
+    kb_chunks = Column(Text)  # список id чанков через запятую или json
+    timestamp = Column(TIMESTAMP, nullable=False)
