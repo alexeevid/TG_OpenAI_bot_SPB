@@ -24,6 +24,7 @@ from .dialog_manager import DialogManager
 from .openai_helper import OpenAIHelper
 from .knowledge_base.indexer import KnowledgeBaseIndexer
 from .knowledge_base.retriever import KnowledgeBaseRetriever
+from .db.session import engine  # ✅ для временной команды fix_db
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,25 @@ class ChatGPTTelegramBot:
         await update.message.reply_text("Привет! Я готов к работе.")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Список команд: /dialogs /rename /export /kb /kb_diag /model /mode /img /web /stats")
+        await update.message.reply_text("Список команд: /dialogs /rename /export /kb /kb_diag /model /mode /img /web /stats /fix_db")
+
+    async def cmd_fix_db(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Временная команда для добавления недостающих колонок в таблицу dialogs"""
+        admin_id = 540532439  # замени на свой Telegram ID
+        if update.effective_user.id != admin_id:
+            await update.message.reply_text("⛔ Нет доступа")
+            return
+
+        with engine.connect() as conn:
+            conn.execute("""
+                ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMP DEFAULT now();
+                ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS model TEXT;
+                ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS style TEXT;
+                ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS kb_documents JSON DEFAULT '[]';
+            """)
+            conn.commit()
+
+        await update.message.reply_text("✅ Структура таблицы dialogs обновлена.")
 
     async def cmd_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -162,31 +181,26 @@ class ChatGPTTelegramBot:
         user_id = update.effective_user.id
         text = update.message.text.strip()
 
-        # Если ждём переименование
         if user_id in self.awaiting_rename:
             dlg_id = self.awaiting_rename.pop(user_id)
             self.dialog_manager.rename_dialog(dlg_id, user_id, text)
             await update.message.reply_text(f"Диалог переименован в: {text}")
             return
 
-        # Если ждём пароль
         if user_id in self.awaiting_kb_pwd:
             idx = self.awaiting_kb_pwd.pop(user_id)
-            # Здесь логика сохранения пароля к документу
+            # Здесь логика сохранения пароля
             await update.message.reply_text("🔑 Пароль сохранён.")
             return
 
-        # Основная логика
         current_dlg = self.current_dialog_by_user.get(user_id)
         if not current_dlg:
             dlg = self.dialog_manager.create_dialog(user_id)
             self.current_dialog_by_user[user_id] = dlg.id
             current_dlg = dlg.id
 
-        # Сохраняем сообщение пользователя
         self.dialog_manager.add_message(current_dlg, "user", text)
-
-        kb_ctx = None  # Здесь можно интегрировать KB контекст
+        kb_ctx = None
         dlg_obj = self.dialog_manager.get_dialog(current_dlg, user_id)
 
         reply = await self.openai.chat(
@@ -198,8 +212,5 @@ class ChatGPTTelegramBot:
             model=dlg_obj.model
         )
 
-        # Сохраняем ответ ассистента
         self.dialog_manager.add_message(current_dlg, "assistant", reply)
-
         await update.message.reply_text(reply)
-
