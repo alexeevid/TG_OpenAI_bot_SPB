@@ -141,6 +141,19 @@ class ChatGPTTelegramBot:
         app.add_handler(CallbackQueryHandler(self.on_callback))
 
     # ========= Вспомогательные =========
+    async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        dlg = dialog_manager.get_active_dialog(user_id)
+        if not dlg:
+            await update.message.reply_text("Нет активного диалога.")
+            return
+        docs = dlg.documents or "(нет документов)"
+        msgs = dialog_manager.get_dialog_messages(dlg.dialog_id)
+        answer = f"Диалог: {dlg.dialog_id}\nДокументы KB: {docs}\n\nИстория сообщений:\n"
+        for m in msgs:
+            answer += f"[{m.role}] {m.text[:60]}{'...' if len(m.text)>60 else ''}\n"
+        await update.message.reply_text(answer)
+    
     def _ensure_dialog(self, user_id: int) -> DialogState:
         user_dialogs = self._dialogs_by_user.setdefault(user_id, {})
         if user_id not in self._current_dialog_by_user:
