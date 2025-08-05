@@ -10,6 +10,19 @@ from openai import OpenAI, APIError, BadRequestError  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+# --- Маппинг ключей для передачи стиля ---
+STYLE_MAP = {
+    "Pro": "Профессионал",
+    "Expert": "Эксперт",
+    "User": "Пользователь",
+    "CEO": "СЕО",
+    # На всякий случай — русские тоже в себя
+    "Профессионал": "Профессионал",
+    "Эксперт": "Эксперт",
+    "Пользователь": "Пользователь",
+    "СЕО": "СЕО",
+}
+
 ROLE_SYSTEM_PROMPTS = {
     "Эксперт": (
         "Ты обязан отвечать только как ведущий эксперт по управлению проектами, использовать сложную профессиональную лексику, стандарты (PMI, PMBOK, Agile, Lean), делать ссылки на методологии, приводить детальные примеры ошибок и best practices. "
@@ -67,39 +80,21 @@ FEW_SHOT_EXAMPLES = {
 class OpenAIHelper:
     """
     Обёртка над OpenAI SDK с единым интерфейсом для бота.
-    Основной сценарий — Chat Completions; Responses API намеренно не используем
-    как primary, чтобы избежать ошибок несовместимости.
     """
 
     def __init__(self, api_key: str):
         if not api_key:
             raise ValueError("OpenAI API key is required")
-        # Клиент v1 (openai>=1.30.0)
         self._client = OpenAI(api_key=api_key)
-
-        # Базовые модели по умолчанию
         self.default_chat_model = os.getenv("OPENAI_MODEL", "gpt-4o")
         self.default_image_model = os.getenv("IMAGE_MODEL", "gpt-image-1")
         self.default_embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-
-        # Белый список моделей для меню (по желанию через переменную окружения)
-        # Пример: "gpt-4o,gpt-4o-mini,o4-mini"
         self._whitelist_env = os.getenv("ALLOWED_MODELS_WHITELIST", "")
 
-    # ---------------------------------------------------------------------
-    # Публичный API, которым пользуется Telegram-бот
-    # ---------------------------------------------------------------------
-
     def list_models_for_menu(self) -> List[str]:
-        """
-        Короткий список моделей для меню выбора в боте.
-        Если задан ALLOWED_MODELS_WHITELIST — берём его.
-        Иначе возвращаем безопасный набор.
-        """
         if self._whitelist_env.strip():
             items = [m.strip() for m in self._whitelist_env.split(",") if m.strip()]
             return items or [self.default_chat_model]
-
         return [
             "gpt-4o",
             "gpt-4o-mini",
@@ -115,14 +110,12 @@ class OpenAIHelper:
         style: str = "Pro",
         kb_ctx: Optional[str] = None,
     ) -> str:
-        """
-        Унифицированный чат-вызов.
-        Если передан kb_ctx — подмешиваем контекст, иначе используем роль и few-shot.
-        """
         chat_model = model or self.default_chat_model
 
+        # --- Маппинг стиля на правильный ключ словаря ---
+        mapped_style = STYLE_MAP.get(style, style)
+
         if kb_ctx:
-            # Для режима с БЗ сохраняем нейтральную system prompt (можно доработать)
             messages = [
                 {
                     "role": "system",
@@ -138,17 +131,15 @@ class OpenAIHelper:
                 },
             ]
         else:
-            system_text = ROLE_SYSTEM_PROMPTS.get(style)
+            system_text = ROLE_SYSTEM_PROMPTS.get(mapped_style)
             if not system_text:
                 system_text = "You are a helpful assistant. Answer concisely and clearly."
-            few_shot = FEW_SHOT_EXAMPLES.get(style, [])
+            few_shot = FEW_SHOT_EXAMPLES.get(mapped_style, [])
             messages = [{"role": "system", "content": system_text}]
             messages.extend(few_shot)
             messages.append({"role": "user", "content": user_text})
 
-        # Логирование prompt/messages для диагностики
         logger.debug("PROMPT to OpenAI:\n%s", messages)
-        # print("PROMPT to OpenAI:\n", messages)  # Можно раскомментировать для stdout
 
         try:
             resp = self._client.chat.completions.create(
@@ -171,13 +162,8 @@ class OpenAIHelper:
     # --- Изображения ---
 
     def generate_image(self, prompt: str, size: Optional[str] = None) -> Tuple[bytes, str]:
-        """
-        Генерирует изображение через Images API.
-        Возвращает кортеж (raw_png_bytes, used_prompt).
-        """
         model = self.default_image_model
         img_size = size or "1024x1024"
-
         try:
             res = self._client.images.generate(
                 model=model,
@@ -194,15 +180,10 @@ class OpenAIHelper:
     # --- Аудио ---
 
     def transcribe_audio(self, audio_bytes: bytes) -> str:
-        """
-        Транскрипция через Whisper.
-        """
         try:
-            # Сохраняем во временный файл (httpx в SDK ожидает file-like)
             tmp = "/tmp/voice.ogg"
             with open(tmp, "wb") as f:
                 f.write(audio_bytes)
-
             with open(tmp, "rb") as f:
                 tr = self._client.audio.transcriptions.create(
                     model="whisper-1",
@@ -217,10 +198,6 @@ class OpenAIHelper:
     # --- Простые описатели для вложений ---
 
     def describe_file(self, file_bytes: bytes, filename: str) -> str:
-        """
-        Очень простой «описатель» файла без реального vision.
-        Для PDF/текста можно добавить локальные эвристики.
-        """
         name = filename or "file"
         size_kb = len(file_bytes) // 1024
         return f"Файл: {name}, размер ~{size_kb} KB. Поддержка глубокой семантической выжимки не включена."
@@ -232,9 +209,6 @@ class OpenAIHelper:
     # --- Веб-поиск (заглушка) ---
 
     def web_answer(self, query: str) -> Tuple[str, List[str]]:
-        """
-        Заглушка. При необходимости подключим внешний сервис/инструмент.
-        """
         answer = (
             "В этой сборке веб-поиск отключён. "
             "Могу ответить на основании вашего контекста/БЗ, если он включён."
