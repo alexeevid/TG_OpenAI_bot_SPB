@@ -1,105 +1,177 @@
-from sqlalchemy.orm import Session
 from datetime import datetime
-from typing import List, Optional, Tuple
-from bot.db.session import SessionLocal
-from bot.db.models import Dialog, Message
+from typing import List, Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
+from .db.models import Dialog, Message
+from .db.session import SessionLocal
+
 
 class DialogManager:
+    """
+    Класс для работы с диалогами и сообщениями через PostgreSQL.
+    """
+
     def __init__(self):
-        # Можно добавить кеш при необходимости
         pass
 
-    def create_dialog(self, user_id: int, title: Optional[str] = None) -> Dialog:
+    def create_dialog(self, user_id: int, title: Optional[str] = None,
+                      model: Optional[str] = None, style: Optional[str] = None,
+                      kb_docs: Optional[list] = None) -> Dialog:
+        """
+        Создание нового диалога.
+        """
         with SessionLocal() as db:
-            if not title:
-                title = "Диалог"
-            dlg = Dialog(user_id=user_id, title=title)
-            db.add(dlg)
+            dialog = Dialog(
+                user_id=user_id,
+                title=title or "Диалог",
+                created_at=datetime.utcnow(),
+                last_message_at=datetime.utcnow(),
+                is_deleted=False,
+                model=model,
+                style=style,
+                kb_documents=kb_docs or []
+            )
+            db.add(dialog)
             db.commit()
-            db.refresh(dlg)
-            return dlg
+            db.refresh(dialog)
+            return dialog
 
     def get_active_dialogs(self, user_id: int) -> List[Dialog]:
+        """
+        Получение всех активных (не удалённых) диалогов пользователя.
+        """
         with SessionLocal() as db:
-            return db.query(Dialog).filter_by(user_id=user_id, is_deleted=False).order_by(Dialog.updated_at.desc()).all()
+            return (
+                db.query(Dialog)
+                .filter(Dialog.user_id == user_id, Dialog.is_deleted == False)
+                .order_by(desc(Dialog.last_message_at))
+                .all()
+            )
 
-    def get_dialog(self, dialog_id: int, user_id: Optional[int] = None) -> Optional[Dialog]:
+    def get_active_dialog(self, user_id: int) -> Optional[Dialog]:
+        """
+        Получить последний активный диалог пользователя.
+        """
         with SessionLocal() as db:
-            q = db.query(Dialog).filter_by(id=dialog_id)
-            if user_id is not None:
-                q = q.filter_by(user_id=user_id)
-            return q.first()
+            return (
+                db.query(Dialog)
+                .filter(Dialog.user_id == user_id, Dialog.is_deleted == False)
+                .order_by(desc(Dialog.last_message_at))
+                .first()
+            )
 
-    def soft_delete_dialog(self, dialog_id: int, user_id: Optional[int] = None) -> bool:
+    def get_dialog(self, dialog_id: int, user_id: int) -> Optional[Dialog]:
+        """
+        Получение диалога по ID (с проверкой пользователя).
+        """
         with SessionLocal() as db:
-            q = db.query(Dialog).filter_by(id=dialog_id)
-            if user_id is not None:
-                q = q.filter_by(user_id=user_id)
-            dlg = q.first()
-            if dlg:
-                dlg.is_deleted = True
+            return (
+                db.query(Dialog)
+                .filter(Dialog.id == dialog_id, Dialog.user_id == user_id)
+                .first()
+            )
+
+    def rename_dialog(self, dialog_id: int, user_id: int, new_title: str) -> bool:
+        """
+        Переименование диалога.
+        """
+        with SessionLocal() as db:
+            dialog = (
+                db.query(Dialog)
+                .filter(Dialog.id == dialog_id, Dialog.user_id == user_id)
+                .first()
+            )
+            if dialog:
+                dialog.title = new_title
                 db.commit()
                 return True
             return False
 
-    def rename_dialog(self, dialog_id: int, new_title: str, user_id: Optional[int] = None) -> bool:
+    def soft_delete_dialog(self, dialog_id: int, user_id: int) -> bool:
+        """
+        Мягкое удаление диалога.
+        """
         with SessionLocal() as db:
-            q = db.query(Dialog).filter_by(id=dialog_id)
-            if user_id is not None:
-                q = q.filter_by(user_id=user_id)
-            dlg = q.first()
-            if dlg:
-                dlg.title = new_title
-                dlg.updated_at = datetime.now()
+            dialog = (
+                db.query(Dialog)
+                .filter(Dialog.id == dialog_id, Dialog.user_id == user_id)
+                .first()
+            )
+            if dialog:
+                dialog.is_deleted = True
                 db.commit()
                 return True
             return False
 
-    def add_message(self, dialog_id: int, role: str, text: str) -> Optional[Message]:
+    def export_dialog(self, dialog_id: int, user_id: int) -> Optional[str]:
+        """
+        Экспорт диалога в формате Markdown.
+        """
         with SessionLocal() as db:
-            dlg = db.query(Dialog).filter_by(id=dialog_id, is_deleted=False).first()
-            if not dlg:
+            messages = (
+                db.query(Message)
+                .filter(Message.dialog_id == dialog_id)
+                .order_by(Message.timestamp)
+                .all()
+            )
+            if not messages:
                 return None
-            msg = Message(dialog_id=dialog_id, role=role, text=text)
-            dlg.updated_at = datetime.now()
-            db.add(msg)
+            md_lines = []
+            for m in messages:
+                role_prefix = "**Пользователь:**" if m.role == "user" else "**Ассистент:**"
+                md_lines.append(f"{role_prefix} {m.content}")
+            return "\n\n".join(md_lines)
+
+    def add_message(self, dialog_id: int, role: str, text: str) -> None:
+        """
+        Добавить сообщение в диалог.
+        """
+        with SessionLocal() as db:
+            message = Message(
+                dialog_id=dialog_id,
+                role=role,
+                content=text,
+                timestamp=datetime.utcnow()
+            )
+            db.add(message)
+            dialog = db.query(Dialog).filter(Dialog.id == dialog_id).first()
+            if dialog:
+                dialog.last_message_at = datetime.utcnow()
             db.commit()
-            db.refresh(msg)
-            return msg
 
-    def get_messages(self, dialog_id: int, limit: Optional[int] = None) -> List[Message]:
+    def get_messages(self, dialog_id: int, limit: int = 10) -> List[Message]:
+        """
+        Получить последние N сообщений диалога.
+        """
         with SessionLocal() as db:
-            q = db.query(Message).filter_by(dialog_id=dialog_id).order_by(Message.created_at.asc())
-            if limit:
-                q = q.limit(limit)
-            return q.all()
+            return (
+                db.query(Message)
+                .filter(Message.dialog_id == dialog_id)
+                .order_by(desc(Message.timestamp))
+                .limit(limit)
+                .all()
+            )
 
-    def get_last_message(self, dialog_id: int) -> Optional[Message]:
+    def update_model(self, dialog_id: int, user_id: int, model: str) -> bool:
+        """
+        Обновить модель, закреплённую за диалогом.
+        """
         with SessionLocal() as db:
-            return db.query(Message).filter_by(dialog_id=dialog_id).order_by(Message.created_at.desc()).first()
+            dialog = self.get_dialog(dialog_id, user_id)
+            if dialog:
+                dialog.model = model
+                db.commit()
+                return True
+            return False
 
-    def generate_summary(self, dialog_id: int) -> str:
-        """Генерация краткого заголовка диалога (по первым 1-2 сообщениям пользователя)."""
+    def update_style(self, dialog_id: int, user_id: int, style: str) -> bool:
+        """
+        Обновить стиль (роль) для диалога.
+        """
         with SessionLocal() as db:
-            msgs = db.query(Message).filter_by(dialog_id=dialog_id).order_by(Message.created_at.asc()).limit(2).all()
-            summary = ""
-            for msg in msgs:
-                if msg.role == "user":
-                    summary += (msg.text[:50] + ("…" if len(msg.text) > 50 else "")) + " "
-            summary = summary.strip() or "Диалог"
-            return summary[:64]  # Ограничим длину
-
-    def update_title_by_summary(self, dialog_id: int) -> None:
-        """Обновить заголовок по автосгенерированному summary."""
-        summary = self.generate_summary(dialog_id)
-        self.rename_dialog(dialog_id, summary)
-
-    def export_dialog(self, dialog_id: int) -> str:
-        """Выгрузить диалог в формате Markdown."""
-        with SessionLocal() as db:
-            dlg = db.query(Dialog).filter_by(id=dialog_id).first()
-            if not dlg:
-                return "Диалог не найден."
-            msgs = db.query(Message).filter_by(dialog_id=dialog_id).order_by(Message.created_at.asc()).all()
-            lines = [f"# Диалог: {dlg.title}\nДата создания: {dlg.created_at.strftime('%Y.%m.%d %H:%M')}\n"]
-            for msg
+            dialog = self.get_dialog(dialog_id, user_id)
+            if dialog:
+                dialog.style = style
+                db.commit()
+                return True
+            return False
