@@ -117,11 +117,12 @@ class OpenAIHelper:
     ) -> str:
         """
         Унифицированный чат-вызов.
-        Если передан kb_ctx — добавляем контекст отдельным сообщением, чтобы повысить релевантность.
+        Если передан kb_ctx — подмешиваем контекст, иначе используем роль и few-shot.
         """
         chat_model = model or self.default_chat_model
 
         if kb_ctx:
+            # Для режима с БЗ сохраняем нейтральную system prompt (можно доработать)
             messages = [
                 {
                     "role": "system",
@@ -139,17 +140,15 @@ class OpenAIHelper:
         else:
             system_text = ROLE_SYSTEM_PROMPTS.get(style)
             if not system_text:
-                # fallback если стиль не найден
                 system_text = "You are a helpful assistant. Answer concisely and clearly."
-            messages = [
-                {"role": "system", "content": system_text},
-                {"role": "user", "content": user_text},
-            ]
+            few_shot = FEW_SHOT_EXAMPLES.get(style, [])
+            messages = [{"role": "system", "content": system_text}]
+            messages.extend(few_shot)
+            messages.append({"role": "user", "content": user_text})
 
-        # Включаем логирование промпта/messages для отладки
+        # Логирование prompt/messages для диагностики
         logger.debug("PROMPT to OpenAI:\n%s", messages)
-        # Если хочешь видеть сразу — можешь раскомментировать:
-        # print("PROMPT to OpenAI:\n", messages)
+        # print("PROMPT to OpenAI:\n", messages)  # Можно раскомментировать для stdout
 
         try:
             resp = self._client.chat.completions.create(
