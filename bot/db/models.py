@@ -1,27 +1,33 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text, func
-from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, JSON
+from sqlalchemy.orm import relationship
+from datetime import datetime
 
-Base = declarative_base()
+from .session import Base
+
 
 class Dialog(Base):
     __tablename__ = "dialogs"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)
-    title = Column(String(128), nullable=False, default="Диалог")
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    title = Column(String, default="Диалог")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_message_at = Column(DateTime, default=datetime.utcnow)  # для сортировки по активности
     is_deleted = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    model = Column(String, nullable=True)  # выбранная модель для диалога
+    style = Column(String, nullable=True)  # выбранный стиль (роль)
+    kb_documents = Column(JSON, default=list)  # список выбранных документов KB
 
     messages = relationship("Message", back_populates="dialog", cascade="all, delete-orphan")
+
 
 class Message(Base):
     __tablename__ = "messages"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    dialog_id = Column(Integer, ForeignKey("dialogs.id", ondelete="CASCADE"), nullable=False, index=True)
-    role = Column(String(16), nullable=False)  # "user", "assistant", "system"
-    text = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=func.now())
+    id = Column(Integer, primary_key=True, index=True)
+    dialog_id = Column(Integer, ForeignKey("dialogs.id"))
+    role = Column(String)  # "user" или "assistant"
+    content = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
 
     dialog = relationship("Dialog", back_populates="messages")
