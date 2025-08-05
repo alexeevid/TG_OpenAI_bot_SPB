@@ -17,7 +17,7 @@ def main():
 
     # Инициализация БД
     logger.info("🔄 Инициализация базы данных...")
-    init_db(Base)
+    init_db()
 
     # Создаём бота
     bot = ChatGPTTelegramBot(settings)
