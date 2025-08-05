@@ -31,6 +31,7 @@ def main():
     app.add_handler(CommandHandler("rename", bot.cmd_rename))
     app.add_handler(CommandHandler("export", bot.cmd_export))
     app.add_handler(CommandHandler("kb_diag", bot.cmd_kb_diag))
+    app.add_handler(CommandHandler("fix_db", bot.cmd_fix_db))
 
     # Обработка текстовых сообщений
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
