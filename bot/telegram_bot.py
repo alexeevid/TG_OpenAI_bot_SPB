@@ -5,6 +5,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
 from bot.dialog_manager import DialogManager
 dialog_manager = DialogManager()
 
@@ -42,7 +43,6 @@ except ImportError as e:
     KB_AVAILABLE = False
     logger.warning("KB unavailable (import): %s", e)
 
-
 # --- Простая модель диалогов в памяти ---
 @dataclass
 class DialogState:
@@ -52,14 +52,24 @@ class DialogState:
     updated_at_ts: float = 0.0
     model: Optional[str] = None
     style: str = "Pro"
-
     # KB
     kb_selected_docs: List[str] = field(default_factory=list)
-    # Пароли к документам в рамках СЕССИИ: disk:/... -> password
     kb_passwords: Dict[str, str] = field(default_factory=dict)
-    # временный флаг «ждём ввод пароля» (индекс документа из последней клавы)
     kb_await_pwd_for_path: Optional[str] = None
 
+# === Новый обработчик /kb_diag через DialogManager и БД ===
+async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    dlg = dialog_manager.get_active_dialog(user_id)
+    if not dlg:
+        await update.message.reply_text("Нет активного диалога.")
+        return
+    docs = dlg.documents or "(нет документов)"
+    msgs = dialog_manager.get_dialog_messages(dlg.dialog_id)
+    answer = f"Диалог: {dlg.dialog_id}\nДокументы KB: {docs}\n\nИстория сообщений:\n"
+    for m in msgs:
+        answer += f"[{m.role}] {m.text[:60]}{'...' if len(m.text)>60 else ''}\n"
+    await update.message.reply_text(answer)
 
 class ChatGPTTelegramBot:
     def __init__(self, openai, settings):
@@ -70,7 +80,7 @@ class ChatGPTTelegramBot:
         self.admin_ids = set(getattr(settings, "admin_user_ids", []) or getattr(settings, "admin_set", []) or [])
         self.allowed_ids = set(getattr(settings, "allowed_user_ids", []) or getattr(settings, "allowed_set", []) or [])
 
-        # Состояние пользователей
+        # Состояние пользователей (in-memory для совместимости)
         self._dialogs_by_user: Dict[int, Dict[int, DialogState]] = {}
         self._current_dialog_by_user: Dict[int, int] = {}
         self._next_dialog_id: int = 1
@@ -102,7 +112,6 @@ class ChatGPTTelegramBot:
         ]
 
     async def setup_commands(self, app: Application) -> None:
-        # Применение команд во всех scope
         commands = self._build_commands()
         try:
             await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -115,7 +124,6 @@ class ChatGPTTelegramBot:
             except Exception:
                 pass
             await app.bot.set_my_commands(commands=commands, scope=scope)
-
         logger.info("✅ Команды установлены (global scopes)")
 
     # ========= Регистрация обработчиков =========
@@ -130,30 +138,16 @@ class ChatGPTTelegramBot:
         app.add_handler(CommandHandler("img", self.cmd_img))
         app.add_handler(CommandHandler("web", self.cmd_web))
         app.add_handler(CommandHandler("kb", self.cmd_kb))
-        app.add_handler(CommandHandler("kb_diag", self.cmd_kb_diag))
-
+        # Новый обработчик KB через БД:
+        app.add_handler(CommandHandler("kb_diag", kb_diag))
         # Сообщения
         app.add_handler(MessageHandler(filters.VOICE, self.on_voice))
         app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, self.on_file_or_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
-        app.add_handler(CommandHandler("kb_diag", kb_diag))
         # Inline callbacks
         app.add_handler(CallbackQueryHandler(self.on_callback))
 
     # ========= Вспомогательные =========
-    async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        dlg = dialog_manager.get_active_dialog(user_id)
-        if not dlg:
-            await update.message.reply_text("Нет активного диалога.")
-            return
-        docs = dlg.documents or "(нет документов)"
-        msgs = dialog_manager.get_dialog_messages(dlg.dialog_id)
-        answer = f"Диалог: {dlg.dialog_id}\nДокументы KB: {docs}\n\nИстория сообщений:\n"
-        for m in msgs:
-            answer += f"[{m.role}] {m.text[:60]}{'...' if len(m.text)>60 else ''}\n"
-        await update.message.reply_text(answer)
-    
     def _ensure_dialog(self, user_id: int) -> DialogState:
         user_dialogs = self._dialogs_by_user.setdefault(user_id, {})
         if user_id not in self._current_dialog_by_user:
