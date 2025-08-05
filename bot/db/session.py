@@ -1,15 +1,16 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from bot.db.models import Base
-import os
+from sqlalchemy.orm import sessionmaker, declarative_base
+from bot.settings import settings
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_URL = settings.database_url
 
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+engine = create_engine(DB_URL, echo=True, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+# Объявление Base здесь
+Base = declarative_base()
+
 def init_db():
+    # импорт моделей внутри функции, чтобы избежать циклического импорта
+    from . import models
     Base.metadata.create_all(bind=engine)
