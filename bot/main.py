@@ -1,89 +1,45 @@
-# bot/main.py
 import logging
-from telegram.ext import Application
-from telegram import BotCommand
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 from bot.config import load_settings
 from bot.telegram_bot import ChatGPTTelegramBot
-from bot.openai_helper import OpenAIHelper
+from bot.db.session import init_db
+from bot.db.models import Base
 
-# ——— Включаем DEBUG-логи для всего приложения ——————————————————
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)-5s %(name)s: %(message)s"
-)
-# ——————————————————————————————————————————————————————————
 
-def build_application() -> Application:
+def main():
+    logger.info("🚀 Запуск Telegram-бота")
+
+    # Загружаем настройки из окружения
     settings = load_settings()
 
-    # OpenAI helper в вашем формате
-    openai = OpenAIHelper(api_key=settings.openai_api_key)
+    # Инициализация БД
+    logger.info("🔄 Инициализация базы данных...")
+    init_db(Base)
 
-    # Наш класс бота с хендлерами
-    bot = ChatGPTTelegramBot(openai=openai, settings=settings)
+    # Создаём бота
+    bot = ChatGPTTelegramBot(settings)
 
-    async def _post_init(app: Application):
-        # 1) Гарантированно гасим вебхук и сбрасываем «зависшие» апдейты
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        me = await app.bot.get_me()
-        logger.info("🤖 Connected as @%s (id=%s)", me.username, me.id)
+    app = ApplicationBuilder().token(settings.telegram_bot_token).build()
 
-        # 2) Ставим команды:
-        try:
-            if hasattr(bot, "setup_commands") and callable(getattr(bot, "setup_commands")):
-                # Если в вашем классе вдруг появится метод setup_commands(app)
-                await bot.setup_commands(app)
-            elif hasattr(bot, "_post_init") and callable(getattr(bot, "_post_init")):
-                # Если уже есть внутренний _post_init(app), отдадим ему право всё настроить
-                await bot._post_init(app)  # type: ignore[attr-defined]
-            elif hasattr(bot, "_apply_bot_commands") and callable(getattr(bot, "_apply_bot_commands")):
-                # Старое приватное API —  установит команды во всех scope
-                await bot._apply_bot_commands(app.bot, lang=getattr(bot.settings, "bot_language", None))  # type: ignore[attr-defined]
-            else:
-                # Фолбэк: минимальный набор команд на всякий случай
-                commands = [
-                    BotCommand("help", "помощь"),
-                    BotCommand("reset", "сброс контекста"),
-                    BotCommand("stats", "статистика"),
-                    BotCommand("kb", "база знаний"),
-                    BotCommand("model", "выбор модели"),
-                    BotCommand("mode", "стиль ответов"),
-                    BotCommand("dialogs", "диалоги"),
-                    BotCommand("img", "сгенерировать изображение"),
-                    BotCommand("web", "веб-поиск"),
-                ]
-                await app.bot.set_my_commands(commands=commands)
-                logger.info("✅ Команды установлены (fallback)")
-        except Exception as e:
-            logger.exception("setup_commands failed: %s", e)
+    # Регистрируем команды
+    app.add_handler(CommandHandler("start", bot.cmd_start))
+    app.add_handler(CommandHandler("help", bot.cmd_help))
+    app.add_handler(CommandHandler("dialogs", bot.cmd_dialogs))
+    app.add_handler(CommandHandler("rename", bot.cmd_rename))
+    app.add_handler(CommandHandler("export", bot.cmd_export))
+    app.add_handler(CommandHandler("kb_diag", bot.cmd_kb_diag))
 
-    # Сборка Application с post_init
-    builder = (
-        Application.builder()
-        .token(settings.telegram_bot_token)
-        .post_init(_post_init)
-    )
-    app = builder.build()
+    # Обработка текстовых сообщений
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
 
-    # Регистрируем все хендлеры
-    bot.install(app)
+    # Обработка callback-кнопок
+    app.add_handler(CallbackQueryHandler(bot.on_callback))
 
-    return app
-
-
-def main() -> None:
-    logger.info("🔒 Advisory-lock получен. Запускаем бота.")
-    app = build_application()
-    logger.info("🚀 Бот запускается (run_polling)...")
-
-    # ВАЖНО: запускаем единственный инстанс, сбрасываем подвешенные апдейты, разрешаем все типы
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=None,
-    )
-
+    logger.info("🤖 Бот запущен в режиме polling")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
