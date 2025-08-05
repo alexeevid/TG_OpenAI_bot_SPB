@@ -10,6 +10,12 @@ from openai import OpenAI, APIError, BadRequestError  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+ROLE_SYSTEM_PROMPTS = {
+    "Эксперт": "Ты отвечаешь как ведущий эксперт. Используй профессиональную лексику, обосновывай выводы, пиши развёрнуто.",
+    "Профессионал": "Ты отвечаешь кратко, по делу, но на хорошем профессиональном уровне. Излагай мысли чётко и структурированно.",
+    "Пользователь": "Ты объясняешь простыми словами, избегай терминов, делай ответы максимально понятными для новичка.",
+    "СЕО": "Ты отвечаешь как CEO компании: мысли стратегически, не погружайся в детали, делай акцент на принятии решений.",
+}
 
 class OpenAIHelper:
     """
@@ -84,11 +90,10 @@ class OpenAIHelper:
                 },
             ]
         else:
-            system_msg = [
-                "You are a helpful assistant.",
-                f"Answer concisely with a {style} tone.",
-            ]
-            system_text = "\n".join(system_msg)
+            system_text = ROLE_SYSTEM_PROMPTS.get(style)
+            if not system_text:
+                # fallback если стиль не найден
+                system_text = "You are a helpful assistant. Answer concisely and clearly."
             messages = [
                 {"role": "system", "content": system_text},
                 {"role": "user", "content": user_text},
