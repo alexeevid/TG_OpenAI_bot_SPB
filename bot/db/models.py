@@ -4,7 +4,6 @@ from datetime import datetime
 
 from .session import Base
 
-
 class Dialog(Base):
     __tablename__ = "dialogs"
 
@@ -12,21 +11,20 @@ class Dialog(Base):
     user_id = Column(Integer, index=True)
     title = Column(String, default="Диалог")
     created_at = Column(DateTime, default=datetime.utcnow)
-    last_message_at = Column(DateTime, default=datetime.utcnow)  # для сортировки по активности
+    last_message_at = Column(DateTime, default=datetime.utcnow)
     is_deleted = Column(Boolean, default=False)
-    model = Column(String, nullable=True)  # выбранная модель для диалога
-    style = Column(String, nullable=True)  # выбранный стиль (роль)
-    kb_documents = Column(JSON, default=list)  # список выбранных документов KB
+    model = Column(String, nullable=True)
+    style = Column(String, nullable=True)
+    kb_documents = Column(JSON, default=list)
 
     messages = relationship("Message", back_populates="dialog", cascade="all, delete-orphan")
-
 
 class Message(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, index=True)
     dialog_id = Column(Integer, ForeignKey("dialogs.id"))
-    role = Column(String)  # "user" или "assistant"
+    role = Column(String)
     content = Column(Text)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
