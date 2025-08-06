@@ -48,6 +48,20 @@ class DialogManager:
                 .all()
             )
 
+    def get_dialog_state(self, dialog_id, user_id):
+        """Возвращает объект диалога с настройками."""
+        return self.get_dialog(dialog_id, user_id)
+    
+    def save_dialog_state(self, dialog_id, user_id, dlg_state):
+        """Сохраняет изменения состояния диалога в БД."""
+        with self.Session() as session:
+            dialog = session.query(Dialog).filter_by(id=dialog_id, user_id=user_id).first()
+            if dialog:
+                dialog.model = getattr(dlg_state, "model", dialog.model)
+                dialog.style = getattr(dlg_state, "style", dialog.style)
+                dialog.kb_documents = getattr(dlg_state, "kb_documents", dialog.kb_documents)
+                session.commit()
+    
     def get_active_dialog(self, user_id: int) -> Optional[Dialog]:
         """
         Получить последний активный диалог пользователя.
