@@ -276,7 +276,7 @@ class ChatGPTTelegramBot:
         dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
     
         # Если админ — запускаем синхронизацию
-        if str(user_id) in str(self.settings.admin_user_ids):
+        if user_id in getattr(self.settings, "admin_user_ids", []):
             await update.message.reply_text("🔄 Синхронизация базы знаний...")
             await asyncio.to_thread(self.kb_indexer.sync)
     
@@ -296,7 +296,7 @@ class ChatGPTTelegramBot:
                 buttons.append([InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")])
     
         buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
-        if str(user_id) in str(self.settings.admin_user_ids):
+        if user_id in getattr(self.settings, "admin_user_ids", []):
             buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
     
         dlg_state.kb_last_paths = {i: d.path for i, d in enumerate(docs)}
@@ -448,7 +448,7 @@ class ChatGPTTelegramBot:
                 if selected and d.path.lower().endswith(".pdf"):
                     buttons.append([InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")])
             buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
-            if str(user_id) in str(self.settings.admin_user_ids):
+            if user_id in getattr(self.settings, "admin_user_ids", []):
                 buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
         
             await query.edit_message_reply_markup(InlineKeyboardMarkup(buttons))
