@@ -127,9 +127,8 @@ class ChatGPTTelegramBot:
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
 
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
-
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
     
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отображает список документов базы знаний с возможностью выбора."""
