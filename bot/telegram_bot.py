@@ -3,7 +3,6 @@ import time
 import os
 from io import BytesIO
 from datetime import datetime
-from sqlalchemy import text  # ✅ нужно добавить импорт
 
 from telegram import (
     Update,
@@ -25,7 +24,6 @@ from .dialog_manager import DialogManager
 from .openai_helper import OpenAIHelper
 from .knowledge_base.indexer import KnowledgeBaseIndexer
 from .knowledge_base.retriever import KnowledgeBaseRetriever
-from .db.session import engine  # ✅ для временной команды fix_db
 
 logger = logging.getLogger(__name__)
 
@@ -50,26 +48,7 @@ class ChatGPTTelegramBot:
         await update.message.reply_text("Привет! Я готов к работе.")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("Список команд: /dialogs /rename /export /kb /kb_diag /model /mode /img /web /stats /fix_db")
-
-    async def cmd_fix_db(self, update, context):
-        admin_id = 540532439  # твой Telegram ID
-        if update.effective_user.id != admin_id:
-            await update.message.reply_text("⛔ Нет доступа")
-            return
-    
-        sql_commands = text("""
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMP DEFAULT now();
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS model TEXT;
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS style TEXT;
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS kb_documents JSON DEFAULT '[]';
-        """)
-    
-        with engine.connect() as conn:
-            conn.execute(sql_commands)
-            conn.commit()
-    
-        await update.message.reply_text("✅ Структура таблицы dialogs обновлена.")
+        await update.message.reply_text("Список команд: /dialogs /rename /export /kb /kb_diag /model /mode /img /web /stats")
 
     async def cmd_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
