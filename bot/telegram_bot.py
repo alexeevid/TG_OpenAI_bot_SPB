@@ -3,8 +3,6 @@ import time
 import os
 from io import BytesIO
 from datetime import datetime
-from sqlalchemy import text
-from .db.session import engine
 
 from telegram import (
     Update,
@@ -52,28 +50,6 @@ class ChatGPTTelegramBot:
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Список команд: /dialogs /rename /export /kb /kb_diag /model /mode /img /web /stats")
 
-    async def cmd_fix_db(self, update, context):
-        admin_id = 540532439  # твой Telegram ID
-        if update.effective_user.id != admin_id:
-            await update.message.reply_text("⛔ Нет доступа")
-            return
-    
-        sql_commands = text("""
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMP DEFAULT now();
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS model TEXT;
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS style TEXT;
-            ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS kb_documents JSON DEFAULT '[]';
-    
-            ALTER TABLE messages ADD COLUMN IF NOT EXISTS content TEXT;
-            ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp TIMESTAMP DEFAULT now();
-        """)
-    
-        with engine.connect() as conn:
-            conn.execute(sql_commands)
-            conn.commit()
-    
-        await update.message.reply_text("✅ Структура таблиц dialogs и messages обновлена.")
-    
     async def cmd_dialogs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         dialogs = self.dialog_manager.get_active_dialogs(user_id)
