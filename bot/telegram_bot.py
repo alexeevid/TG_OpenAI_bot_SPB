@@ -27,7 +27,6 @@ from .knowledge_base.retriever import KnowledgeBaseRetriever
 
 logger = logging.getLogger(__name__)
 
-
 class ChatGPTTelegramBot:
     def __init__(self, settings):
         self.settings = settings
@@ -93,6 +92,32 @@ class ChatGPTTelegramBot:
         file_bytes.name = f"dialog_{current_dlg}.md"
         await update.message.reply_document(InputFile(file_bytes))
 
+    async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор стиля ответа ассистента."""
+        user_id = update.effective_user.id
+        current_dlg = self.current_dialog_by_user.get(user_id)
+        if not current_dlg:
+            dlg = self.dialog_manager.create_dialog(user_id)
+            self.current_dialog_by_user[user_id] = dlg.id
+            current_dlg = dlg.id
+    
+        styles = {
+            "ceo": "СЕО — стратегичный, кратко о главном",
+            "expert": "Эксперт — детально, с фактами и примерами",
+            "pro": "Про — чётко, по делу, без воды",
+            "user": "Юзер — просто и понятно, без терминов"
+        }
+    
+        buttons = [
+            [InlineKeyboardButton(desc, callback_data=f"mode:{key}")]
+            for key, desc in styles.items()
+        ]
+    
+        await update.message.reply_text(
+            "Выберите стиль общения:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    
     async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Динамический выбор модели OpenAI по списку из API."""
         user_id = update.effective_user.id
@@ -287,6 +312,14 @@ class ChatGPTTelegramBot:
             await context.bot.send_document(chat_id=user_id, document=InputFile(file_bytes))
             return
 
+        if data.startswith("mode:"):
+            mode_key = data.split(":", 1)[1]
+            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+            dlg_state.style = mode_key
+            self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
+            await query.edit_message_text(f"✅ Стиль установлен: {mode_key}")
+            return
+        
         if data.startswith("dlg:del:"):
             dlg_id = int(data.split(":")[2])
             self.dialog_manager.soft_delete_dialog(dlg_id, user_id)
