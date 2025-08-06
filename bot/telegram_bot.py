@@ -264,44 +264,53 @@ class ChatGPTTelegramBot:
             await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
     
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отображает список документов базы знаний с возможностью выбора."""
+        """Отображает список документов из базы знаний для выбора."""
         user_id = update.effective_user.id
-        current_dlg = self.current_dialog_by_user.get(user_id)
-        if not current_dlg:
+        current_dlg_id = self.current_dialog_by_user.get(user_id)
+
+        if not current_dlg_id:
             dlg = self.dialog_manager.create_dialog(user_id)
             self.current_dialog_by_user[user_id] = dlg.id
-            current_dlg = dlg.id
-    
-        dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
-    
+            current_dlg_id = dlg.id
+
+        # Получаем список всех документов из индекса KB
         try:
-            docs = await asyncio.to_thread(self.kb_indexer.list_documents)
+            docs = self.kb_indexer.list_documents()
         except Exception as e:
-            await update.message.reply_text(f"⚠️ Ошибка получения списка документов: {e}")
+            await update.message.reply_text(f"Ошибка при получении списка документов: {e}")
             return
-    
+
+        dlg_state = self.dialog_manager.get_dialog_state(current_dlg_id, user_id)
+        selected_docs = set(dlg_state.kb_documents or [])
+
         buttons = []
-        path_by_idx = {}
-    
-        for i, d in enumerate(docs):
-            path_by_idx[i] = d.path
-            mark = "✅ " if d.path in dlg_state.kb_selected_docs else "☐ "
-            buttons.append([InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")])
-    
-            # Кнопка пароля только для PDF
-            if d.path in dlg_state.kb_selected_docs and d.path.lower().endswith(".pdf"):
-                buttons.append([InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")])
-    
-        # Кнопки управления
-        buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
-        buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
-    
-        dlg_state.kb_last_paths = path_by_idx
-        self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
-    
+        for idx, doc in enumerate(docs):
+            mark = "✅" if doc in selected_docs else "❌"
+            buttons.append([
+                InlineKeyboardButton(f"{mark} {doc}", callback_data=f"kb:toggle:{idx}")
+            ])
+
         await update.message.reply_text(
-            "📂 База знаний: выберите документы для этого диалога.",
+            "📚 Выберите документы для использования в ответах:",
             reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает статистику диалогов и сообщений пользователя."""
+        user_id = update.effective_user.id
+
+        dialogs = self.dialog_manager.get_active_dialogs(user_id)
+        total_dialogs = len(dialogs)
+        total_messages = 0
+
+        for dlg in dialogs:
+            msgs = self.dialog_manager.get_messages(dlg.id, limit=999999)
+            total_messages += len(msgs)
+
+        await update.message.reply_text(
+            f"📊 Ваша статистика:\n"
+            f"— Активных диалогов: {total_dialogs}\n"
+            f"— Всего сообщений: {total_messages}"
         )
     
     async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
