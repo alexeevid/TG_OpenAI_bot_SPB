@@ -139,6 +139,12 @@ class DialogManager:
                 dialog.last_message_at = datetime.utcnow()
             db.commit()
 
+    def reset_user_dialogs(self, user_id):
+        """Удаляет все диалоги и состояния для пользователя."""
+        self._dialogs_by_user.pop(user_id, None)
+        self._current_dialog_by_user.pop(user_id, None)
+
+    
     def get_messages(self, dialog_id: int, limit: int = 10) -> List[Message]:
         """
         Получить последние N сообщений диалога.
