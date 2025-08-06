@@ -31,7 +31,11 @@ def main():
     app.add_handler(CommandHandler("rename", bot.cmd_rename))
     app.add_handler(CommandHandler("export", bot.cmd_export))
     app.add_handler(CommandHandler("kb_diag", bot.cmd_kb_diag))
-    
+    app.add_handler(CommandHandler("reset", bot.cmd_reset))
+    app.add_handler(CommandHandler("model", bot.cmd_model))
+    app.add_handler(CommandHandler("mode", bot.cmd_mode))
+    app.add_handler(CommandHandler("img", bot.cmd_img))
+
     # Обработка текстовых сообщений
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
 
