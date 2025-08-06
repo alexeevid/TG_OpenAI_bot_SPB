@@ -93,6 +93,44 @@ class ChatGPTTelegramBot:
         file_bytes.name = f"dialog_{current_dlg}.md"
         await update.message.reply_document(InputFile(file_bytes))
 
+    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Динамический выбор модели OpenAI по списку из API."""
+        user_id = update.effective_user.id
+        current_dlg = self.current_dialog_by_user.get(user_id)
+        if not current_dlg:
+            dlg = self.dialog_manager.create_dialog(user_id)
+            self.current_dialog_by_user[user_id] = dlg.id
+            current_dlg = dlg.id
+    
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.settings.openai_api_key)
+    
+            # Запрос списка моделей
+            models_data = client.models.list()
+            model_names = sorted([m.id for m in models_data.data])
+    
+            if not model_names:
+                await update.message.reply_text("⚠️ Не удалось получить список моделей OpenAI.")
+                return
+    
+            # Делаем кнопки по 2 в строке
+            buttons = []
+            for i in range(0, len(model_names), 2):
+                row = []
+                for model in model_names[i:i+2]:
+                    row.append(InlineKeyboardButton(model, callback_data=f"model:{model}"))
+                buttons.append(row)
+    
+            await update.message.reply_text(
+                "Выберите модель для работы:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
+
+    
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отображает список документов базы знаний с возможностью выбора."""
         user_id = update.effective_user.id
@@ -173,6 +211,14 @@ class ChatGPTTelegramBot:
             await query.edit_message_text(f"Создан новый диалог: {dlg.title}")
             return
 
+        if data.startswith("model:"):
+            model_name = data.split(":", 1)[1]
+            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+            dlg_state.model = model_name
+            self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
+            await query.edit_message_text(f"✅ Модель установлена: {model_name}")
+            return
+        
         if data.startswith("dlg:open:"):
             dlg_id = int(data.split(":")[2])
             self.current_dialog_by_user[user_id] = dlg_id
