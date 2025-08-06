@@ -237,6 +237,22 @@ class ChatGPTTelegramBot:
             return
 
         if data.startswith("kb:pwd:"):
+            idx = int(data.split(":", 2)[2])
+            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+            path = dlg_state.kb_last_paths.get(idx)
+        
+            if not path:
+                await query.answer("Элемент недоступен, обновите список (/kb).", show_alert=True)
+                return
+        
+            # Запоминаем, для какого документа ждём пароль
+            self.awaiting_kb_pwd[user_id] = idx
+            await query.edit_message_text(
+                f"Введите пароль для документа: {os.path.basename(path)}"
+            )
+            return
+
+        if data.startswith("kb:pwd:"):
             idx = int(data.split(":")[2])
             self.awaiting_kb_pwd[user_id] = idx
             await query.edit_message_text("Введите пароль к документу:")
