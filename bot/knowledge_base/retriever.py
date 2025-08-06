@@ -1,58 +1,65 @@
-import logging
-
-logger = logging.getLogger(__name__)
+import re
 
 class KnowledgeBaseRetriever:
     def __init__(self, settings):
         self.settings = settings
-        # здесь инициализация индекса / векторного поиска
 
-    def retrieve(self, query, docs=None, passwords=None):
-        """
-        Извлекает релевантный контекст из выбранных документов.
-        passwords — dict {path: password}
-        """
-        relevant_chunks = []
-        for doc_path in docs or []:
-            try:
-                if doc_path.lower().endswith(".pdf") and passwords and doc_path in passwords:
-                    text = self._extract_pdf_with_password(doc_path, passwords[doc_path])
-                else:
-                    text = self._extract_text(doc_path)
-                chunks = self._split_into_chunks(text)
-                # логика поиска релевантных чанков по запросу query
-                relevant_chunks.extend(chunks)
-            except Exception as e:
-                logger.error(f"Ошибка при обработке {doc_path}: {e}")
-        return relevant_chunks
+    def retrieve(self, query: str, selected_docs: list, passwords: dict):
+        all_chunks = []
 
-    def _extract_text(self, path):
-        """
-        Заглушка — логика извлечения текста из документа.
-        """
-        return ""
+        # Разбиваем запрос пользователя на слова (ключевые слова)
+        query_words = [w.lower() for w in re.findall(r"\w+", query) if len(w) > 2]
 
-    def _split_into_chunks(self, text, chunk_size=1000, overlap=200):
-        """
-        Делим текст на чанки.
-        """
+        # Берём текущие рабочие настройки
+        max_chunks = 6   # было в твоей версии
+        chunk_size = 800 # было в твоей версии
+
+        for doc_path in selected_docs:
+            text = self._load_and_parse_document(doc_path, passwords.get(doc_path))
+            if not text:
+                continue
+
+            chunks = self._split_into_chunks(text, chunk_size=chunk_size)
+            relevant = []
+
+            for idx, chunk in enumerate(chunks):
+                chunk_lower = chunk.lower()
+                if any(word in chunk_lower for word in query_words):
+                    relevant.append(chunk)
+                    if idx + 1 < len(chunks):
+                        relevant.append(chunks[idx + 1])
+
+            # Если релевантных нет, берём первые чанки
+            if not relevant:
+                relevant = chunks[:2]
+
+            all_chunks.extend(relevant)
+
+        # Ограничиваем общее количество чанков
+        if len(all_chunks) > max_chunks:
+            all_chunks = all_chunks[:max_chunks]
+
+        return all_chunks
+
+    def _load_and_parse_document(self, path, password):
+        # Здесь остаётся твоя текущая логика загрузки документа из Я.Диска
+        ...
+
+    def _split_into_chunks(self, text, chunk_size=800):
+        words = text.split()
         chunks = []
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            chunks.append(text[start:end])
-            start += chunk_size - overlap
-        return chunks
+        current_chunk = []
+        current_len = 0
 
-    def _extract_pdf_with_password(self, path, password):
-        """
-        Извлечение текста из PDF с паролем.
-        """
-        from PyPDF2 import PdfReader
-        reader = PdfReader(path)
-        if reader.is_encrypted:
-            reader.decrypt(password)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() or ""
-        return text
+        for word in words:
+            current_chunk.append(word)
+            current_len += len(word) + 1
+            if current_len >= chunk_size:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        return chunks
