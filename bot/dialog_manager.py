@@ -87,6 +87,13 @@ class DialogManager:
                 return True
             return False
 
+    def get_dialog_state(self, dialog_id, user_id):
+        """Возвращает объект диалога с текущими настройками модели и стиля."""
+        dlg = self.get_dialog(dialog_id, user_id)
+        if dlg is None:
+            return None
+        return dlg
+    
     def soft_delete_dialog(self, dialog_id: int, user_id: int) -> bool:
         """
         Мягкое удаление диалога.
