@@ -92,6 +92,114 @@ class ChatGPTTelegramBot:
         file_bytes.name = f"dialog_{current_dlg}.md"
         await update.message.reply_document(InputFile(file_bytes))
 
+    # =========================
+    # /reset — сброс диалога
+    # =========================
+    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сброс текущего диалога и состояния KB."""
+        user_id = update.effective_user.id
+        self.current_dialog_by_user.pop(user_id, None)
+        self.awaiting_rename.pop(user_id, None)
+        self.awaiting_kb_pwd.pop(user_id, None)
+    
+        # Сброс в DialogManager (если реализован)
+        if hasattr(self.dialog_manager, "reset_user_dialogs"):
+            self.dialog_manager.reset_user_dialogs(user_id)
+    
+        await update.message.reply_text("🔄 Диалог и настройки базы знаний сброшены.")
+    
+    # =========================
+    # /model — выбор модели
+    # =========================
+    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Динамический выбор модели OpenAI по списку из API."""
+        user_id = update.effective_user.id
+        current_dlg = self.current_dialog_by_user.get(user_id)
+        if not current_dlg:
+            dlg = self.dialog_manager.create_dialog(user_id)
+            self.current_dialog_by_user[user_id] = dlg.id
+            current_dlg = dlg.id
+    
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.settings.openai_api_key)
+    
+            models_data = client.models.list()
+            model_names = sorted([m.id for m in models_data.data])
+    
+            if not model_names:
+                await update.message.reply_text("⚠️ Не удалось получить список моделей OpenAI.")
+                return
+    
+            buttons = []
+            for i in range(0, len(model_names), 2):
+                row = []
+                for model in model_names[i:i+2]:
+                    row.append(InlineKeyboardButton(model, callback_data=f"model:{model}"))
+                buttons.append(row)
+    
+            await update.message.reply_text(
+                "Выберите модель для работы:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+    
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
+    
+    # =========================
+    # /mode — выбор стиля
+    # =========================
+    async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор стиля ответа ассистента."""
+        user_id = update.effective_user.id
+        current_dlg = self.current_dialog_by_user.get(user_id)
+        if not current_dlg:
+            dlg = self.dialog_manager.create_dialog(user_id)
+            self.current_dialog_by_user[user_id] = dlg.id
+            current_dlg = dlg.id
+    
+        styles = {
+            "ceo": "СЕО — стратегично и кратко",
+            "expert": "Эксперт — глубоко и с фактами",
+            "pro": "Про — по делу и структурно",
+            "user": "Юзер — просто и понятно"
+        }
+    
+        buttons = [
+            [InlineKeyboardButton(desc, callback_data=f"mode:{key}")]
+            for key, desc in styles.items()
+        ]
+    
+        await update.message.reply_text(
+            "Выберите стиль общения:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    
+    
+    # =========================
+    # /img — генерация изображений
+    # =========================
+    async def cmd_img(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Генерация изображения по запросу."""
+        prompt = " ".join(context.args) if context.args else None
+    
+        if not prompt:
+            await update.message.reply_text("🖼 Укажите описание. Пример:\n/img космический корабль на Марсе")
+            return
+    
+        try:
+            await update.message.reply_text("⏳ Генерирую изображение, подождите...")
+            img_bytes = await self.openai.generate_image(prompt)
+            if not img_bytes:
+                await update.message.reply_text("⚠️ Не удалось сгенерировать изображение.")
+                return
+    
+            await update.message.reply_photo(photo=img_bytes, caption=f"🖼 {prompt}")
+    
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Ошибка генерации изображения: {e}")
+
+    
     async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Выбор стиля ответа ассистента."""
         user_id = update.effective_user.id
@@ -241,6 +349,24 @@ class ChatGPTTelegramBot:
             dlg_state.model = model_name
             self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
             await query.edit_message_text(f"✅ Модель установлена: {model_name}")
+            return
+        
+        # Выбор модели
+        if data.startswith("model:"):
+            model_name = data.split(":", 1)[1]
+            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+            dlg_state.model = model_name
+            self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
+            await query.edit_message_text(f"✅ Модель установлена: {model_name}")
+            return
+        
+        # Выбор стиля
+        if data.startswith("mode:"):
+            mode_key = data.split(":", 1)[1]
+            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+            dlg_state.style = mode_key
+            self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
+            await query.edit_message_text(f"✅ Стиль установлен: {mode_key}")
             return
         
         if data.startswith("dlg:open:"):
