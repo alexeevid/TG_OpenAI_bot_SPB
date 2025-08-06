@@ -461,17 +461,17 @@ class ChatGPTTelegramBot:
             await query.edit_message_text(f"Введите пароль для документа: {os.path.basename(path)}")
             return
     
-        async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-            user_id = update.effective_user.id
-            text = update.message.text.strip()
-        
-            # Обработка переименования
-            if user_id in self.awaiting_rename:
-                dlg_id = self.awaiting_rename.pop(user_id)
-                self.dialog_manager.rename_dialog(dlg_id, user_id, text)
-                await update.message.reply_text(f"Диалог переименован в: {text}")
-                return
-    
+    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        text = update.message.text.strip()
+
+        # Обработка переименования
+        if user_id in self.awaiting_rename:
+            dlg_id = self.awaiting_rename.pop(user_id)
+            self.dialog_manager.rename_dialog(dlg_id, user_id, text)
+            await update.message.reply_text(f"Диалог переименован в: {text}")
+            return
+
         # Обработка пароля для документа KB
         if user_id in self.awaiting_kb_pwd:
             idx = self.awaiting_kb_pwd.pop(user_id)
@@ -484,17 +484,17 @@ class ChatGPTTelegramBot:
             else:
                 await update.message.reply_text("⚠️ Не удалось сохранить пароль: документ не найден.")
             return
-    
+
         # Определяем активный диалог
         current_dlg = self.current_dialog_by_user.get(user_id)
         if not current_dlg:
             dlg = self.dialog_manager.create_dialog(user_id)
             self.current_dialog_by_user[user_id] = dlg.id
             current_dlg = dlg.id
-    
+
         # Сохраняем сообщение пользователя
         self.dialog_manager.add_message(current_dlg, "user", text)
-    
+
         # Проверяем KB
         kb_ctx = None
         dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
@@ -505,7 +505,7 @@ class ChatGPTTelegramBot:
                 list(dlg_state.kb_selected_docs),
                 dlg_state.kb_passwords
             )
-    
+
             # Предупреждение о PDF, которые не использованы
             used_paths_text = "\n".join(chunks) if chunks else ""
             for path in dlg_state.kb_selected_docs:
@@ -514,10 +514,10 @@ class ChatGPTTelegramBot:
                         f"⚠️ Документ {os.path.basename(path)} не использован. "
                         "Возможно, нужен пароль или он указан неверно."
                     )
-    
+
             if chunks:
                 kb_ctx = "\n\n".join(chunks)
-    
+
         # Запрос к OpenAI
         dlg_obj = self.dialog_manager.get_dialog(current_dlg, user_id)
         reply = await self.openai.chat(
@@ -528,8 +528,8 @@ class ChatGPTTelegramBot:
             kb_context=kb_ctx,
             model=dlg_obj.model
         )
-    
+
         # Сохраняем ответ ассистента
         self.dialog_manager.add_message(current_dlg, "assistant", reply)
         await update.message.reply_text(reply)
-    
+
