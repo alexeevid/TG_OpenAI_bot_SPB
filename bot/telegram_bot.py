@@ -134,6 +134,18 @@ class ChatGPTTelegramBot:
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     
+    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сброс текущего диалога и состояния KB."""
+        user_id = update.effective_user.id
+        self.current_dialog_by_user.pop(user_id, None)
+        self.awaiting_rename.pop(user_id, None)
+        self.awaiting_kb_pwd.pop(user_id, None)
+    
+        # Если используем DialogManager, очищаем состояние
+        self.dialog_manager.reset_user_dialogs(user_id)
+    
+        await update.message.reply_text("🔄 Диалог и настройки базы знаний сброшены.")
+    
     async def cmd_kb_diag(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         current_dlg = self.current_dialog_by_user.get(user_id)
