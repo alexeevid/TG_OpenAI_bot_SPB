@@ -1,5 +1,7 @@
 import logging
 import time
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes
 import os
 import asyncio
 from io import BytesIO
@@ -265,46 +267,50 @@ class ChatGPTTelegramBot:
             await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
     
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда выбора документов для базы знаний."""
         user_id = update.effective_user.id
-        current_dlg = self.current_dialog_by_user.get(user_id)
+        is_admin = str(user_id) in [str(i) for i in (self.settings.admin_user_ids or [])]
     
-        if not current_dlg:
-            dlg = self.dialog_manager.create_dialog(user_id)
-            self.current_dialog_by_user[user_id] = dlg.id
-            current_dlg = dlg.id
+        # Админ → синхронизация + вывод
+        if is_admin:
+            await update.message.reply_text("🔄 Синхронизация с Яндекс.Диском...")
+            try:
+                await self.kb_indexer.sync_kb()  # async версия
+                await update.message.reply_text("✅ Синхронизация завершена.")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка при синхронизации: {e}")
     
-        dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
-    
-        # Если админ — запускаем синхронизацию
-        if user_id in getattr(self.settings, "admin_user_ids", []):
-            await update.message.reply_text("🔄 Синхронизация базы знаний...")
-            await asyncio.to_thread(self.kb_indexer.sync)
-    
-        # Загружаем список документов
-        docs = await asyncio.to_thread(self.kb_indexer.list_documents)
-        if not docs:
-            await update.message.reply_text("📂 Нет доступных документов в базе знаний.")
+        # Получаем список документов
+        try:
+            docs = await asyncio.to_thread(self.kb_indexer.list_documents)
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Не удалось получить список документов: {e}")
             return
     
-        # Формируем клавиатуру
+        if not docs:
+            await update.message.reply_text("📂 База знаний пуста.")
+            return
+    
+        # Текущее подключение к KB по диалогу
+        current_dlg_id = self.current_dialog_by_user.get(user_id)
+        dlg_state = self.dialog_manager.get_dialog_state(current_dlg_id, user_id)
+    
+        kb_selected = dlg_state.kb_selected_docs or set()
+    
+        # Генерируем кнопки
         buttons = []
-        for i, d in enumerate(docs):
-            selected = d.path in (dlg_state.kb_documents or [])
-            mark = "✅ " if selected else "☐ "
-            buttons.append([InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")])
-            if selected and d.path.lower().endswith(".pdf"):
-                buttons.append([InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")])
-    
-        buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
-        if user_id in getattr(self.settings, "admin_user_ids", []):
-            buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
-    
-        dlg_state.kb_last_paths = {i: d.path for i, d in enumerate(docs)}
-        self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
+        for idx, path in enumerate(docs):
+            short_name = os.path.basename(path)
+            enabled = path in kb_selected
+            prefix = "✅" if enabled else "☑️"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{prefix} {short_name}",
+                    callback_data=f"kb_toggle:{idx}"
+                )
+            ])
     
         await update.message.reply_text(
-            "📚 Выберите документы для использования в ответах:",
+            "📚 Выбери документы для контекста текущего диалога:",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
@@ -445,9 +451,14 @@ class ChatGPTTelegramBot:
             for i, d in enumerate(docs):
                 selected = d.path in (dlg_state.kb_documents or [])
                 mark = "✅ " if selected else "☐ "
-                buttons.append([InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")])
+                buttons.append([
+                    InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")
+                ])
                 if selected and d.path.lower().endswith(".pdf"):
-                    buttons.append([InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")])
+                    buttons.append([
+                        InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")
+                    ])
+        
             buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
             if user_id in getattr(self.settings, "admin_user_ids", []):
                 buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
@@ -455,18 +466,17 @@ class ChatGPTTelegramBot:
             await query.edit_message_reply_markup(InlineKeyboardMarkup(buttons))
             return
         
-        if data == "kb:save":
+        elif data == "kb:save":
             dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
-            if not dlg_state.kb_documents:
-                dlg_state.kb_enabled = False
-                await query.edit_message_text("📂 База знаний отключена (документы не выбраны).")
-            else:
-                dlg_state.kb_enabled = True
-                await query.edit_message_text(f"Выбрано документов: {len(dlg_state.kb_documents)}. Буду использовать БЗ.")
+            dlg_state.kb_enabled = bool(dlg_state.kb_documents)
+            await query.edit_message_text(
+                "📂 База знаний отключена." if not dlg_state.kb_enabled
+                else f"Выбрано документов: {len(dlg_state.kb_documents)}. БЗ включена."
+            )
             self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
             return
         
-        if data == "kb:resync":
+        elif data == "kb:resync":
             if str(user_id) not in str(self.settings.admin_user_ids):
                 await query.answer("⛔ Синхронизация доступна только администраторам.", show_alert=True)
                 return
@@ -476,7 +486,7 @@ class ChatGPTTelegramBot:
             await self.cmd_kb(update, context)
             return
         
-        if data.startswith("kb:pwd:"):
+        elif data.startswith("kb:pwd:"):
             idx = int(data.split(":", 2)[2])
             dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
             path = dlg_state.kb_last_paths.get(idx)
