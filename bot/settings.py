@@ -57,3 +57,4 @@ class Settings(BaseSettings):
             except Exception:
                 return None
         return None
+settings = Settings()
