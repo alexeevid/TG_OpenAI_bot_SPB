@@ -503,46 +503,40 @@ class ChatGPTTelegramBot:
         user_id = update.effective_user.id
         text = update.message.text.strip()
     
-        # === Ожидаем переименование диалога ===
+        # === Переименование диалога ===
         if user_id in self.awaiting_rename:
             dlg_id = self.awaiting_rename.pop(user_id)
             self.dialog_manager.rename_dialog(dlg_id, user_id, text)
-            await update.message.reply_text(f"✏️ Диалог переименован в: {text}")
+            await update.message.reply_text(f"Диалог переименован в: {text}")
             return
     
-        # === Ожидаем ввод пароля к KB ===
+        # === Пароль к документу KB ===
         if user_id in self.awaiting_kb_pwd:
             idx = self.awaiting_kb_pwd.pop(user_id)
             dlg_id = self.current_dialog_by_user.get(user_id)
-            if not dlg_id:
-                await update.message.reply_text("⚠️ Нет активного диалога.")
-                return
-    
             dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
             path = dlg_state.kb_last_paths.get(idx)
-    
-            if not path:
-                await update.message.reply_text("⚠️ Документ не найден.")
-                return
-    
-            dlg_state.kb_passwords[path] = text
-            self.dialog_manager.save_dialog_state(dlg_id, user_id, dlg_state)
-            await update.message.reply_text(f"🔑 Пароль сохранён для: {os.path.basename(path)}")
+            if path:
+                dlg_state.kb_passwords[path] = text
+                self.dialog_manager.save_dialog_state(dlg_id, user_id, dlg_state)
+                await update.message.reply_text(f"🔑 Пароль сохранён для: {os.path.basename(path)}")
+            else:
+                await update.message.reply_text("⚠️ Не удалось сохранить пароль: документ не найден.")
             return
     
-        # === Убедимся, что есть активный диалог ===
+        # === Определение текущего диалога ===
         current_dlg = self.current_dialog_by_user.get(user_id)
         if not current_dlg:
             dlg = self.dialog_manager.create_dialog(user_id)
             self.current_dialog_by_user[user_id] = dlg.id
             current_dlg = dlg.id
     
-        # === Сохраняем сообщение пользователя ===
         self.dialog_manager.add_message(current_dlg, "user", text)
     
-        # === Подготовка контекста из базы знаний ===
+        # === Подготовка контекста из БЗ ===
+        kb_context = None
         dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
-        kb_ctx = None
+    
         if dlg_state.kb_enabled and dlg_state.kb_documents:
             chunks = await asyncio.to_thread(
                 self.kb_retriever.retrieve,
@@ -551,29 +545,28 @@ class ChatGPTTelegramBot:
                 dlg_state.kb_passwords
             )
     
-            if chunks:
-                kb_ctx = "\n\n".join(chunks)
-    
-            # Проверка PDF-доков
-            used_paths_text = "\n".join(chunks) if chunks else ""
+            # Проверка PDF-документов на успешность дешифровки
+            used_text = "\n".join(chunks) if chunks else ""
             for path in dlg_state.kb_documents:
-                if path.lower().endswith(".pdf") and path not in used_paths_text:
+                if path.lower().endswith(".pdf") and path not in used_text:
                     await update.message.reply_text(
                         f"⚠️ Документ {os.path.basename(path)} не использован. "
-                        "Возможно, нужен пароль или он указан неверно."
+                        "Возможно, необходим пароль или он указан неверно."
                     )
     
-        # === Ответ от OpenAI ===
+            if chunks:
+                kb_context = "\n\n".join(chunks)
+    
+        # === Запрос к OpenAI ===
         dlg_obj = self.dialog_manager.get_dialog(current_dlg, user_id)
         reply = await self.openai.chat(
             dialog_id=current_dlg,
             user_id=user_id,
             user_message=text,
             style=dlg_obj.style,
-            kb_context=kb_ctx,
+            kb_context=kb_context,
             model=dlg_obj.model
         )
     
-        # === Сохраняем ответ и отправляем пользователю ===
         self.dialog_manager.add_message(current_dlg, "assistant", reply)
         await update.message.reply_text(reply)
