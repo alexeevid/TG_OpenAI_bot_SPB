@@ -268,49 +268,48 @@ class ChatGPTTelegramBot:
     
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        is_admin = str(user_id) in [str(i) for i in (self.settings.admin_user_ids or [])]
+        is_admin = str(user_id) in str(self.settings.admin_user_ids)
+        current_dlg = self.current_dialog_by_user.get(user_id)
     
-        # Админ → синхронизация + вывод
+        if not current_dlg:
+            await update.message.reply_text("❌ Нет активного диалога. Сначала создайте или выберите диалог.")
+            return
+    
+        dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
+    
+        # Синхронизация (только для админов)
         if is_admin:
             await update.message.reply_text("🔄 Синхронизация с Яндекс.Диском...")
-            try:
-                await self.kb_indexer.sync_kb()  # async версия
-                await update.message.reply_text("✅ Синхронизация завершена.")
-            except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка при синхронизации: {e}")
+            await asyncio.to_thread(self.kb_indexer.sync)
+            await asyncio.sleep(1)
     
-        # Получаем список документов
-        try:
-            docs = await asyncio.to_thread(self.kb_indexer.list_documents)
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ Не удалось получить список документов: {e}")
-            return
+        # Получение списка документов
+        docs = await asyncio.to_thread(self.kb_indexer.list_documents)
+        dlg_state.kb_last_paths = {i: d.path for i, d in enumerate(docs)}
+        self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
     
-        if not docs:
-            await update.message.reply_text("📂 База знаний пуста.")
-            return
-    
-        # Текущее подключение к KB по диалогу
-        current_dlg_id = self.current_dialog_by_user.get(user_id)
-        dlg_state = self.dialog_manager.get_dialog_state(current_dlg_id, user_id)
-    
-        kb_selected = dlg_state.kb_selected_docs or set()
-    
-        # Генерируем кнопки
+        # Сборка клавиатуры
         buttons = []
-        for idx, path in enumerate(docs):
-            short_name = os.path.basename(path)
-            enabled = path in kb_selected
-            prefix = "✅" if enabled else "☑️"
+        for i, d in enumerate(docs):
+            selected = d.path in (dlg_state.kb_documents or [])
+            mark = "✅ " if selected else "☐ "
             buttons.append([
-                InlineKeyboardButton(
-                    f"{prefix} {short_name}",
-                    callback_data=f"kb_toggle:{idx}"
-                )
+                InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")
             ])
+            if selected and d.path.lower().endswith(".pdf"):
+                buttons.append([
+                    InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")
+                ])
+    
+        buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
+        if is_admin:
+            buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
     
         await update.message.reply_text(
-            "📚 Выбери документы для контекста текущего диалога:",
+            f"📚 Документы из базы знаний ({len(docs)}):\n\n"
+            "☑️ Отметьте нужные документы для текущего диалога.\n"
+            "🔑 Для PDF можно ввести пароль.\n"
+            "💾 Сохраните выбор, чтобы БЗ применялась при ответах.",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
@@ -362,18 +361,17 @@ class ChatGPTTelegramBot:
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-        data = query.data
+        data = (query.data or "").strip()
         user_id = update.effective_user.id
         current_dlg = self.current_dialog_by_user.get(user_id)
     
-        # Новый диалог
+        # === Диалоги ===
         if data == "dlg:new":
             dlg = self.dialog_manager.create_dialog(user_id)
             self.current_dialog_by_user[user_id] = dlg.id
             await query.edit_message_text(f"Создан новый диалог: {dlg.title}")
             return
     
-        # Открытие диалога
         if data.startswith("dlg:open:"):
             dlg_id = int(data.split(":")[2])
             self.current_dialog_by_user[user_id] = dlg_id
@@ -383,14 +381,12 @@ class ChatGPTTelegramBot:
             await query.edit_message_text(f"📂 Диалог '{dlg.title}' (последнее сообщение: {last_date}) активирован.")
             return
     
-        # Переименование
         if data.startswith("dlg:rename:"):
             dlg_id = int(data.split(":")[2])
             self.awaiting_rename[user_id] = dlg_id
             await query.edit_message_text("Введите новое название диалога:")
             return
     
-        # Экспорт
         if data.startswith("dlg:export:"):
             dlg_id = int(data.split(":")[2])
             md_text = self.dialog_manager.export_dialog(dlg_id, user_id)
@@ -402,14 +398,13 @@ class ChatGPTTelegramBot:
             await context.bot.send_document(chat_id=user_id, document=InputFile(file_bytes))
             return
     
-        # Удаление
         if data.startswith("dlg:del:"):
             dlg_id = int(data.split(":")[2])
             self.dialog_manager.soft_delete_dialog(dlg_id, user_id)
             await query.edit_message_text("Диалог удалён.")
             return
     
-        # Выбор модели
+        # === Модель и стиль ===
         if data.startswith("model:"):
             model_name = data.split(":", 1)[1]
             dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
@@ -418,7 +413,6 @@ class ChatGPTTelegramBot:
             await query.edit_message_text(f"✅ Модель установлена: {model_name}")
             return
     
-        # Выбор стиля
         if data.startswith("mode:"):
             mode_key = data.split(":", 1)[1]
             dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
@@ -427,25 +421,25 @@ class ChatGPTTelegramBot:
             await query.edit_message_text(f"✅ Стиль установлен: {mode_key}")
             return
     
-        # === KB CALLBACKS ===
+        # === KB: выбор/отключение документов ===
         if data.startswith("kb:toggle:"):
             idx = int(data.split(":", 2)[2])
-            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+            dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
             path = dlg_state.kb_last_paths.get(idx)
-        
+    
             if not path:
                 await query.answer("Элемент недоступен, обновите список (/kb).", show_alert=True)
                 return
-        
+    
             if path in (dlg_state.kb_documents or []):
                 dlg_state.kb_documents.remove(path)
                 dlg_state.kb_passwords.pop(path, None)
             else:
                 dlg_state.kb_documents.append(path)
-        
-            self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
-        
-            # Обновляем клавиатуру
+    
+            self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
+    
+            # Перерисовать клавиатуру
             docs = await asyncio.to_thread(self.kb_indexer.list_documents)
             buttons = []
             for i, d in enumerate(docs):
@@ -458,25 +452,26 @@ class ChatGPTTelegramBot:
                     buttons.append([
                         InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")
                     ])
-        
+    
             buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
             if user_id in getattr(self.settings, "admin_user_ids", []):
                 buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
-        
+    
             await query.edit_message_reply_markup(InlineKeyboardMarkup(buttons))
             return
-        
-        elif data == "kb:save":
-            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+    
+        if data == "kb:save":
+            dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
             dlg_state.kb_enabled = bool(dlg_state.kb_documents)
-            await query.edit_message_text(
+            self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
+            msg = (
                 "📂 База знаний отключена." if not dlg_state.kb_enabled
                 else f"Выбрано документов: {len(dlg_state.kb_documents)}. БЗ включена."
             )
-            self.dialog_manager.save_dialog_state(self.current_dialog_by_user[user_id], user_id, dlg_state)
+            await query.edit_message_text(msg)
             return
-        
-        elif data == "kb:resync":
+    
+        if data == "kb:resync":
             if str(user_id) not in str(self.settings.admin_user_ids):
                 await query.answer("⛔ Синхронизация доступна только администраторам.", show_alert=True)
                 return
@@ -485,19 +480,20 @@ class ChatGPTTelegramBot:
             await asyncio.sleep(1)
             await self.cmd_kb(update, context)
             return
-        
-        elif data.startswith("kb:pwd:"):
+    
+        if data.startswith("kb:pwd:"):
             idx = int(data.split(":", 2)[2])
-            dlg_state = self.dialog_manager.get_dialog_state(self.current_dialog_by_user[user_id], user_id)
+            dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
             path = dlg_state.kb_last_paths.get(idx)
-        
+    
             if not path:
                 await query.answer("Элемент недоступен, обновите список (/kb).", show_alert=True)
                 return
-        
+    
             self.awaiting_kb_pwd[user_id] = idx
             await query.edit_message_text(f"Введите пароль для документа: {os.path.basename(path)}")
             return
+
     
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
