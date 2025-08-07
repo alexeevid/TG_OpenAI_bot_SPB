@@ -6,6 +6,7 @@ import os
 import asyncio
 from io import BytesIO
 from datetime import datetime
+from bot.settings import settings
 
 from telegram import (
     Update,
