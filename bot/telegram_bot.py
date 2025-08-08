@@ -2,7 +2,8 @@ import logging
 import time
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-import os
+from telegram.ext import ApplicationBuilder
+import os, re
 import asyncio
 from io import BytesIO
 from datetime import datetime
@@ -95,6 +96,42 @@ class ChatGPTTelegramBot:
         file_bytes = BytesIO(md_text.encode("utf-8"))
         file_bytes.name = f"dialog_{current_dlg}.md"
         await update.message.reply_document(InputFile(file_bytes))
+
+    def _parse_id_list(self, value) -> set[int]:
+        """Принимает список/набор/строку с ID, возвращает множество int."""
+        if value is None:
+            return set()
+        if isinstance(value, (list, tuple, set)):
+            try:
+                return {int(x) for x in value}
+            except Exception:
+                return set()
+        # строка: "123, 456 789"
+        s = str(value).strip()
+        if not s:
+            return set()
+        parts = re.split(r"[,\s]+", s)
+        return {int(p) for p in parts if p.isdigit()}
+    
+    def _ids_from_settings_or_env(self, attr_name: str, env_name: str) -> set[int]:
+        """Пробует достать список ID из self.settings.<attr_name>, иначе из переменной окружения <env_name>."""
+        val = getattr(self.settings, attr_name, None)
+        if not val:
+            val = os.getenv(env_name, "")
+        return self._parse_id_list(val)
+    
+    def _is_admin(self, user_id: int) -> bool:
+        return int(user_id) in self._ids_from_settings_or_env("admin_user_ids", "ADMIN_USER_IDS")
+    
+    def _is_allowed(self, user_id: int) -> bool:
+        # если ALLOWED_USER_IDS пусто — считаем, что все разрешены
+        ids = self._ids_from_settings_or_env("allowed_user_ids", "ALLOWED_USER_IDS")
+        return True if not ids else int(user_id) in ids
+
+    async def on_error(update, context):
+        # не спамим в чат, просто лог
+        import logging, traceback
+        logging.getLogger(__name__).error("Unhandled error: %s", traceback.format_exc())
 
     # =========================
     # /reset — сброс диалога
@@ -270,7 +307,7 @@ class ChatGPTTelegramBot:
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню базы знаний"""
         user_id = update.effective_user.id
-        is_admin = str(user_id) in str(self.settings.admin_user_ids)
+        is_admin = self._is_admin(user_id)
         kb = [
             [
                 # TODO: сюда твои InlineKeyboardButton(...)
