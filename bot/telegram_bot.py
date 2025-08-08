@@ -266,35 +266,48 @@ class ChatGPTTelegramBot:
 
         except Exception as e:
             await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
-    
-    async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
+async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Главное меню Базы знаний: список/мои/синхронизация (для админа)."""
+        user = update.effective_user
+        if not user:
+            return
+        user_id = user.id
+
+        # гарантируем активный диалог
         dlg_id = self.current_dialog_by_user.get(user_id)
-        dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
-    
-        from bot.settings import settings  # импорт в начале файла
-        is_admin = settings.admin_user_ids and user_id in settings.admin_user_ids
-    
-        docs = await asyncio.to_thread(self.kb_indexer.list_documents)
-        dlg_state.kb_last_paths = {i: d.path for i, d in enumerate(docs)}
-    
-        buttons = []
-        for i, d in enumerate(docs):
-            selected = d.path in (dlg_state.kb_documents or [])
-            mark = "✅ " if selected else "☐ "
-            buttons.append([
-                InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")
-            ])
-            if selected and d.path.lower().endswith(".pdf"):
-                buttons.append([
-                    InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")
-                ])
-    
-        buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
+        if dlg_id is None:
+            dlg = self.dialog_manager.create_dialog(user_id)
+            self.current_dialog_by_user[user_id] = dlg.id
+
+        # проверка админа
+        is_admin = False
+        try:
+            from bot.settings import settings
+            is_admin = bool(settings.admin_user_ids and user_id in settings.admin_user_ids)
+        except Exception:
+            is_admin = False
+
+        kb = [
+            [InlineKeyboardButton("📚 Выбрать документы", callback_data="kb:list:p1")],
+            [InlineKeyboardButton("🗂 Мои в диалоге", callback_data="kb:mine")],
+        ]
         if is_admin:
-            buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
-    
-        await update.message.reply_text("📚 Выберите документы из базы знаний:", reply_markup=InlineKeyboardMarkup(buttons))
+            kb.insert(0, [InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:resync")])
+
+        text = (
+            "🧠 *База знаний*\n"
+            "Выберите действие:\n"
+            "• 📚 *Выбрать документы* — подключить/отключить файлы к текущему диалогу\n"
+            "• 🗂 *Мои в диалоге* — список уже подключённых файлов\n"
+            f"{'• 🔄 *Синхронизация* — обновить БЗ из Яндекс.Диска (только админам)\n' if is_admin else ''}"
+            "\n_Документы хранятся на Яндекс.Диске. Удалённые файлы будут исключены при синхронизации._"
+        )
+        markup = InlineKeyboardMarkup(kb)
+        if update.message:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+
 
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показывает статистику диалогов и сообщений пользователя."""
@@ -340,6 +353,22 @@ class ChatGPTTelegramBot:
         for m in reversed(msgs):
             text += f"[{m.role}] {m.content}\n"
         await update.message.reply_text(text)
+        # Навигация по БЗ
+        if data == "kb:root":
+            await self.cmd_kb(update, context)
+            return
+
+        if data.startswith("kb:list:"):
+            try:
+                page = int(data.split(":")[2].lstrip("p"))
+            except Exception:
+                page = 1
+            await self._kb_render_list(update, context, page=page)
+            return
+
+        if data == "kb:mine":
+            await self._kb_render_attached(update, context)
+            return
 
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
