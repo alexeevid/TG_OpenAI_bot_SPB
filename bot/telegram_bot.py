@@ -2,8 +2,7 @@ import logging
 import time
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-from telegram.ext import ApplicationBuilder
-import os, re
+import os
 import asyncio
 from io import BytesIO
 from datetime import datetime
@@ -96,42 +95,6 @@ class ChatGPTTelegramBot:
         file_bytes = BytesIO(md_text.encode("utf-8"))
         file_bytes.name = f"dialog_{current_dlg}.md"
         await update.message.reply_document(InputFile(file_bytes))
-
-    def _parse_id_list(self, value) -> set[int]:
-        """Принимает список/набор/строку с ID, возвращает множество int."""
-        if value is None:
-            return set()
-        if isinstance(value, (list, tuple, set)):
-            try:
-                return {int(x) for x in value}
-            except Exception:
-                return set()
-        # строка: "123, 456 789"
-        s = str(value).strip()
-        if not s:
-            return set()
-        parts = re.split(r"[,\s]+", s)
-        return {int(p) for p in parts if p.isdigit()}
-    
-    def _ids_from_settings_or_env(self, attr_name: str, env_name: str) -> set[int]:
-        """Пробует достать список ID из self.settings.<attr_name>, иначе из переменной окружения <env_name>."""
-        val = getattr(self.settings, attr_name, None)
-        if not val:
-            val = os.getenv(env_name, "")
-        return self._parse_id_list(val)
-    
-    def _is_admin(self, user_id: int) -> bool:
-        return int(user_id) in self._ids_from_settings_or_env("admin_user_ids", "ADMIN_USER_IDS")
-    
-    def _is_allowed(self, user_id: int) -> bool:
-        # если ALLOWED_USER_IDS пусто — считаем, что все разрешены
-        ids = self._ids_from_settings_or_env("allowed_user_ids", "ALLOWED_USER_IDS")
-        return True if not ids else int(user_id) in ids
-
-    async def on_error(update, context):
-        # не спамим в чат, просто лог
-        import logging, traceback
-        logging.getLogger(__name__).error("Unhandled error: %s", traceback.format_exc())
 
     # =========================
     # /reset — сброс диалога
@@ -303,311 +266,347 @@ class ChatGPTTelegramBot:
 
         except Exception as e:
             await update.message.reply_text(f"⚠️ Ошибка при получении списка моделей: {e}")
-    
     async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Меню базы знаний"""
-        user_id = update.effective_user.id
-        is_admin = self._is_admin(user_id)
-        kb = [
-            [
-                # TODO: сюда твои InlineKeyboardButton(...)
+            """Главное меню Базы знаний: список/мои/синхронизация (для админа)."""
+            user = update.effective_user
+            if not user:
+                return
+            user_id = user.id
+    
+            # гарантируем активный диалог
+            dlg_id = self.current_dialog_by_user.get(user_id)
+            if dlg_id is None:
+                dlg = self.dialog_manager.create_dialog(user_id)
+                self.current_dialog_by_user[user_id] = dlg.id
+    
+            # проверка админа
+            is_admin = False
+            try:
+                from bot.settings import settings
+                is_admin = bool(settings.admin_user_ids and user_id in settings.admin_user_ids)
+            except Exception:
+                is_admin = False
+    
+            kb = [
+                [InlineKeyboardButton("📚 Выбрать документы", callback_data="kb:list:p1")],
+                [InlineKeyboardButton("🗂 Мои в диалоге", callback_data="kb:mine")],
             ]
-        ]
-        text = (
-            "🧠 *База знаний*\n"
-            "Выберите действие:\n"
-            "• 📚 *Выбрать документы* — подключить/отключить файлы к текущему диалогу\n"
-            "• 🗂 *Мои в диалоге* — список уже подключённых файлов\n"
-        )
-        if is_admin:
-            text += "• 🔄 *Синхронизация* — обновить БЗ из Яндекс.Диска (только админам)\n"
-        text += "\n_Документы хранятся на Яндекс.Диске. Удалённые файлы будут исключены при синхронизации._"
-
-        markup = InlineKeyboardMarkup(kb)
-        if update.message:
-            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-        else:
-            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
-
+            if is_admin:
+                kb.insert(0, [InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:resync")])
+    
+            text = (
+                "🧠 *База знаний*\n"
+                "Выберите действие:\n"
+                "• 📚 *Выбрать документы* — подключить/отключить файлы к текущему диалогу\n"
+                "• 🗂 *Мои в диалоге* — список уже подключённых файлов\n"
+            )
+            if is_admin:
+                text += "• 🔄 *Синхронизация* — обновить БЗ из Яндекс.Диска (только админам)\n"
+            text += "\n_Документы хранятся на Яндекс.Диске. Удалённые файлы будут исключены при синхронизации._"
+            markup = InlineKeyboardMarkup(kb)
+            if update.message:
+                await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+            else:
+                await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    
+    
+    
     async def cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показ статистики"""
-        total_dialogs = 0  # TODO: твоя логика подсчёта
-        total_messages = 0  # TODO: твоя логика подсчёта
+
+
+        """Показывает статистику диалогов и сообщений пользователя."""
+
+
+        user_id = update.effective_user.id
+
+
+        dialogs = self.dialog_manager.get_active_dialogs(user_id)
+
+
+        total_dialogs = len(dialogs)
+
+
+        total_messages = 0
+
+
+        for dlg in dialogs:
+
+
+            msgs = self.dialog_manager.get_messages(dlg.id, limit=999999)
+
+
+            total_messages += len(msgs)
+
+
 
         await update.message.reply_text(
+
+
             "📊 Ваша статистика:\n"
+
+
             f"— Активных диалогов: {total_dialogs}\n"
+
+
             f"— Всего сообщений: {total_messages}"
+
+
         )
-    
-    async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сброс текущего диалога и состояния KB."""
-        user_id = update.effective_user.id
-        self.current_dialog_by_user.pop(user_id, None)
-        self.awaiting_rename.pop(user_id, None)
-        self.awaiting_kb_pwd.pop(user_id, None)
-    
-        # Если используем DialogManager, очищаем состояние
-        self.dialog_manager.reset_user_dialogs(user_id)
-    
-        await update.message.reply_text("🔄 Диалог и настройки базы знаний сброшены.")
-    
-    async def cmd_kb_diag(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        current_dlg = self.current_dialog_by_user.get(user_id)
-        if not current_dlg:
-            await update.message.reply_text("Нет активного диалога.")
-            return
-        dlg = self.dialog_manager.get_dialog(current_dlg, user_id)
-        msgs = self.dialog_manager.get_messages(current_dlg, limit=5)
-        kb_docs = dlg.kb_documents if hasattr(dlg, "kb_documents") else []
 
-        text = f"Диалог: {dlg.title} (ID {dlg.id})\nВыбранные документы: {', '.join(kb_docs) or '—'}\nПоследние сообщения:\n"
-        for m in reversed(msgs):
-            text += f"[{m.role}] {m.content}\n"
-        await update.message.reply_text(text)
 
-        if data.startswith("kb:list:"):
-            try:
-                page = int(data.split(":")[2].lstrip("p"))
-            except Exception:
-                page = 1
-            await self._kb_render_list(update, context, page=page)
-            return
-
-        if data == "kb:mine":
-            await self._kb_render_attached(update, context)
-            return
-
-    async def on_kb_callback(self, update, context):
-        return await self.on_callback(update, context)
-
-    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        data = (query.data or "").strip()
-        user_id = update.effective_user.id
-        current_dlg = self.current_dialog_by_user.get(user_id)
     
-        # === Диалоги ===
-        if data == "dlg:new":
-            dlg = self.dialog_manager.create_dialog(user_id)
-            self.current_dialog_by_user[user_id] = dlg.id
-            await query.edit_message_text(f"Создан новый диалог: {dlg.title}")
-            return
-    
-        if data.startswith("dlg:open:"):
-            dlg_id = int(data.split(":")[2])
-            self.current_dialog_by_user[user_id] = dlg_id
-            dlg = self.dialog_manager.get_dialog(dlg_id, user_id)
-            last_msg = self.dialog_manager.get_messages(dlg_id, limit=1)
-            last_date = last_msg[0].timestamp.strftime("%Y.%m.%d") if last_msg else "—"
-            await query.edit_message_text(f"📂 Диалог '{dlg.title}' (последнее сообщение: {last_date}) активирован.")
-            return
-    
-        if data.startswith("dlg:rename:"):
-            dlg_id = int(data.split(":")[2])
-            self.awaiting_rename[user_id] = dlg_id
-            await query.edit_message_text("Введите новое название диалога:")
-            return
-    
-        if data.startswith("dlg:export:"):
-            dlg_id = int(data.split(":")[2])
-            md_text = self.dialog_manager.export_dialog(dlg_id, user_id)
-            if not md_text:
-                await query.edit_message_text("Диалог пуст.")
-                return
-            file_bytes = BytesIO(md_text.encode("utf-8"))
-            file_bytes.name = f"dialog_{dlg_id}.md"
-            await context.bot.send_document(chat_id=user_id, document=InputFile(file_bytes))
-            return
-    
-        if data.startswith("dlg:del:"):
-            dlg_id = int(data.split(":")[2])
-            self.dialog_manager.soft_delete_dialog(dlg_id, user_id)
-            await query.edit_message_text("Диалог удалён.")
-            return
-    
-        # === Модель и стиль ===
-        if data.startswith("model:"):
-            model_name = data.split(":", 1)[1]
-            dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
-            dlg_state.model = model_name
-            self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
-            await query.edit_message_text(f"✅ Модель установлена: {model_name}")
-            return
-    
-        if data.startswith("mode:"):
-            mode_key = data.split(":", 1)[1]
-            dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
-            dlg_state.style = mode_key
-            self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
-            await query.edit_message_text(f"✅ Стиль установлен: {mode_key}")
-            return
-    
-        # === KB: выбор/отключение документов ===
+        async def cmd_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            """Сброс текущего диалога и состояния KB."""
+            user_id = update.effective_user.id
+            self.current_dialog_by_user.pop(user_id, None)
+            self.awaiting_rename.pop(user_id, None)
+            self.awaiting_kb_pwd.pop(user_id, None)
         
-        # === KB: навигация ===
-        if data == "kb:root":
-            await self.cmd_kb(update, context)
-            return
-
-        if data.startswith("kb:list:"):
-            try:
-                page = int(data.split(":")[2].lstrip("p"))
-            except Exception:
-                page = 1
-            await self._kb_render_list(update, context, page=page)
-            return
-
-        if data == "kb:mine":
-            await self._kb_render_attached(update, context)
-            return
-# === KB CALLBACKS ===
-        if data.startswith("kb:toggle:"):
-            idx = int(data.split(":", 2)[2])
-            dlg_id = self.current_dialog_by_user.get(user_id)
-            dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
-            path = dlg_state.kb_last_paths.get(idx)
-
-            if not path:
-                await query.answer("Элемент недоступен, обновите список (/kb).", show_alert=True)
+            # Если используем DialogManager, очищаем состояние
+            self.dialog_manager.reset_user_dialogs(user_id)
+        
+            await update.message.reply_text("🔄 Диалог и настройки базы знаний сброшены.")
+        
+        async def cmd_kb_diag(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            current_dlg = self.current_dialog_by_user.get(user_id)
+            if not current_dlg:
+                await update.message.reply_text("Нет активного диалога.")
                 return
-
-            if path in (dlg_state.kb_documents or []):
-                dlg_state.kb_documents.remove(path)
-                dlg_state.kb_passwords.pop(path, None)
-            else:
-                dlg_state.kb_documents.append(path)
-
-            self.dialog_manager.save_dialog_state(dlg_id, user_id, dlg_state)
-
-            docs = await asyncio.to_thread(self.kb_indexer.list_documents)
-            buttons = []
-            for i, d in enumerate(docs):
-                selected = d.path in (dlg_state.kb_documents or [])
-                mark = "✅ " if selected else "☐ "
-                buttons.append([
-                    InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")
-                ])
-                if selected and d.path.lower().endswith(".pdf"):
-                    buttons.append([
-                        InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")
-                    ])
-
-            buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
-            from bot.settings import settings
-            is_admin = settings.admin_user_ids and user_id in settings.admin_user_ids
-            if is_admin:
-                buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
-
-            await query.edit_message_reply_markup(InlineKeyboardMarkup(buttons))
-            return
-
-        elif data == "kb:save":
-            dlg_id = self.current_dialog_by_user.get(user_id)
-            dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
-            dlg_state.kb_enabled = bool(dlg_state.kb_documents)
-            self.dialog_manager.save_dialog_state(dlg_id, user_id, dlg_state)
-            await query.edit_message_text(
-                "📂 База знаний отключена." if not dlg_state.kb_enabled
-                else f"Выбрано документов: {len(dlg_state.kb_documents)}. БЗ включена."
-            )
-            return
-
-        elif data == "kb:resync":
-            from bot.settings import settings
-            if not (settings.admin_user_ids and user_id in settings.admin_user_ids):
-                await query.answer("⛔ Синхронизация доступна только администраторам.", show_alert=True)
+            dlg = self.dialog_manager.get_dialog(current_dlg, user_id)
+            msgs = self.dialog_manager.get_messages(current_dlg, limit=5)
+            kb_docs = dlg.kb_documents if hasattr(dlg, "kb_documents") else []
+    
+            text = f"Диалог: {dlg.title} (ID {dlg.id})\nВыбранные документы: {', '.join(kb_docs) or '—'}\nПоследние сообщения:\n"
+            for m in reversed(msgs):
+                text += f"[{m.role}] {m.content}\n"
+            await update.message.reply_text(text)
+            # Навигация по БЗ
+            if data == "kb:root":
+                await self.cmd_kb(update, context)
                 return
-            await query.edit_message_text("🔄 Синхронизация базы знаний...")
-            await asyncio.to_thread(self.kb_indexer.sync)
-            await asyncio.sleep(1)
-            await self.cmd_kb(update, context)
-            return
-
-        elif data.startswith("kb:pwd:"):
-            idx = int(data.split(":", 2)[2])
-            dlg_id = self.current_dialog_by_user.get(user_id)
-            dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
-            path = dlg_state.kb_last_paths.get(idx)
-
-            if not path:
-                await query.answer("Элемент недоступен, обновите список (/kb).", show_alert=True)
+    
+            if data.startswith("kb:list:"):
+                try:
+                    page = int(data.split(":")[2].lstrip("p"))
+                except Exception:
+                    page = 1
+                await self._kb_render_list(update, context, page=page)
                 return
-
-            self.awaiting_kb_pwd[user_id] = idx
-            await query.edit_message_text(f"Введите пароль для документа: {os.path.basename(path)}")
-            return
     
-    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        text = update.message.text.strip()
+            if data == "kb:mine":
+                await self._kb_render_attached(update, context)
+                return
     
-        # === Переименование диалога ===
-        if user_id in self.awaiting_rename:
-            dlg_id = self.awaiting_rename.pop(user_id)
-            self.dialog_manager.rename_dialog(dlg_id, user_id, text)
-            await update.message.reply_text(f"Диалог переименован в: {text}")
-            return
+        async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            data = (query.data or "").strip()
+            user_id = update.effective_user.id
+            current_dlg = self.current_dialog_by_user.get(user_id)
+        
+            # === Диалоги ===
+            if data == "dlg:new":
+                dlg = self.dialog_manager.create_dialog(user_id)
+                self.current_dialog_by_user[user_id] = dlg.id
+                await query.edit_message_text(f"Создан новый диалог: {dlg.title}")
+                return
+        
+            if data.startswith("dlg:open:"):
+                dlg_id = int(data.split(":")[2])
+                self.current_dialog_by_user[user_id] = dlg_id
+                dlg = self.dialog_manager.get_dialog(dlg_id, user_id)
+                last_msg = self.dialog_manager.get_messages(dlg_id, limit=1)
+                last_date = last_msg[0].timestamp.strftime("%Y.%m.%d") if last_msg else "—"
+                await query.edit_message_text(f"📂 Диалог '{dlg.title}' (последнее сообщение: {last_date}) активирован.")
+                return
+        
+            if data.startswith("dlg:rename:"):
+                dlg_id = int(data.split(":")[2])
+                self.awaiting_rename[user_id] = dlg_id
+                await query.edit_message_text("Введите новое название диалога:")
+                return
+        
+            if data.startswith("dlg:export:"):
+                dlg_id = int(data.split(":")[2])
+                md_text = self.dialog_manager.export_dialog(dlg_id, user_id)
+                if not md_text:
+                    await query.edit_message_text("Диалог пуст.")
+                    return
+                file_bytes = BytesIO(md_text.encode("utf-8"))
+                file_bytes.name = f"dialog_{dlg_id}.md"
+                await context.bot.send_document(chat_id=user_id, document=InputFile(file_bytes))
+                return
+        
+            if data.startswith("dlg:del:"):
+                dlg_id = int(data.split(":")[2])
+                self.dialog_manager.soft_delete_dialog(dlg_id, user_id)
+                await query.edit_message_text("Диалог удалён.")
+                return
+        
+            # === Модель и стиль ===
+            if data.startswith("model:"):
+                model_name = data.split(":", 1)[1]
+                dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
+                dlg_state.model = model_name
+                self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
+                await query.edit_message_text(f"✅ Модель установлена: {model_name}")
+                return
+        
+            if data.startswith("mode:"):
+                mode_key = data.split(":", 1)[1]
+                dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
+                dlg_state.style = mode_key
+                self.dialog_manager.save_dialog_state(current_dlg, user_id, dlg_state)
+                await query.edit_message_text(f"✅ Стиль установлен: {mode_key}")
+                return
+        
+            # === KB: выбор/отключение документов ===
+            # === KB CALLBACKS ===
+            if data.startswith("kb:toggle:"):
+                idx = int(data.split(":", 2)[2])
+                dlg_id = self.current_dialog_by_user.get(user_id)
+                dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
+                path = dlg_state.kb_last_paths.get(idx)
     
-        # === Пароль к документу KB ===
-        if user_id in self.awaiting_kb_pwd:
-            idx = self.awaiting_kb_pwd.pop(user_id)
-            dlg_id = self.current_dialog_by_user.get(user_id)
-            dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
-            path = dlg_state.kb_last_paths.get(idx)
-            if path:
-                dlg_state.kb_passwords[path] = text
+                if not path:
+                    await query.answer("Элемент недоступен, обновите список (/kb).", show_alert=True)
+                    return
+    
+                if path in (dlg_state.kb_documents or []):
+                    dlg_state.kb_documents.remove(path)
+                    dlg_state.kb_passwords.pop(path, None)
+                else:
+                    dlg_state.kb_documents.append(path)
+    
                 self.dialog_manager.save_dialog_state(dlg_id, user_id, dlg_state)
-                await update.message.reply_text(f"🔑 Пароль сохранён для: {os.path.basename(path)}")
-            else:
-                await update.message.reply_text("⚠️ Не удалось сохранить пароль: документ не найден.")
-            return
     
-        # === Определение текущего диалога ===
-        current_dlg = self.current_dialog_by_user.get(user_id)
-        if not current_dlg:
-            dlg = self.dialog_manager.create_dialog(user_id)
-            self.current_dialog_by_user[user_id] = dlg.id
-            current_dlg = dlg.id
+                docs = await asyncio.to_thread(self.kb_indexer.list_documents)
+                buttons = []
+                for i, d in enumerate(docs):
+                    selected = d.path in (dlg_state.kb_documents or [])
+                    mark = "✅ " if selected else "☐ "
+                    buttons.append([
+                        InlineKeyboardButton(f"{mark}{os.path.basename(d.path)}", callback_data=f"kb:toggle:{i}")
+                    ])
+                    if selected and d.path.lower().endswith(".pdf"):
+                        buttons.append([
+                            InlineKeyboardButton("🔑 Пароль", callback_data=f"kb:pwd:{i}")
+                        ])
     
-        self.dialog_manager.add_message(current_dlg, "user", text)
+                buttons.append([InlineKeyboardButton("💾 Сохранить выбор", callback_data="kb:save")])
+                from bot.settings import settings
+                is_admin = settings.admin_user_ids and user_id in settings.admin_user_ids
+                if is_admin:
+                    buttons.append([InlineKeyboardButton("🔁 Повторить синхронизацию", callback_data="kb:resync")])
     
-        # === Подготовка контекста из БЗ ===
-        kb_context = None
-        dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
+                await query.edit_message_reply_markup(InlineKeyboardMarkup(buttons))
+                return
     
-        if dlg_state.kb_enabled and dlg_state.kb_documents:
-            chunks = await asyncio.to_thread(
-                self.kb_retriever.retrieve,
-                text,
-                dlg_state.kb_documents,
-                dlg_state.kb_passwords
+            elif data == "kb:save":
+                dlg_id = self.current_dialog_by_user.get(user_id)
+                dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
+                dlg_state.kb_enabled = bool(dlg_state.kb_documents)
+                self.dialog_manager.save_dialog_state(dlg_id, user_id, dlg_state)
+                await query.edit_message_text(
+                    "📂 База знаний отключена." if not dlg_state.kb_enabled
+                    else f"Выбрано документов: {len(dlg_state.kb_documents)}. БЗ включена."
+                )
+                return
+    
+            elif data == "kb:resync":
+                from bot.settings import settings
+                if not (settings.admin_user_ids and user_id in settings.admin_user_ids):
+                    await query.answer("⛔ Синхронизация доступна только администраторам.", show_alert=True)
+                    return
+                await query.edit_message_text("🔄 Синхронизация базы знаний...")
+                await asyncio.to_thread(self.kb_indexer.sync)
+                await asyncio.sleep(1)
+                await self.cmd_kb(update, context)
+                return
+    
+            elif data.startswith("kb:pwd:"):
+                idx = int(data.split(":", 2)[2])
+                dlg_id = self.current_dialog_by_user.get(user_id)
+                dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
+                path = dlg_state.kb_last_paths.get(idx)
+    
+                if not path:
+                    await query.answer("Элемент недоступен, обновите список (/kb).", show_alert=True)
+                    return
+    
+                self.awaiting_kb_pwd[user_id] = idx
+                await query.edit_message_text(f"Введите пароль для документа: {os.path.basename(path)}")
+                return
+        
+        async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            text = update.message.text.strip()
+        
+            # === Переименование диалога ===
+            if user_id in self.awaiting_rename:
+                dlg_id = self.awaiting_rename.pop(user_id)
+                self.dialog_manager.rename_dialog(dlg_id, user_id, text)
+                await update.message.reply_text(f"Диалог переименован в: {text}")
+                return
+        
+            # === Пароль к документу KB ===
+            if user_id in self.awaiting_kb_pwd:
+                idx = self.awaiting_kb_pwd.pop(user_id)
+                dlg_id = self.current_dialog_by_user.get(user_id)
+                dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
+                path = dlg_state.kb_last_paths.get(idx)
+                if path:
+                    dlg_state.kb_passwords[path] = text
+                    self.dialog_manager.save_dialog_state(dlg_id, user_id, dlg_state)
+                    await update.message.reply_text(f"🔑 Пароль сохранён для: {os.path.basename(path)}")
+                else:
+                    await update.message.reply_text("⚠️ Не удалось сохранить пароль: документ не найден.")
+                return
+        
+            # === Определение текущего диалога ===
+            current_dlg = self.current_dialog_by_user.get(user_id)
+            if not current_dlg:
+                dlg = self.dialog_manager.create_dialog(user_id)
+                self.current_dialog_by_user[user_id] = dlg.id
+                current_dlg = dlg.id
+        
+            self.dialog_manager.add_message(current_dlg, "user", text)
+        
+            # === Подготовка контекста из БЗ ===
+            kb_context = None
+            dlg_state = self.dialog_manager.get_dialog_state(current_dlg, user_id)
+        
+            if dlg_state.kb_enabled and dlg_state.kb_documents:
+                chunks = await asyncio.to_thread(
+                    self.kb_retriever.retrieve,
+                    text,
+                    dlg_state.kb_documents,
+                    dlg_state.kb_passwords
+                )
+        
+                # Проверка PDF-документов на успешность дешифровки
+                used_text = "\n".join(chunks) if chunks else ""
+                for path in dlg_state.kb_documents:
+                    if path.lower().endswith(".pdf") and path not in used_text:
+                        await update.message.reply_text(
+                            f"⚠️ Документ {os.path.basename(path)} не использован. "
+                            "Возможно, необходим пароль или он указан неверно."
+                        )
+        
+                if chunks:
+                    kb_context = "\n\n".join(chunks)
+        
+            # === Запрос к OpenAI ===
+            dlg_obj = self.dialog_manager.get_dialog(current_dlg, user_id)
+            reply = await self.openai.chat(
+                dialog_id=current_dlg,
+                user_id=user_id,
+                user_message=text,
+                style=dlg_obj.style,
+                kb_context=kb_context,
+                model=dlg_obj.model
             )
-    
-            # Проверка PDF-документов на успешность дешифровки
-            used_text = "\n".join(chunks) if chunks else ""
-            for path in dlg_state.kb_documents:
-                if path.lower().endswith(".pdf") and path not in used_text:
-                    await update.message.reply_text(
-                        f"⚠️ Документ {os.path.basename(path)} не использован. "
-                        "Возможно, необходим пароль или он указан неверно."
-                    )
-    
-            if chunks:
-                kb_context = "\n\n".join(chunks)
-    
-        # === Запрос к OpenAI ===
-        dlg_obj = self.dialog_manager.get_dialog(current_dlg, user_id)
-        reply = await self.openai.chat(
-            dialog_id=current_dlg,
-            user_id=user_id,
-            user_message=text,
-            style=dlg_obj.style,
-            kb_context=kb_context,
-            model=dlg_obj.model
-        )
-    
-        self.dialog_manager.add_message(current_dlg, "assistant", reply)
-        await update.message.reply_text(reply)
+        
+            self.dialog_manager.add_message(current_dlg, "assistant", reply)
+            await update.message.reply_text(reply)
