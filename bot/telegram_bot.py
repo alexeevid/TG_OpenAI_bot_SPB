@@ -299,8 +299,7 @@ async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Выберите действие:\n"
             "• 📚 *Выбрать документы* — подключить/отключить файлы к текущему диалогу\n"
             "• 🗂 *Мои в диалоге* — список уже подключённых файлов\n"
-            f"{'• 🔄 *Синхронизация* — обновить БЗ из Яндекс.Диска (только админам)
-' if is_admin else ''}"
+            ('• 🔄 *Синхронизация* — обновить БЗ из Яндекс.Диска (только админам)\n' if is_admin else '')
             "\n_Документы хранятся на Яндекс.Диске. Удалённые файлы будут исключены при синхронизации._"
         )
         markup = InlineKeyboardMarkup(kb)
@@ -323,10 +322,8 @@ async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_messages += len(msgs)
 
         await update.message.reply_text(
-            f"📊 Ваша статистика:
-"
-            f"— Активных диалогов: {total_dialogs}
-"
+            "📊 Ваша статистика:\n"
+            f"— Активных диалогов: {total_dialogs}\n"
             f"— Всего сообщений: {total_messages}"
         )
     
@@ -356,10 +353,6 @@ async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         for m in reversed(msgs):
             text += f"[{m.role}] {m.content}\n"
         await update.message.reply_text(text)
-        # Навигация по БЗ
-        if data == "kb:root":
-            await self.cmd_kb(update, context)
-            return
 
         if data.startswith("kb:list:"):
             try:
@@ -437,7 +430,24 @@ async def cmd_kb(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     
         # === KB: выбор/отключение документов ===
-        # === KB CALLBACKS ===
+        
+        # === KB: навигация ===
+        if data == "kb:root":
+            await self.cmd_kb(update, context)
+            return
+
+        if data.startswith("kb:list:"):
+            try:
+                page = int(data.split(":")[2].lstrip("p"))
+            except Exception:
+                page = 1
+            await self._kb_render_list(update, context, page=page)
+            return
+
+        if data == "kb:mine":
+            await self._kb_render_attached(update, context)
+            return
+# === KB CALLBACKS ===
         if data.startswith("kb:toggle:"):
             idx = int(data.split(":", 2)[2])
             dlg_id = self.current_dialog_by_user.get(user_id)
