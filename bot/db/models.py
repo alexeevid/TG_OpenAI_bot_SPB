@@ -1,5 +1,5 @@
 from sqlalchemy import Column, BigInteger, Text, Boolean, Integer, DateTime, ForeignKey, JSON, String
-from sqlalchemy_pgvector import Vector
+from pgvector.sqlalchemy import Vector
 from bot.db.session import Base
 class User(Base):
     __tablename__='users'
