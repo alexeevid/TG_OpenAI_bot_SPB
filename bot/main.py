@@ -37,13 +37,14 @@ def main():
     app.add_handler(CommandHandler("img", bot.cmd_img))
     app.add_handler(CommandHandler("kb", bot.cmd_kb))
     app.add_handler(CommandHandler("stats", bot.cmd_stats))
-
+   
     # Обработка текстовых сообщений
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
 
     # Обработка callback-кнопок
     app.add_handler(CallbackQueryHandler(bot.on_callback))
-
+    app.add_handler(CallbackQueryHandler(bot.on_kb_callback, pattern=r"^kb:"))
+    
     logger.info("🤖 Бот запущен в режиме polling")
     app.run_polling()
 
