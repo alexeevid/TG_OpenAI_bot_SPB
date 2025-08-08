@@ -1,4 +1,6 @@
+        
 import logging
+logger = logging.getLogger(__name__)
 import time
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
@@ -610,3 +612,8 @@ class ChatGPTTelegramBot:
         
             self.dialog_manager.add_message(current_dlg, "assistant", reply)
             await update.message.reply_text(reply)
+
+
+async def on_error(update, context):
+    """Глобальный обработчик ошибок Telegram."""
+    logger.exception("Произошла ошибка при обработке апдейта", exc_info=context.error)
