@@ -370,36 +370,54 @@ class ChatGPTTelegramBot:
             await update.message.reply_text("🔄 Диалог и настройки базы знаний сброшены.")
         
         async def cmd_kb_diag(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-            user_id = update.effective_user.id
-            current_dlg = self.current_dialog_by_user.get(user_id)
-            if not current_dlg:
-                await update.message.reply_text("Нет активного диалога.")
-                return
-            dlg = self.dialog_manager.get_dialog(current_dlg, user_id)
-            msgs = self.dialog_manager.get_messages(current_dlg, limit=5)
-            kb_docs = dlg.kb_documents if hasattr(dlg, "kb_documents") else []
-    
-            text = f"Диалог: {dlg.title} (ID {dlg.id})\nВыбранные документы: {', '.join(kb_docs) or '—'}\nПоследние сообщения:\n"
-            for m in reversed(msgs):
-                text += f"[{m.role}] {m.content}\n"
-            await update.message.reply_text(text)
-            # Навигация по БЗ
-            if data == "kb:root":
-                await self.cmd_kb(update, context)
-                return
-    
-            if data.startswith("kb:list:"):
+                """Технический отчёт по текущему диалогу и БЗ."""
+                user_id = update.effective_user.id
+                dlg_id = self.current_dialog_by_user.get(user_id)
+                if not dlg_id:
+                    await update.message.reply_text("Нет активного диалога.")
+                    return
+        
+                dlg = self.dialog_manager.get_dialog(dlg_id, user_id)
+                msgs = self.dialog_manager.get_messages(dlg_id, limit=5) or []
+                dlg_state = self.dialog_manager.get_dialog_state(dlg_id, user_id)
+        
+                kb_docs = (getattr(dlg_state, "kb_documents", None) or [])
+                kb_enabled = bool(getattr(dlg_state, "kb_enabled", False))
+                last_paths = getattr(dlg_state, "kb_last_paths", {}) or {}
+                pwd_count = len(getattr(dlg_state, "kb_passwords", {}) or {})
+        
+                # Сверим с индексом, какие файлы реально доступны
                 try:
-                    page = int(data.split(":")[2].lstrip("p"))
+                    docs = await asyncio.to_thread(self.kb_indexer.list_documents)
+                    available = {d.path for d in docs}
                 except Exception:
-                    page = 1
-                await self._kb_render_list(update, context, page=page)
-                return
-    
-            if data == "kb:mine":
-                await self._kb_render_attached(update, context)
-                return
-    
+                    available = set()
+        
+                missing = [p for p in kb_docs if p not in available]
+        
+                lines = [
+                    f"🧪 Диагностика БЗ для диалога: *{dlg.title}* (ID {dlg.id})",
+                    f"— Статус БЗ: {'✅ включена' if kb_enabled else '⛔️ выключена'}",
+                    f"— Подключено документов: {len(kb_docs)}",
+                ]
+                if kb_docs:
+                    lines.append("— Список документов:")
+                    for p in kb_docs:
+                        mark = "❌ (нет в индексе)" if p in missing else "✅"
+                        lines.append(f"   {mark} `{p}`")
+                lines += [
+                    f"— Временных позиций (kb_last_paths): {len(last_paths)}",
+                    f"— Сохранённых паролей: {pwd_count}",
+                    "",
+                    "📝 Последние сообщения:",
+                ]
+                for m in reversed(msgs):
+                    role = getattr(m, "role", "user")
+                    content = (getattr(m, "content", "") or "")[:200].replace("\n", " ")
+                    lines.append(f"— [{role}] {content}")
+        
+                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
         async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
             query = update.callback_query
             await query.answer()
