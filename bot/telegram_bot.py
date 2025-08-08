@@ -342,6 +342,9 @@ class ChatGPTTelegramBot:
             await self._kb_render_attached(update, context)
             return
 
+    async def on_kb_callback(self, update, context):
+        return await self.on_callback(update, context)
+
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
