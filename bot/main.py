@@ -23,7 +23,8 @@ def main():
     bot = ChatGPTTelegramBot(settings)
 
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
-
+    app.add_error_handler(bot.on_error)
+    
     # Регистрируем команды
     app.add_handler(CommandHandler("start", bot.cmd_start))
     app.add_handler(CommandHandler("help", bot.cmd_help))
