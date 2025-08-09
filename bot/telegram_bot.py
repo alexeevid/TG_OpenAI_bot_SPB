@@ -4,9 +4,18 @@ import logging
 from datetime import datetime
 from io import BytesIO
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
-)
+# PTB 20.4 не содержит BufferedInputFile. Делаем совместимый импорт.
+try:
+    from telegram import (
+        Update, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile, InputFile
+    )
+    HAS_BUFFERED = True
+except Exception:  # pragma: no cover
+    from telegram import (  # type: ignore
+        Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+    )
+    HAS_BUFFERED = False
+
 from telegram.ext import (
     ApplicationBuilder, Application, CommandHandler, ContextTypes,
     MessageHandler, CallbackQueryHandler, filters
@@ -19,9 +28,7 @@ from bot.db.session import SessionLocal
 log = logging.getLogger(__name__)
 settings = load_settings()
 
-# ---------------------------
-# SQL helpers
-# ---------------------------
+# ---------- helpers ----------
 def _exec_scalar(db, sql: str, **params):
     return db.execute(text(sql), params).scalar()
 
@@ -29,13 +36,13 @@ def _exec_all(db, sql: str, **params):
     return db.execute(text(sql), params).all()
 
 def _ensure_user(db, tg_id: int) -> int:
-    """Return users.id; create if needed."""
     uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id=:tg", tg=tg_id)
     if uid:
         return uid
     uid = _exec_scalar(
         db,
-        """        INSERT INTO users (tg_user_id, is_admin, is_allowed, lang)
+        """
+        INSERT INTO users (tg_user_id, is_admin, is_allowed, lang)
         VALUES (:tg, FALSE, TRUE, 'ru')
         RETURNING id
         """, tg=tg_id,
@@ -43,10 +50,10 @@ def _ensure_user(db, tg_id: int) -> int:
     return uid
 
 def _ensure_dialog(db, user_id: int) -> int:
-    """Return dialogs.id of the latest non-deleted dialog; create if needed."""
     did = _exec_scalar(
         db,
-        """        SELECT id FROM dialogs
+        """
+        SELECT id FROM dialogs
         WHERE user_id=:u AND is_deleted=FALSE
         ORDER BY created_at DESC
         LIMIT 1
@@ -56,7 +63,8 @@ def _ensure_dialog(db, user_id: int) -> int:
         return did
     did = _exec_scalar(
         db,
-        """        INSERT INTO dialogs (user_id, title, style, model, is_deleted)
+        """
+        INSERT INTO dialogs (user_id, title, style, model, is_deleted)
         VALUES (:u, :t, 'expert', :m, FALSE)
         RETURNING id
         """, u=user_id, t=datetime.now().strftime("%Y-%m-%d | диалог"), m=settings.openai_model,
@@ -70,9 +78,7 @@ def _is_admin(tg_id: int) -> bool:
     except Exception:
         return False
 
-# ---------------------------
-# /START, /HELP, /HEALTH, /STATS
-# ---------------------------
+# ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = update.effective_chat.id if update.effective_chat else None
@@ -126,9 +132,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("stats failed")
         await update.message.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
 
-# ---------------------------
-# /DIALOGS (+ callbacks)
-# ---------------------------
+# ---------- dialogs ----------
 async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_id = update.effective_user.id
@@ -136,7 +140,8 @@ async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid = _ensure_user(db, tg_id)
             ds = _exec_all(
                 db,
-                """                SELECT id, title
+                """
+                SELECT id, title
                 FROM dialogs
                 WHERE user_id=:u AND is_deleted=FALSE
                 ORDER BY created_at DESC
@@ -179,7 +184,8 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with SessionLocal() as db:
                 msgs = _exec_all(
                     db,
-                    """                    SELECT role, content, created_at
+                    """
+                    SELECT role, content, created_at
                     FROM messages
                     WHERE dialog_id=:d
                     ORDER BY created_at
@@ -190,7 +196,10 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 who = "Пользователь" if role == "user" else "Бот"
                 lines.append(f"**{who}:**\n{content}\n")
             data_bytes = "\n".join(lines).encode("utf-8")
-            file = BufferedInputFile(data_bytes, filename=f"dialog_{dlg_id}.md")
+            if HAS_BUFFERED:
+                file = BufferedInputFile(data_bytes, filename=f"dialog_{dlg_id}.md")  # type: ignore
+            else:
+                file = InputFile(data_bytes, filename=f"dialog_{dlg_id}.md")  # type: ignore
             await q.message.reply_document(document=file, caption="Экспорт готов")
             return
 
@@ -226,10 +235,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("Принято. (Текстовый роутер будет подключён к RAG после стабилизации UI.)")
 
-# ---------------------------
-# /KB (+ callbacks)
-# ---------------------------
+# ---------- KB ----------
 PAGE_SIZE = 8
+
+def _exec_page_count(total: int) -> int:
+    return max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
 def _kb_keyboard(rows, page, pages, filter_name, admin: bool):
     nav = []
@@ -258,7 +268,8 @@ def _kb_keyboard(rows, page, pages, filter_name, admin: bool):
 def _kb_fetch(db, user_id: int, page: int, filter_name: str):
     dlg_id = _exec_scalar(
         db,
-        """        SELECT d.id
+        """
+        SELECT d.id
         FROM dialogs d
         WHERE d.user_id=:u AND d.is_deleted=FALSE
         ORDER BY d.created_at DESC
@@ -284,12 +295,13 @@ def _kb_fetch(db, user_id: int, page: int, filter_name: str):
         params["ids"] = list(conn_ids)
 
     total = _exec_scalar(db, f"SELECT COUNT(*) FROM kb_documents {where}", **params) or 0
-    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    pages = _exec_page_count(total)
     page = max(1, min(page, pages))
 
     rows = _exec_all(
         db,
-        f"""        SELECT id, path
+        f"""
+        SELECT id, path
         FROM kb_documents
         {where}
         ORDER BY path
@@ -311,8 +323,8 @@ async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             checked = "☑" if d_id in conn_ids else "☐"
             fname = path.split("/")[-1]
             buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:all")])
-        kb = _kb_keyboard(buttons, page, pages, "all", admin=_is_admin(tg_id))
-        await update.message.reply_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb)
+        kb_markup = _kb_keyboard(buttons, page, pages, "all", admin=_is_admin(tg_id))
+        await update.message.reply_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
     except Exception:
         log.exception("kb failed")
         await update.message.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
@@ -334,15 +346,16 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     checked = "☑" if d_id in conn_ids else "☐"
                     fname = path.split("/")[-1]
                     buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:{flt}")])
-                kb = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
-                await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb)
+                kb_markup = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
+                await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
                 return
 
             if data.startswith("kb:toggle:"):
                 _, _, doc_id, page, flt = data.split(":", 4)
                 doc_id = int(doc_id)
                 dlg_id = _exec_scalar(db,
-                    """                    SELECT id FROM dialogs WHERE user_id=:u AND is_deleted=FALSE
+                    """
+                    SELECT id FROM dialogs WHERE user_id=:u AND is_deleted=FALSE
                     ORDER BY created_at DESC LIMIT 1
                     """, u=uid)
                 if not dlg_id:
@@ -365,8 +378,8 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     checked = "☑" if d_id in conn_ids else "☐"
                     fname = path.split("/")[-1]
                     buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:{flt}")])
-                kb = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
-                await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb)
+                kb_markup = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
+                await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
                 return
 
             if data == "kb:status":
@@ -391,9 +404,7 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ---------------------------
-# SERVICE / ERROR
-# ---------------------------
+# ---------- service ----------
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Контекст текущего диалога очищен.")
@@ -408,9 +419,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ---------------------------
-# BUILD APP
-# ---------------------------
+# ---------- build ----------
 def build_app() -> Application:
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
 
