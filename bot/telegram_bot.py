@@ -23,10 +23,41 @@ from telegram.ext import (
 from sqlalchemy import text
 
 from bot.settings import load_settings
-from bot.db.session import SessionLocal
+from bot.db.session import SessionLocal  # engine импортируем внутри apply_migrations_if_needed
 
 log = logging.getLogger(__name__)
 settings = load_settings()
+
+# --- Авто-миграция при старте (если нет таблиц) ---
+def apply_migrations_if_needed(force: bool = False) -> None:
+    """
+    Если таблицы отсутствуют (или force=True), запускаем alembic upgrade head.
+    Работает без консоли Railway.
+    """
+    try:
+        from sqlalchemy import text
+        from bot.db.session import engine
+        need = True
+        if not force:
+            # Проверяем наличие ключевой таблицы
+            with engine.connect() as conn:
+                exists = conn.execute(text("SELECT to_regclass('public.users')")).scalar()
+                need = not bool(exists)
+
+        if need:
+            log.info("Auto-migrate: applying Alembic migrations...")
+            # Настраиваем Alembic программно
+            import os
+            from alembic.config import Config
+            from alembic import command
+            cfg = Config("alembic.ini")  # файл лежит в корне проекта
+            os.environ["DATABASE_URL"] = settings.database_url  # чтобы Alembic знал, куда подключаться
+            command.upgrade(cfg, "head")
+            log.info("Auto-migrate: done")
+        else:
+            log.info("Auto-migrate: tables already present")
+    except Exception:
+        log.exception("Auto-migrate failed")
 
 # ---------- helpers ----------
 def _exec_scalar(db, sql: str, **params):
@@ -421,6 +452,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- build ----------
 def build_app() -> Application:
+    apply_migrations_if_needed()
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
 
     app.add_error_handler(error_handler)
