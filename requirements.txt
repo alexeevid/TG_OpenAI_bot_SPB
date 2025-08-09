@@ -15,3 +15,4 @@ PyMuPDF==1.23.5
 python-docx==1.1.0
 python-pptx==0.6.21
 openpyxl==3.1.2
+pydantic-settings==2.2.1
