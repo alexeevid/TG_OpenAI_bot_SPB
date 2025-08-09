@@ -143,6 +143,125 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# ---- RAG helpers ----
+from typing import List, Tuple
+
+def _vec_literal(vec: List[float]) -> Tuple[str, dict]:
+    arr = "[" + ","join(f"{x:.6f}" for x in (vec or [])) + "]"
+    return ":q::vector", {"q": arr}
+
+def _embed_query(text: str) -> List[float]:
+    from openai import OpenAI
+    client = OpenAI(api_key=settings.openai_api_key)
+    return client.embeddings.create(model=settings.embedding_model, input=[text]).data[0].embedding
+
+def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict]:
+    # если столбец embedding не в vector-типе — просто вернём пусто (RAG отключится)
+    kind = _kb_embedding_column_kind(db)
+    if kind != "vector":
+        return []
+
+    q = _embed_query(question)
+    placeholder, params = _vec_literal(q)
+    sql = f"""
+        SELECT c.content, c.meta, d.path
+        FROM kb_chunks c
+        JOIN kb_documents d      ON d.id = c.document_id AND d.is_active = TRUE
+        JOIN dialog_kb_links l   ON l.document_id = c.document_id
+        WHERE l.dialog_id = :did
+        ORDER BY c.embedding <=> {placeholder}
+        LIMIT :k
+    """
+    p = {"did": dialog_id, "k": k}; p.update(params)
+    rows = db.execute(text(sql), p).mappings().all()
+    return [dict(r) for r in rows]
+
+def _build_prompt(context_blocks: List[str], question: str) -> str:
+    ctx = "\n\n".join(f"[{i+1}] {b}" for i, b in enumerate(context_blocks))
+    return (
+        "Ты отвечаешь кратко и по делу на основе контекста ниже. "
+        "Если в контексте нет ответа, честно скажи об этом.\n\n"
+        f"КОНТЕКСТ:\n{ctx}\n\n"
+        f"ВОПРОС: {question}\nОТВЕТ:"
+    )
+
+def _format_citations(chunks: List[dict]) -> str:
+    # Берём короткое имя файла
+    def short(p: str) -> str:
+        return (p or "").split("/")[-1].split("?")[0]
+    uniq = []
+    for r in chunks:
+        name = short(r.get("path") or (r.get("meta") or {}).get("path", ""))
+        if name and name not in uniq:
+            uniq.append(name)
+    if not uniq: 
+        return ""
+    return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    q = (m.text or "").strip()
+    if not q:
+        return
+
+    try:
+        with SessionLocal() as db:
+            tg_id = update.effective_user.id
+            user_id = _ensure_user(db, tg_id)
+            dialog_id = _ensure_dialog(db, user_id)  # активный диалог
+
+            # 1) пробуем достать контекст из подключённых документов
+            chunks = _retrieve_chunks(db, dialog_id, q, k=6)
+
+            from openai import OpenAI
+            client = OpenAI(api_key=settings.openai_api_key)
+
+            if chunks:
+                ctx_blocks = [r["content"][:800] for r in chunks]  # аккуратно ограничим
+                prompt = _build_prompt(ctx_blocks, q)
+            else:
+                # без RAG — обычный ответ модели
+                prompt = q
+
+            resp = client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[{"role":"system","content":"Ты полезный помощник."},
+                          {"role":"user","content": prompt}],
+                temperature=0.2,
+            )
+            answer = resp.choices[0].message.content or "…"
+
+            # добавим источники, если был контекст
+            if chunks:
+                answer += _format_citations(chunks)
+
+            await m.reply_text(answer)
+    except Exception:
+        log.exception("on_text failed")
+        await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+
+async def rag_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    q = " ".join(context.args) if context.args else ""
+    if not q:
+        return await m.reply_text("Напишите запрос: /rag_diag ваш вопрос")
+    try:
+        with SessionLocal() as db:
+            uid = _ensure_user(db, update.effective_user.id)
+            did = _ensure_dialog(db, uid)
+            rows = _retrieve_chunks(db, did, q, k=5)
+            if not rows:
+                return await m.reply_text("Ничего релевантного не нашли среди подключённых документов.")
+            out = []
+            for i, r in enumerate(rows, 1):
+                path = (r.get("path") or (r.get("meta") or {}).get("path", "")).split("/")[-1]
+                sample = (r["content"] or "")[:140].replace("\n", " ")
+                out.append(f"[{i}] {path} — “{sample}…”")
+            await m.reply_text("\n".join(out))
+    except Exception:
+        log.exception("rag_diag failed")
+        await m.reply_text("⚠ rag_diag: ошибка. Смотри логи.")
+
 # ---- PDF helpers ----
 def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
     """
@@ -1353,7 +1472,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_chunks_force", kb_chunks_force))
     app.add_handler(CommandHandler("kb_sync", kb_sync))
     app.add_handler(CommandHandler("kb_sync_pdf", kb_sync_pdf))
+    app.add_handler(CommandHandler("rag_diag", rag_diag))
 
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     return app
