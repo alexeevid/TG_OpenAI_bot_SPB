@@ -360,4 +360,5 @@ def build_app()->Application:
     app.add_handler(CommandHandler('mode', mode_cmd))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, voice_message))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
+    app.add_error_handler(on_error)
     return app
