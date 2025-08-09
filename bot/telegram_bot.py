@@ -201,6 +201,18 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data=='kb:nop':
         return
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback, logging
+    logging.exception("Unhandled error: %s", traceback.format_exc())
+    # по возможности сообщим пользователю
+    try:
+        if hasattr(update, "message") and update.message:
+            await update.message.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+        elif hasattr(update, "callback_query") and update.callback_query:
+            await update.callback_query.message.reply_text("⚠ Ошибка обработчика. Попробуйте ещё раз.")
+    except Exception:
+        pass
+
 async def dialogs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     dbu, _ = _ensure_user_and_dialog(user.id)
