@@ -219,21 +219,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
 
-        # режим переименования диалога
-        if "rename_dialog_id" in context.user_data:
-            dlg_id = context.user_data.pop("rename_dialog_id")
-            new_title = (m.text or "").strip()[:100]
-            if not new_title:
-                return await m.reply_text("Название пустое. Отменено.")
-            try:
-                with SessionLocal() as db:
-                    db.execute(text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
-                    db.commit()
-                return await m.reply_text("Название сохранено.")
-            except Exception:
-                log.exception("rename dialog title failed")
-                return await m.reply_text("⚠ Не удалось сохранить название.")
-
     try:
         with SessionLocal() as db:
             tg_id = update.effective_user.id
@@ -344,6 +329,14 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         indexed_chunks = 0
 
         with SessionLocal() as db:
+            # деактивируем PDF, которых нет на диске
+            present = { (f.get("path") or f.get("name")) for f in files if (f.get("path") or f.get("name")) }
+            rows = db.execute(text("SELECT id, path, is_active FROM kb_documents WHERE mime LIKE 'application/pdf%'")).mappings().all()
+            for r in rows:
+                if r["path"] not in present and r["is_active"]:
+                    db.execute(text("UPDATE kb_documents SET is_active=FALSE, updated_at=now() WHERE id=:id"), {"id": r["id"]})
+            db.commit()
+
             emb_kind = _kb_embedding_column_kind(db)  # 'vector' | 'bytea' | 'none'
             for it in files:
                 path  = it.get("path") or it.get("name")
@@ -365,7 +358,7 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Парсим
                 try:
-                    txt, pages, is_prot = _pdf_extract_text(blob)
+                    text, pages, is_prot = _pdf_extract_text(blob)
                 except Exception:
                     log.exception("pdf parse failed: %s", path)
                     continue
@@ -380,7 +373,7 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Переиндексация целиком (простая стратегия)
                 _kb_clear_chunks(db, doc_id)
 
-                chunks = _chunk_text(txt, settings.chunk_size, settings.chunk_overlap)
+                chunks = _chunk_text(text, settings.chunk_size, settings.chunk_overlap)
                 embs = _get_embeddings(chunks) if emb_kind in ("vector","bytea") else [[] for _ in chunks]
 
                 for idx, (ch, ve) in enumerate(zip(chunks, embs)):
@@ -547,6 +540,14 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         touched_docs = updated_docs = indexed_chunks = 0
 
         with SessionLocal() as db:
+            # деактивируем документы, которых больше нет на диске
+            present = { (f.get("path") or f.get("name")) for f in files if (f.get("path") or f.get("name")) }
+            rows = db.execute(text("SELECT id, path, is_active FROM kb_documents")).mappings().all()
+            for r in rows:
+                if r["path"] not in present and r["is_active"]:
+                    db.execute(text("UPDATE kb_documents SET is_active=FALSE, updated_at=now() WHERE id=:id"), {"id": r["id"]})
+            db.commit()
+
             emb_kind = _kb_embedding_column_kind(db)  # 'vector' | 'bytea' | 'none'
 
             for it in files:
@@ -573,12 +574,12 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Скачиваем и режем
                 try:
                     blob = _ya_download(path)
-                    txt = blob.decode("utf-8", errors="ignore")
+                    text = blob.decode("utf-8", errors="ignore")
                 except Exception:
                     log.exception("download failed for %s", path)
                     continue
 
-                chunks = _chunk_text(txt, settings.chunk_size, settings.chunk_overlap)
+                chunks = _chunk_text(text, settings.chunk_size, settings.chunk_overlap)
                 embs = _get_embeddings(chunks) if emb_kind in ("vector","bytea") else [[] for _ in chunks]
 
                 # Пишем чанки
