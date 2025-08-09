@@ -143,6 +143,18 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+async def rag_selftest(update, context):
+    from sqlalchemy import text
+    m = update.effective_message or update.message
+    try:
+        with SessionLocal() as db:
+            t = db.execute(text("SELECT pg_typeof(embedding)::text FROM kb_chunks LIMIT 1")).scalar()
+            d = db.execute(text("SELECT (embedding <=> embedding) FROM kb_chunks LIMIT 1")).scalar()
+        await m.reply_text(f"pg_typeof(embedding) = {t}\n(embedding <=> embedding) = {d}")
+    except Exception as e:
+        log.exception("rag_selftest failed")
+        await m.reply_text(f"❌ rag_selftest: {e}")
+
 # ---- RAG helpers ----
 from typing import List, Tuple
 
@@ -1473,6 +1485,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_sync", kb_sync))
     app.add_handler(CommandHandler("kb_sync_pdf", kb_sync_pdf))
     app.add_handler(CommandHandler("rag_diag", rag_diag))
+    app.add_handler(CommandHandler("rag_selftest", rag_selftest))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
