@@ -143,6 +143,98 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# Жёстко создаёт kb_chunks БЕЗ ivfflat, с безопасным коммитом после каждого шага
+async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await m.reply_text("Только для админа.")
+
+        from sqlalchemy import text
+        notes = []
+
+        with SessionLocal() as db:
+            # 0) vector на всякий случай (без паники при ошибке)
+            try:
+                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                db.commit()
+            except Exception:
+                db.rollback()
+                notes.append("[warn] CREATE EXTENSION vector failed")
+
+            # 1) Создать таблицу (если vector есть — с vector(3072), иначе fallback BYTEA)
+            has_vector_type = False
+            try:
+                has_vector_type = db.execute(text(
+                    "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname='vector')"
+                )).scalar()
+            except Exception:
+                pass
+
+            try:
+                if has_vector_type:
+                    db.execute(text("""
+                        CREATE TABLE IF NOT EXISTS kb_chunks (
+                            id           BIGSERIAL PRIMARY KEY,
+                            document_id  BIGINT NOT NULL,
+                            chunk_index  INTEGER NOT NULL,
+                            content      TEXT NOT NULL,
+                            meta         JSON,
+                            embedding    vector(3072)
+                        );
+                    """))
+                else:
+                    db.execute(text("""
+                        CREATE TABLE IF NOT EXISTS kb_chunks (
+                            id           BIGSERIAL PRIMARY KEY,
+                            document_id  BIGINT NOT NULL,
+                            chunk_index  INTEGER NOT NULL,
+                            content      TEXT NOT NULL,
+                            meta         JSON,
+                            embedding    BYTEA
+                        );
+                    """))
+                    notes.append("[info] fallback: embedding BYTEA (нет типа vector)")
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                raise RuntimeError(f"CREATE TABLE failed: {e}")
+
+            # 2) Простейшие индексы (без ivfflat) — отдельная транзакция
+            try:
+                db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_doc_chunk ON kb_chunks(document_id, chunk_index);"))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                notes.append(f"[warn] create simple indexes failed: {e}")
+
+            # 3) Внешний ключ на kb_documents — отдельная транзакция
+            try:
+                db.execute(text("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                           SELECT 1 FROM pg_constraint WHERE conname='fk_kb_chunks_docs'
+                        ) THEN
+                           ALTER TABLE kb_chunks
+                           ADD CONSTRAINT fk_kb_chunks_docs
+                           FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
+                        END IF;
+                    END $$;
+                """))
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                notes.append(f"[warn] add FK failed: {e}")
+
+        await m.reply_text("✅ kb_chunks создана и подготовлена (без ivfflat).\n" + ("\n".join(notes) if notes else ""))
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc(limit=3)
+        log.exception("kb_chunks_force failed")
+        await m.reply_text(f"⚠ kb_chunks_force: {e}\n{tb}")
+
 # Доведём kb_chunks: уберём ivfflat, добавим FK и тех.индексы
 async def kb_chunks_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -937,6 +1029,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("pgvector_check", pgvector_check))
     app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
     app.add_handler(CommandHandler("kb_chunks_fix", kb_chunks_fix))
+    app.add_handler(CommandHandler("kb_chunks_force", kb_chunks_force))
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
