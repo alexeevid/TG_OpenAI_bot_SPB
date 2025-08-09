@@ -143,6 +143,204 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# ==== KB sync (Yandex.Disk -> kb_documents/kb_chunks) ====
+import os, json, math, time
+import requests
+from typing import Iterable, List, Dict, Any, Tuple
+
+YA_API = "https://cloud-api.yandex.net/v1/disk"
+
+def _ya_headers() -> Dict[str, str]:
+    return {"Authorization": f"OAuth {settings.yandex_disk_token}"}
+
+def _ya_list_files(root_path: str) -> Iterable[Dict[str, Any]]:
+    """Постранично перечисляем все элементы в папке на Я.Диске."""
+    limit, offset = 200, 0
+    while True:
+        params = {
+            "path": root_path,
+            "limit": limit,
+            "offset": offset,
+            "fields": "_embedded.items.name,_embedded.items.path,_embedded.items.type,_embedded.items.mime_type,_embedded.items.size,_embedded.items.md5",
+        }
+        r = requests.get(f"{YA_API}/resources", headers=_ya_headers(), params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        items = (data.get("_embedded") or {}).get("items") or []
+        for it in items:
+            if it.get("type") == "file":
+                yield it
+        if len(items) < limit:
+            break
+        offset += limit
+
+def _ya_download(path: str) -> bytes:
+    """Получить содержимое файла (сначала href, затем GET по нему)."""
+    r = requests.get(f"{YA_API}/resources/download", headers=_ya_headers(), params={"path": path}, timeout=30)
+    r.raise_for_status()
+    href = r.json()["href"]
+    r2 = requests.get(href, timeout=60)
+    r2.raise_for_status()
+    return r2.content
+
+def _chunk_text(text: str, chunk_size: int = None, overlap: int = None) -> List[str]:
+    cs = chunk_size or settings.chunk_size
+    ov = overlap or settings.chunk_overlap
+    text = (text or "").replace("\r\n", "\n")
+    res, i, n = [], 0, len(text)
+    while i < n:
+        res.append(text[i : i + cs])
+        i += max(1, cs - ov)
+    return res
+
+def _embedding_model() -> str:
+    return settings.embedding_model  # например, text-embedding-3-large (3072)
+
+def _get_embeddings(chunks: List[str]) -> List[List[float]]:
+    """Запрос эмбеддингов пачками. Если не удалось — вернём пустые списки (бот всё равно работает)."""
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=settings.openai_api_key)
+        # кусками по 128, чтобы не уткнуться в лимиты
+        out: List[List[float]] = []
+        B = 64
+        for i in range(0, len(chunks), B):
+            part = chunks[i:i+B]
+            resp = client.embeddings.create(model=_embedding_model(), input=part)
+            out.extend([d.embedding for d in resp.data])
+        return out
+    except Exception as e:
+        log.exception("embedding failed: %s", e)
+        return [[] for _ in chunks]
+
+def _kb_embedding_column_kind(db) -> str:
+    """Определяем тип столбца embedding: 'vector' или 'bytea'."""
+    kind = db.execute(text("""
+        SELECT CASE WHEN (SELECT 1 FROM pg_type WHERE typname='vector') IS NOT NULL
+                    AND EXISTS(SELECT 1 FROM information_schema.columns
+                               WHERE table_name='kb_chunks' AND column_name='embedding' AND udt_name='vector')
+               THEN 'vector'
+               ELSE (SELECT CASE WHEN EXISTS(
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='kb_chunks' AND column_name='embedding' AND udt_name='bytea'
+                    ) THEN 'bytea' ELSE 'none' END)
+          END
+    """)).scalar() or "none"
+    return kind
+
+def _format_vector_sql(vec: List[float]) -> Tuple[str, Dict[str, Any]]:
+    """Для pgvector: вернём SQL-фрагмент и параметры."""
+    arr = "[" + ",".join(f"{x:.6f}" for x in (vec or [])) + "]"
+    return " :emb::vector ", {"emb": arr}
+
+def _format_bytea_sql(vec: List[float]) -> Tuple[str, Dict[str, Any]]:
+    """Упакуем float[] в bytea (маленькая оптимизация; можно хранить NULL)."""
+    try:
+        import struct
+        b = struct.pack(f"{len(vec)}f", *vec) if vec else b""
+        from psycopg2 import Binary  # psycopg2-binary у тебя есть
+        return " :emb ", {"emb": Binary(b)}
+    except Exception:
+        return " NULL ", {}
+
+def _kb_upsert_document(db, path: str, mime: str, size: int, etag: str) -> int:
+    did = _exec_scalar(db, "SELECT id FROM kb_documents WHERE path=:p", p=path)
+    if did:
+        _ = db.execute(text("UPDATE kb_documents SET mime=:m, bytes=:b, etag=:e, updated_at=now(), is_active=TRUE WHERE id=:id"),
+                       {"m": mime, "b": size, "e": etag, "id": did})
+        db.commit()
+        return did
+    did = _exec_scalar(db, """
+        INSERT INTO kb_documents (path, mime, bytes, etag, is_active)
+        VALUES (:p,:m,:b,:e, TRUE) RETURNING id
+    """, p=path, m=mime, b=size, e=etag)
+    db.commit()
+    return did
+
+def _kb_clear_chunks(db, document_id: int):
+    db.execute(text("DELETE FROM kb_chunks WHERE document_id=:d"), {"d": document_id})
+    db.commit()
+
+# Синхронизация БЗ c Я.Диска
+async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await m.reply_text("Только для админа.")
+        start_ts = time.time()
+        await m.reply_text("🔄 Начинаю синхронизацию БЗ…")
+
+        root = settings.yandex_root_path
+        files = list(_ya_list_files(root))
+        touched_docs = updated_docs = indexed_chunks = 0
+
+        with SessionLocal() as db:
+            emb_kind = _kb_embedding_column_kind(db)  # 'vector' | 'bytea' | 'none'
+
+            for it in files:
+                path  = it.get("path") or it.get("name")
+                mime  = it.get("mime_type") or ""
+                size  = int(it.get("size") or 0)
+                etag  = it.get("md5") or ""
+                if not path:
+                    continue
+
+                doc_id = _kb_upsert_document(db, path=path, mime=mime, size=size, etag=etag)
+                touched_docs += 1
+
+                # Индексация только для простых текстовых файлов (md/txt)
+                name = (it.get("name") or "").lower()
+                is_text = name.endswith(".txt") or name.endswith(".md")
+                if not is_text:
+                    continue
+
+                # Проверка: если такой etag уже индексировали — можно пропустить
+                # (упрощённо: когда мы чистим/индексируем, переписываем целиком)
+                _kb_clear_chunks(db, doc_id)
+
+                # Скачиваем и режем
+                try:
+                    blob = _ya_download(path)
+                    text = blob.decode("utf-8", errors="ignore")
+                except Exception:
+                    log.exception("download failed for %s", path)
+                    continue
+
+                chunks = _chunk_text(text, settings.chunk_size, settings.chunk_overlap)
+                embs = _get_embeddings(chunks) if emb_kind in ("vector","bytea") else [[] for _ in chunks]
+
+                # Пишем чанки
+                for idx, (ch, ve) in enumerate(zip(chunks, embs)):
+                    meta = {"path": path, "mime": mime}
+                    if emb_kind == "vector":
+                        place, params = _format_vector_sql(ve)
+                    elif emb_kind == "bytea":
+                        place, params = _format_bytea_sql(ve)
+                    else:
+                        place, params = " NULL ", {}
+                    sql = f"""
+                        INSERT INTO kb_chunks (document_id, chunk_index, content, meta, embedding)
+                        VALUES (:d, :i, :c, :meta, {place})
+                    """
+                    p = {"d": doc_id, "i": idx, "c": ch, "meta": json.dumps(meta)}
+                    p.update(params)
+                    try:
+                        db.execute(text(sql), p)
+                    except Exception:
+                        log.exception("insert chunk failed (doc_id=%s, idx=%s)", doc_id, idx)
+                db.commit()
+                updated_docs += 1
+                indexed_chunks += len(chunks)
+
+        took = int((time.time() - start_ts) * 1000)
+        await m.reply_text(f"✅ Синхронизация завершена.\nДокументов учтено: {touched_docs}\n"
+                           f"Проиндексировано (txt/md): {updated_docs} документов, {indexed_chunks} чанков\n"
+                           f"Время: {took} ms")
+    except Exception:
+        log.exception("kb_sync failed")
+        await (update.effective_message or update.message).reply_text("⚠ kb_sync: ошибка. Смотри логи.")
+
+
 # Жёстко создаёт kb_chunks БЕЗ ivfflat, с безопасным коммитом после каждого шага
 async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -1030,6 +1228,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
     app.add_handler(CommandHandler("kb_chunks_fix", kb_chunks_fix))
     app.add_handler(CommandHandler("kb_chunks_force", kb_chunks_force))
+    app.add_handler(CommandHandler("kb_sync", kb_sync))
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
