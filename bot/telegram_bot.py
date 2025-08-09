@@ -143,67 +143,138 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
-# Создать таблицу kb_chunks и индексы (если её нет)
+# Создать kb_chunks надёжно: с vector, а при ошибке — fallback без vector
 async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
         if not _is_admin(update.effective_user.id):
             return await m.reply_text("Только для админа.")
+
         from sqlalchemy import text
-        created = []
+        created_note = ""
         with SessionLocal() as db:
+            # Диагностика окружения
+            search_path = db.execute(text("SHOW search_path")).scalar()
+            has_tbl = db.execute(text("SELECT to_regclass('public.kb_chunks') IS NOT NULL")).scalar()
+            has_vector_ext = db.execute(text(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')"
+            )).scalar()
+            has_vector_type = db.execute(text(
+                "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname='vector')"
+            )).scalar()
+
+            if has_tbl:
+                return await m.reply_text("✅ kb_chunks уже существует.")
+
             # На всякий случай — расширение
+            if not has_vector_ext:
+                try:
+                    db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                    db.commit()
+                    has_vector_ext = True
+                except Exception as e:
+                    db.rollback()
+                    # не падаем — попробуем fallback
+                    created_note += f"[warn] CREATE EXTENSION failed: {e}\n"
+
+            # Обновим наличие типа
+            if not has_vector_type:
+                has_vector_type = db.execute(text(
+                    "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname='vector')"
+                )).scalar()
+
             try:
-                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                if has_vector_type:
+                    # Основной вариант: с vector(3072)
+                    db.execute(text("""
+                        CREATE TABLE IF NOT EXISTS kb_chunks (
+                            id           BIGSERIAL PRIMARY KEY,
+                            document_id  BIGINT NOT NULL,
+                            chunk_index  INTEGER NOT NULL,
+                            content      TEXT NOT NULL,
+                            meta         JSON,
+                            embedding    vector(3072)
+                        );
+                    """))
+                    # Индексы и FK (best-effort)
+                    try:
+                        db.execute(text(
+                            "CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                        db.execute(text("""
+                            CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
+                            ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
+                        """))
+                    except Exception as e:
+                        created_note += f"[warn] index create failed: {e}\n"
+                    try:
+                        db.execute(text("""
+                            DO $$
+                            BEGIN
+                                IF NOT EXISTS (
+                                   SELECT 1 FROM pg_constraint WHERE conname = 'fk_kb_chunks_docs'
+                                ) THEN
+                                   ALTER TABLE kb_chunks
+                                   ADD CONSTRAINT fk_kb_chunks_docs
+                                   FOREIGN KEY (document_id)
+                                   REFERENCES kb_documents(id) ON DELETE CASCADE;
+                                END IF;
+                            END $$;
+                        """))
+                    except Exception as e:
+                        created_note += f"[warn] FK create failed: {e}\n"
+
+                    db.commit()
+                    return await m.reply_text(
+                        "✅ kb_chunks создана (vector). "
+                        f"\nsearch_path={search_path}\n{created_note or ''}".strip()
+                    )
+
+                # Fallback: без vector — embedding как BYTEA, без ivfflat
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS kb_chunks (
+                        id           BIGSERIAL PRIMARY KEY,
+                        document_id  BIGINT NOT NULL,
+                        chunk_index  INTEGER NOT NULL,
+                        content      TEXT NOT NULL,
+                        meta         JSON,
+                        embedding    BYTEA
+                    );
+                """))
+                try:
+                    db.execute(text(
+                        "CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                except Exception as e:
+                    created_note += f"[warn] fallback index failed: {e}\n"
+                try:
+                    db.execute(text("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_kb_chunks_docs'
+                            ) THEN
+                               ALTER TABLE kb_chunks
+                               ADD CONSTRAINT fk_kb_chunks_docs
+                               FOREIGN KEY (document_id)
+                               REFERENCES kb_documents(id) ON DELETE CASCADE;
+                            END IF;
+                        END $$;
+                    """))
+                except Exception as e:
+                    created_note += f"[warn] fallback FK failed: {e}\n"
+
                 db.commit()
-            except Exception:
+                return await m.reply_text(
+                    "✅ kb_chunks создана (fallback без vector). "
+                    f"\nsearch_path={search_path}\n{created_note or ''}".strip()
+                )
+
+            except Exception as e:
                 db.rollback()
+                raise e
 
-            # Таблица
-            db.execute(text("""
-                CREATE TABLE IF NOT EXISTS kb_chunks (
-                    id           BIGSERIAL PRIMARY KEY,
-                    document_id  BIGINT NOT NULL,
-                    chunk_index  INTEGER NOT NULL,
-                    content      TEXT NOT NULL,
-                    meta         JSON,
-                    embedding    vector(3072)
-                );
-            """))
-            # Индексы
-            try:
-                db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
-                db.execute(text("""
-                    CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
-                    ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
-                """))
-            except Exception:
-                # индексы не критичны — продолжаем без падения
-                pass
-            # FK на kb_documents
-            try:
-                db.execute(text("""
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                           SELECT 1 FROM pg_constraint WHERE conname = 'fk_kb_chunks_docs'
-                        ) THEN
-                           ALTER TABLE kb_chunks
-                           ADD CONSTRAINT fk_kb_chunks_docs
-                           FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
-                        END IF;
-                    END $$;
-                """))
-            except Exception:
-                pass
-
-            db.commit()
-            created.append("kb_chunks + indexes + FK")
-
-        await m.reply_text("✅ Создано: " + ", ".join(created))
-    except Exception:
+    except Exception as e:
         log.exception("kb_chunks_create failed")
-        await m.reply_text("⚠ Не удалось создать kb_chunks. Смотри логи.")
+        await m.reply_text(f"⚠ Не удалось создать kb_chunks: {e}")
 
 # создать новый диалог вручную
 async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
