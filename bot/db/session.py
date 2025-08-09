@@ -1,28 +1,33 @@
+import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from bot.db.base import Base
-from bot.settings import load_settings
-import logging, re
+from bot.settings import settings
 
-_engine = None
-_SessionLocal = None
+logger = logging.getLogger(__name__)
 
-def _mask(url: str) -> str:
-    return re.sub(r"://([^:]+):([^@]+)@", r"://\\1:***@", url)
+# Исправляем старый формат postgres:// на postgresql://
+DB_URL = settings.database_url
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-def _ensure_engine():
-    global _engine, _SessionLocal
-    if _engine is None:
-        s = load_settings()
-        db_url = s.database_url
-        logging.getLogger(__name__).info("DB URL resolved: %s", _mask(db_url))
-        try:
-            _engine = create_engine(db_url, pool_pre_ping=True, future=True)
-            _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
-        except Exception:
-            logging.exception("Failed to create SQLAlchemy engine")
-            raise
+# Маскируем пароль в логах
+safe_url = DB_URL.replace(settings.database_url.split('@')[0], "postgresql://***:***")
 
-def get_session():
-    _ensure_engine()
-    return _SessionLocal()
+try:
+    engine = create_engine(DB_URL, echo=False, pool_pre_ping=True)
+    logger.info(f"📦 Database engine created for {safe_url}")
+except Exception as e:
+    logger.exception(f"❌ Failed to create engine for {safe_url}")
+    raise
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def init_db(Base):
+    """Инициализация всех таблиц БД"""
+    from . import models
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("✅ Database tables created successfully")
+    except Exception as e:
+        logger.exception("❌ Failed to create database tables")
+        raise
