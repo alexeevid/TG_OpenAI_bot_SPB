@@ -2,15 +2,12 @@ from alembic import op
 import sqlalchemy as sa
 from pgvector.sqlalchemy import Vector
 
-# Alembic identifiers
 revision = '001_initial'
 down_revision = None
 branch_labels = None
 depends_on = None
 
-
 def upgrade():
-    # pgvector (может потребовать прав superuser на БД)
     op.execute('CREATE EXTENSION IF NOT EXISTS vector;')
 
     op.create_table(
@@ -94,7 +91,6 @@ def upgrade():
         sa.Column('payload', sa.JSON),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     )
-
 
 def downgrade():
     op.drop_table('audit_log')

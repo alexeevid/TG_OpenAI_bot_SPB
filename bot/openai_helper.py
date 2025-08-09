@@ -4,7 +4,7 @@ _settings = load_settings()
 _client = AsyncOpenAI(api_key=_settings.openai_api_key)
 async def chat(messages, model=None, max_tokens=800):
     model = model or _settings.openai_model
-    resp = await _client.chat.completions.create(model=model, messages=messages, temperature=0.2, max_tokens=max_tokens)
+    resp = await _client.chat.completions.create(model=model, messages=messages, temperature=0.2, max_tokens=800)
     return resp.choices[0].message.content or ''
 async def embed(texts, model=None):
     model = model or _settings.embedding_model

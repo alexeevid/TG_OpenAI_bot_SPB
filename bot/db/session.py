@@ -1,8 +1,18 @@
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker
+from bot.db.base import Base
 from bot.settings import load_settings
-Base = declarative_base()
-engine = create_engine(load_settings().database_url, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+_engine = None
+_SessionLocal = None
+
+def _ensure_engine():
+    global _engine, _SessionLocal
+    if _engine is None:
+        db_url = load_settings().database_url
+        _engine = create_engine(db_url, pool_pre_ping=True, future=True)
+        _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
+
 def get_session():
-    return SessionLocal()
+    _ensure_engine()
+    return _SessionLocal()

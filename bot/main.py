@@ -1,14 +1,11 @@
-from __future__ import annotations
 import logging
 from bot.settings import load_settings
 from bot.telegram_bot import build_app
 
 def main():
-    settings = load_settings()
+    settings=load_settings()
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
-    app = build_app()
-    # polling-бот: сервис Railway должен быть типом Worker
-    app.run_polling(allowed_updates=None)
+    app=build_app(); app.run_polling(allowed_updates=None)
 
-if __name__ == "__main__":
+if __name__=='__main__':
     main()
