@@ -165,6 +165,22 @@ async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("dialog_new failed")
         await (update.effective_message or update.message).reply_text("⚠ Не удалось создать диалог.")
 
+async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with SessionLocal() as db:
+            avail = db.execute(text(
+                "SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name='vector')"
+            )).scalar()
+            installed = db.execute(text(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')"
+            )).scalar()
+        await (update.effective_message or update.message).reply_text(
+            f"pgvector доступно: {'✅' if avail else '❌'}\n"
+            f"pgvector установлено: {'✅' if installed else '❌'}"
+        )
+    except Exception:
+        log.exception("pgvector_check failed")
+        await (update.effective_message or update.message).reply_text("⚠ Ошибка pgvector_check. Смотри логи.")
 
 async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -748,6 +764,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb", kb))
     app.add_handler(CallbackQueryHandler(kb_cb, pattern=r"^kb:"))
     app.add_handler(CommandHandler("dialog_new", dialog_new))
+    app.add_handler(CommandHandler("pgvector_check", pgvector_check))
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
