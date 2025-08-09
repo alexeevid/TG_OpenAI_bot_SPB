@@ -30,9 +30,36 @@ def _ensure_user_and_dialog(tg_id:int):
             dlg = M.Dialog(user_id=dbu.id, title=datetime.now().strftime('%Y-%m-%d | диалог'), style='expert', model=_settings.openai_model); s.add(dlg); s.commit()
         return dbu, dlg
 
+# было: async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+import logging
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _ensure_user_and_dialog(update.effective_user.id)
-    await update.message.reply_text('Привет! Я помогу искать ответы в документах из БЗ. Откройте /kb или задайте вопрос. /help — список команд.')
+    chat_id = (update.effective_chat.id if update.effective_chat else None)
+    user = update.effective_user
+
+    # создаём пользователя/диалог, но не падаем, если что-то пошло не так
+    try:
+        if user:
+            _ensure_user_and_dialog(user.id)
+    except Exception:
+        logging.exception("start: _ensure_user_and_dialog failed")
+
+    text = (
+        "Привет! Я помогу искать ответы в документах из БЗ.\n"
+        "Откройте /kb (кнопки внутри) или задайте вопрос.\n\n"
+        "/help — список команд."
+    )
+
+    # отвечаем по-любому каналу: message, callback, либо напрямую в чат
+    if update.message:
+        await update.message.reply_text(text)
+    elif update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text)
+        except Exception:
+            await update.callback_query.message.reply_text(text)
+    elif chat_id is not None:
+        await context.bot.send_message(chat_id, text)
 
 async def help_cmd(update, context):
     await update.message.reply_text('/start /help /reset /stats\n/dialogs, /dialog <id>\n/kb, /kb_diag\n/model, /mode\n/img <prompt>\n/web <query>\n/whoami, /grant <id>, /revoke <id>')
