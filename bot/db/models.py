@@ -1,6 +1,6 @@
 from sqlalchemy import Column, BigInteger, Text, Boolean, Integer, DateTime, ForeignKey, JSON, String
-from pgvector.sqlalchemy import Vector
 from bot.db.base import Base
+from pgvector.sqlalchemy import Vector
 class User(Base):
     __tablename__='users'
     id = Column(BigInteger, primary_key=True)
