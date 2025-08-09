@@ -147,7 +147,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 from typing import List, Tuple
 
 def _vec_literal(vec: List[float]) -> Tuple[str, dict]:
-    arr = "[" + ","join(f"{x:.6f}" for x in (vec or [])) + "]"
+    arr = "[" + ",".join(f"{x:.6f}" for x in (vec or [])) + "]"
     return ":q::vector", {"q": arr}
 
 def _embed_query(text: str) -> List[float]:
