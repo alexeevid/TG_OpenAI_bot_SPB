@@ -141,6 +141,46 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# Проверка наличия таблиц в БД
+async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with SessionLocal() as db:
+            rows = db.execute(text("""
+                select 'users' as t, to_regclass('public.users') is not null as ok
+                union all select 'dialogs',          to_regclass('public.dialogs') is not null
+                union all select 'messages',         to_regclass('public.messages') is not null
+                union all select 'kb_documents',     to_regclass('public.kb_documents') is not null
+                union all select 'kb_chunks',        to_regclass('public.kb_chunks') is not null
+                union all select 'dialog_kb_links',  to_regclass('public.dialog_kb_links') is not null
+                union all select 'pdf_passwords',    to_regclass('public.pdf_passwords') is not null
+                union all select 'audit_log',        to_regclass('public.audit_log') is not null
+            """)).all()
+        lines = ["Проверка таблиц:"]
+        for t, ok in rows:
+            lines.append(f"{'✅' if ok else '❌'} {t}")
+        await (update.effective_message or update.message).reply_text("\n".join(lines))
+    except Exception:
+        log.exception("dbcheck failed")
+        await (update.effective_message or update.message).reply_text("⚠ Ошибка dbcheck. Смотри логи.")
+
+# Принудительный прогон миграций Alembic (только для админа)
+async def migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await (update.effective_message or update.message).reply_text("Только для админа.")
+        await (update.effective_message or update.message).reply_text("🔧 Запускаю миграции...")
+        # Программный вызов Alembic
+        import os
+        from alembic.config import Config
+        from alembic import command
+        os.environ["DATABASE_URL"] = settings.database_url
+        cfg = Config("alembic.ini")
+        command.upgrade(cfg, "head")
+        await (update.effective_message or update.message).reply_text("✅ Миграции применены.")
+    except Exception:
+        log.exception("migrate failed")
+        await (update.effective_message or update.message).reply_text("⚠ Ошибка миграции. Смотри логи.")
+
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with SessionLocal() as db:
@@ -465,6 +505,9 @@ def build_app() -> Application:
 
     app.add_handler(CommandHandler("dialogs", dialogs))
     app.add_handler(CallbackQueryHandler(dialog_cb, pattern=r"^dlg:"))
+
+    app.add_handler(CommandHandler("dbcheck", dbcheck))
+    app.add_handler(CommandHandler("migrate", migrate))
 
     app.add_handler(CommandHandler("kb", kb))
     app.add_handler(CallbackQueryHandler(kb_cb, pattern=r"^kb:"))
