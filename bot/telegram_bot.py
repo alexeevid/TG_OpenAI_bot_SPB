@@ -143,6 +143,129 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# ---- PDF helpers ----
+def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
+    """
+    Возвращает (текст, pages, is_protected).
+    Если PDF защищён и пароль не известен — is_protected=True и текст пустой.
+    """
+    import fitz  # PyMuPDF
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        # защищённый? (true/false)
+        is_prot = bool(doc.is_encrypted)
+        if is_prot:
+            # пробуем пустой пароль: некоторые "псевдозащищённые" открываются
+            try:
+                if doc.authenticate(""):
+                    is_prot = False
+            except Exception:
+                pass
+        if is_prot:
+            return ("", 0, True)
+
+        pages = doc.page_count
+        out = []
+        for i in range(pages):
+            try:
+                text = doc.load_page(i).get_text("text") or ""
+            except Exception:
+                text = ""
+            out.append(text)
+        return ("\n".join(out), pages, False)
+
+def _kb_update_pages(db, document_id: int, pages: int | None):
+    if pages is None:
+        return
+    db.execute(text("UPDATE kb_documents SET pages=:p, updated_at=now() WHERE id=:id"), {"p": pages, "id": document_id})
+    db.commit()
+
+# Синхронизировать только PDF (без пароля). Защищённые PDF регистрируем, но не индексируем.
+async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await m.reply_text("Только для админа.")
+        await m.reply_text("📄 Индексация PDF началась…")
+
+        root = settings.yandex_root_path
+        files = [f for f in _ya_list_files(root) if (f.get("name") or "").lower().endswith(".pdf")]
+
+        touched_docs = 0
+        indexed_docs = 0
+        indexed_chunks = 0
+
+        with SessionLocal() as db:
+            emb_kind = _kb_embedding_column_kind(db)  # 'vector' | 'bytea' | 'none'
+            for it in files:
+                path  = it.get("path") or it.get("name")
+                mime  = it.get("mime_type") or "application/pdf"
+                size  = int(it.get("size") or 0)
+                etag  = it.get("md5") or ""
+                if not path:
+                    continue
+
+                doc_id = _kb_upsert_document(db, path=path, mime=mime, size=size, etag=etag)
+                touched_docs += 1
+
+                # Скачиваем
+                try:
+                    blob = _ya_download(path)
+                except Exception:
+                    log.exception("pdf download failed: %s", path)
+                    continue
+
+                # Парсим
+                try:
+                    text, pages, is_prot = _pdf_extract_text(blob)
+                except Exception:
+                    log.exception("pdf parse failed: %s", path)
+                    continue
+
+                _kb_update_pages(db, doc_id, pages if pages else None)
+
+                # Защищённый PDF — не индексируем сейчас
+                if is_prot:
+                    log.info("pdf protected, skip indexing: %s", path)
+                    continue
+
+                # Переиндексация целиком (простая стратегия)
+                _kb_clear_chunks(db, doc_id)
+
+                chunks = _chunk_text(text, settings.chunk_size, settings.chunk_overlap)
+                embs = _get_embeddings(chunks) if emb_kind in ("vector","bytea") else [[] for _ in chunks]
+
+                for idx, (ch, ve) in enumerate(zip(chunks, embs)):
+                    meta = {"path": path, "mime": mime, "page_hint": None}
+                    if emb_kind == "vector":
+                        place, params = _format_vector_sql(ve)
+                    elif emb_kind == "bytea":
+                        place, params = _format_bytea_sql(ve)
+                    else:
+                        place, params = " NULL ", {}
+                    sql = f"""
+                        INSERT INTO kb_chunks (document_id, chunk_index, content, meta, embedding)
+                        VALUES (:d, :i, :c, :meta, {place})
+                    """
+                    p = {"d": doc_id, "i": idx, "c": ch, "meta": json.dumps(meta)}
+                    p.update(params)
+                    try:
+                        db.execute(text(sql), p)
+                    except Exception:
+                        log.exception("insert pdf chunk failed (doc_id=%s, idx=%s)", doc_id, idx)
+                db.commit()
+
+                indexed_docs += 1
+                indexed_chunks += len(chunks)
+
+        await m.reply_text(
+            "✅ Индексация PDF завершена.\n"
+            f"Документов учтено: {touched_docs}\n"
+            f"Проиндексировано: {indexed_docs} документов, {indexed_chunks} чанков"
+        )
+    except Exception:
+        log.exception("kb_sync_pdf failed")
+        await (update.effective_message or update.message).reply_text("⚠ kb_sync_pdf: ошибка. Смотри логи.")
+
 # ==== KB sync (Yandex.Disk -> kb_documents/kb_chunks) ====
 import os, json, math, time
 import requests
@@ -1229,6 +1352,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_chunks_fix", kb_chunks_fix))
     app.add_handler(CommandHandler("kb_chunks_force", kb_chunks_force))
     app.add_handler(CommandHandler("kb_sync", kb_sync))
+    app.add_handler(CommandHandler("kb_sync_pdf", kb_sync_pdf))
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
