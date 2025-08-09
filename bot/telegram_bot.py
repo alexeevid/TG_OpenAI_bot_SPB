@@ -78,6 +78,7 @@ def _ensure_user(db, tg_id: int) -> int:
         RETURNING id
         """, tg=tg_id,
     )
+    db.commit()
     return uid
 
 def _ensure_dialog(db, user_id: int) -> int:
@@ -100,6 +101,7 @@ def _ensure_dialog(db, user_id: int) -> int:
         RETURNING id
         """, u=user_id, t=datetime.now().strftime("%Y-%m-%d | диалог"), m=settings.openai_model,
     )
+    db.commit()
     return did
 
 def _is_admin(tg_id: int) -> bool:
@@ -157,6 +159,7 @@ async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """,
                 u=uid, t=datetime.now().strftime("%Y-%m-%d | диалог"), m=settings.openai_model
             )
+        db.commit()
         await m.reply_text(f"✅ Создан диалог #{did}")
     except Exception:
         log.exception("dialog_new failed")
