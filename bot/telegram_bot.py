@@ -20,7 +20,7 @@ from telegram.ext import (
     ApplicationBuilder, Application, CommandHandler, ContextTypes,
     MessageHandler, CallbackQueryHandler, filters
 )
-from sqlalchemy import text
+from sqlalchemy import text as sa_text
 
 from bot.settings import load_settings
 from bot.db.session import SessionLocal  # engine импортируем внутри apply_migrations_if_needed
@@ -35,13 +35,13 @@ def apply_migrations_if_needed(force: bool = False) -> None:
     Работает без консоли Railway.
     """
     try:
-        from sqlalchemy import text
+        from sqlalchemy import text as sa_text
         from bot.db.session import engine
         need = True
         if not force:
             # Проверяем наличие ключевой таблицы
             with engine.connect() as conn:
-                exists = conn.execute(text("SELECT to_regclass('public.users')")).scalar()
+                exists = conn.execute(sa_text("SELECT to_regclass('public.users')")).scalar()
                 need = not bool(exists)
 
         if need:
@@ -61,10 +61,10 @@ def apply_migrations_if_needed(force: bool = False) -> None:
 
 # ---------- helpers ----------
 def _exec_scalar(db, sql: str, **params):
-    return db.execute(text(sql), params).scalar()
+    return db.execute(sa_text(sql), params).scalar()
 
 def _exec_all(db, sql: str, **params):
-    return db.execute(text(sql), params).all()
+    return db.execute(sa_text(sql), params).all()
 
 def _ensure_user(db, tg_id: int) -> int:
     uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id=:tg", tg=tg_id)
@@ -144,12 +144,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def rag_selftest(update, context):
-    from sqlalchemy import text
+    from sqlalchemy import text as sa_text
     m = update.effective_message or update.message
     try:
         with SessionLocal() as db:
-            t = db.execute(text("SELECT pg_typeof(embedding)::text FROM kb_chunks LIMIT 1")).scalar()
-            d = db.execute(text("SELECT (embedding <=> embedding) FROM kb_chunks LIMIT 1")).scalar()
+            t = db.execute(sa_text("SELECT pg_typeof(embedding)::text FROM kb_chunks LIMIT 1")).scalar()
+            d = db.execute(sa_text("SELECT (embedding <=> embedding) FROM kb_chunks LIMIT 1")).scalar()
         await m.reply_text(f"pg_typeof(embedding) = {t}\n(embedding <=> embedding) = {d}")
     except Exception as e:
         log.exception("rag_selftest failed")
@@ -188,7 +188,7 @@ def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict
     """
     p = {"did": dialog_id, "k": k}
     p.update(params)
-    rows = db.execute(text(sql), p).mappings().all()
+    rows = db.execute(sa_text(sql), p).mappings().all()
     return [dict(r) for r in rows]
 
 def _build_prompt(context_blocks: List[str], question: str) -> str:
@@ -310,7 +310,7 @@ def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
 def _kb_update_pages(db, document_id: int, pages: int | None):
     if pages is None:
         return
-    db.execute(text("UPDATE kb_documents SET pages=:p, updated_at=now() WHERE id=:id"), {"p": pages, "id": document_id})
+    db.execute(sa_text("UPDATE kb_documents SET pages=:p, updated_at=now() WHERE id=:id"), {"p": pages, "id": document_id})
     db.commit()
 
 # Синхронизировать только PDF (без пароля). Защищённые PDF регистрируем, но не индексируем.
@@ -331,10 +331,10 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as db:
             # деактивируем PDF, которых нет на диске
             present = { (f.get("path") or f.get("name")) for f in files if (f.get("path") or f.get("name")) }
-            rows = db.execute(text("SELECT id, path, is_active FROM kb_documents WHERE mime LIKE 'application/pdf%'")).mappings().all()
+            rows = db.execute(sa_text("SELECT id, path, is_active FROM kb_documents WHERE mime LIKE 'application/pdf%'")).mappings().all()
             for r in rows:
                 if r["path"] not in present and r["is_active"]:
-                    db.execute(text("UPDATE kb_documents SET is_active=FALSE, updated_at=now() WHERE id=:id"), {"id": r["id"]})
+                    db.execute(sa_text("UPDATE kb_documents SET is_active=FALSE, updated_at=now() WHERE id=:id"), {"id": r["id"]})
             db.commit()
 
             emb_kind = _kb_embedding_column_kind(db)  # 'vector' | 'bytea' | 'none'
@@ -391,7 +391,7 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     p = {"d": doc_id, "i": idx, "c": ch, "meta": json.dumps(meta)}
                     p.update(params)
                     try:
-                        db.execute(text(sql), p)
+                        db.execute(sa_text(sql), p)
                     except Exception:
                         log.exception("insert pdf chunk failed (doc_id=%s, idx=%s)", doc_id, idx)
                 db.commit()
@@ -404,9 +404,9 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Документов учтено: {touched_docs}\n"
             f"Проиндексировано: {indexed_docs} документов, {indexed_chunks} чанков"
         )
-    except Exception:
+    except Exception as e:
         log.exception("kb_sync_pdf failed")
-        await (update.effective_message or update.message).reply_text("⚠ kb_sync_pdf: ошибка. Смотри логи.")
+        await (update.effective_message or update.message).reply_text(f"⚠ kb_sync_pdf: {e}")
 
 # ==== KB sync (Yandex.Disk -> kb_documents/kb_chunks) ====
 import os, json, math, time
@@ -480,7 +480,7 @@ def _get_embeddings(chunks: List[str]) -> List[List[float]]:
 
 def _kb_embedding_column_kind(db) -> str:
     """Определяем тип столбца embedding: 'vector' или 'bytea'."""
-    kind = db.execute(text("""
+    kind = db.execute(sa_text("""
         SELECT CASE WHEN (SELECT 1 FROM pg_type WHERE typname='vector') IS NOT NULL
                     AND EXISTS(SELECT 1 FROM information_schema.columns
                                WHERE table_name='kb_chunks' AND column_name='embedding' AND udt_name='vector')
@@ -511,7 +511,7 @@ def _format_bytea_sql(vec: List[float]) -> Tuple[str, Dict[str, Any]]:
 def _kb_upsert_document(db, path: str, mime: str, size: int, etag: str) -> int:
     did = _exec_scalar(db, "SELECT id FROM kb_documents WHERE path=:p", p=path)
     if did:
-        _ = db.execute(text("UPDATE kb_documents SET mime=:m, bytes=:b, etag=:e, updated_at=now(), is_active=TRUE WHERE id=:id"),
+        _ = db.execute(sa_text("UPDATE kb_documents SET mime=:m, bytes=:b, etag=:e, updated_at=now(), is_active=TRUE WHERE id=:id"),
                        {"m": mime, "b": size, "e": etag, "id": did})
         db.commit()
         return did
@@ -523,7 +523,7 @@ def _kb_upsert_document(db, path: str, mime: str, size: int, etag: str) -> int:
     return did
 
 def _kb_clear_chunks(db, document_id: int):
-    db.execute(text("DELETE FROM kb_chunks WHERE document_id=:d"), {"d": document_id})
+    db.execute(sa_text("DELETE FROM kb_chunks WHERE document_id=:d"), {"d": document_id})
     db.commit()
 
 # Синхронизация БЗ c Я.Диска
@@ -542,10 +542,10 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as db:
             # деактивируем документы, которых больше нет на диске
             present = { (f.get("path") or f.get("name")) for f in files if (f.get("path") or f.get("name")) }
-            rows = db.execute(text("SELECT id, path, is_active FROM kb_documents")).mappings().all()
+            rows = db.execute(sa_text("SELECT id, path, is_active FROM kb_documents")).mappings().all()
             for r in rows:
                 if r["path"] not in present and r["is_active"]:
-                    db.execute(text("UPDATE kb_documents SET is_active=FALSE, updated_at=now() WHERE id=:id"), {"id": r["id"]})
+                    db.execute(sa_text("UPDATE kb_documents SET is_active=FALSE, updated_at=now() WHERE id=:id"), {"id": r["id"]})
             db.commit()
 
             emb_kind = _kb_embedding_column_kind(db)  # 'vector' | 'bytea' | 'none'
@@ -598,7 +598,7 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     p = {"d": doc_id, "i": idx, "c": ch, "meta": json.dumps(meta)}
                     p.update(params)
                     try:
-                        db.execute(text(sql), p)
+                        db.execute(sa_text(sql), p)
                     except Exception:
                         log.exception("insert chunk failed (doc_id=%s, idx=%s)", doc_id, idx)
                 db.commit()
@@ -609,9 +609,9 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text(f"✅ Синхронизация завершена.\nДокументов учтено: {touched_docs}\n"
                            f"Проиндексировано (txt/md): {updated_docs} документов, {indexed_chunks} чанков\n"
                            f"Время: {took} ms")
-    except Exception:
+    except Exception as e:
         log.exception("kb_sync failed")
-        await (update.effective_message or update.message).reply_text("⚠ kb_sync: ошибка. Смотри логи.")
+        await (update.effective_message or update.message).reply_text(f"⚠ kb_sync: {e}")
 
 
 # Жёстко создаёт kb_chunks БЕЗ ivfflat, с безопасным коммитом после каждого шага
@@ -621,13 +621,13 @@ async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _is_admin(update.effective_user.id):
             return await m.reply_text("Только для админа.")
 
-        from sqlalchemy import text
+        from sqlalchemy import text as sa_text
         notes = []
 
         with SessionLocal() as db:
             # 0) vector на всякий случай (без паники при ошибке)
             try:
-                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                db.execute(sa_text("CREATE EXTENSION IF NOT EXISTS vector;"))
                 db.commit()
             except Exception:
                 db.rollback()
@@ -636,7 +636,7 @@ async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 1) Создать таблицу (если vector есть — с vector(3072), иначе fallback BYTEA)
             has_vector_type = False
             try:
-                has_vector_type = db.execute(text(
+                has_vector_type = db.execute(sa_text(
                     "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname='vector')"
                 )).scalar()
             except Exception:
@@ -644,7 +644,7 @@ async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             try:
                 if has_vector_type:
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS kb_chunks (
                             id           BIGSERIAL PRIMARY KEY,
                             document_id  BIGINT NOT NULL,
@@ -655,7 +655,7 @@ async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         );
                     """))
                 else:
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS kb_chunks (
                             id           BIGSERIAL PRIMARY KEY,
                             document_id  BIGINT NOT NULL,
@@ -673,8 +673,8 @@ async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # 2) Простейшие индексы (без ivfflat) — отдельная транзакция
             try:
-                db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
-                db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_doc_chunk ON kb_chunks(document_id, chunk_index);"))
+                db.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                db.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_doc_chunk ON kb_chunks(document_id, chunk_index);"))
                 db.commit()
             except Exception as e:
                 db.rollback()
@@ -682,7 +682,7 @@ async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # 3) Внешний ключ на kb_documents — отдельная транзакция
             try:
-                db.execute(text("""
+                db.execute(sa_text("""
                     DO $$
                     BEGIN
                         IF NOT EXISTS (
@@ -712,20 +712,20 @@ async def kb_chunks_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not _is_admin(update.effective_user.id):
             return await m.reply_text("Только для админа.")
-        from sqlalchemy import text
+        from sqlalchemy import text as sa_text
         with SessionLocal() as db:
             # удалить ivfflat-индекс если он успел создаться частично (на всякий)
             try:
-                db.execute(text("DROP INDEX IF EXISTS kb_chunks_embedding_idx;"))
+                db.execute(sa_text("DROP INDEX IF EXISTS kb_chunks_embedding_idx;"))
                 db.commit()
             except Exception:
                 db.rollback()
             # минимальные индексы для скорости по документам
-            db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
-            db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_doc_chunk ON kb_chunks(document_id, chunk_index);"))
+            db.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+            db.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_doc_chunk ON kb_chunks(document_id, chunk_index);"))
             # добавить FK в отдельной транзакции
             try:
-                db.execute(text("""
+                db.execute(sa_text("""
                     DO $$
                     BEGIN
                         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='fk_kb_chunks_docs') THEN
@@ -750,16 +750,16 @@ async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _is_admin(update.effective_user.id):
             return await m.reply_text("Только для админа.")
 
-        from sqlalchemy import text
+        from sqlalchemy import text as sa_text
         created_note = ""
         with SessionLocal() as db:
             # Диагностика окружения
-            search_path = db.execute(text("SHOW search_path")).scalar()
-            has_tbl = db.execute(text("SELECT to_regclass('public.kb_chunks') IS NOT NULL")).scalar()
-            has_vector_ext = db.execute(text(
+            search_path = db.execute(sa_text("SHOW search_path")).scalar()
+            has_tbl = db.execute(sa_text("SELECT to_regclass('public.kb_chunks') IS NOT NULL")).scalar()
+            has_vector_ext = db.execute(sa_text(
                 "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')"
             )).scalar()
-            has_vector_type = db.execute(text(
+            has_vector_type = db.execute(sa_text(
                 "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname='vector')"
             )).scalar()
 
@@ -769,7 +769,7 @@ async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # На всякий случай — расширение
             if not has_vector_ext:
                 try:
-                    db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                    db.execute(sa_text("CREATE EXTENSION IF NOT EXISTS vector;"))
                     db.commit()
                     has_vector_ext = True
                 except Exception as e:
@@ -779,14 +779,14 @@ async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Обновим наличие типа
             if not has_vector_type:
-                has_vector_type = db.execute(text(
+                has_vector_type = db.execute(sa_text(
                     "SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname='vector')"
                 )).scalar()
 
             try:
                 if has_vector_type:
                     # Основной вариант: с vector(3072)
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS kb_chunks (
                             id           BIGSERIAL PRIMARY KEY,
                             document_id  BIGINT NOT NULL,
@@ -798,16 +798,16 @@ async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     """))
                     # Индексы и FK (best-effort)
                     try:
-                        db.execute(text(
+                        db.execute(sa_text(
                             "CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
-                        db.execute(text("""
+                        db.execute(sa_text("""
                             CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
                             ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
                         """))
                     except Exception as e:
                         created_note += f"[warn] index create failed: {e}\n"
                     try:
-                        db.execute(text("""
+                        db.execute(sa_text("""
                             DO $$
                             BEGIN
                                 IF NOT EXISTS (
@@ -830,7 +830,7 @@ async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
 
                 # Fallback: без vector — embedding как BYTEA, без ivfflat
-                db.execute(text("""
+                db.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS kb_chunks (
                         id           BIGSERIAL PRIMARY KEY,
                         document_id  BIGINT NOT NULL,
@@ -841,12 +841,12 @@ async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     );
                 """))
                 try:
-                    db.execute(text(
+                    db.execute(sa_text(
                         "CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
                 except Exception as e:
                     created_note += f"[warn] fallback index failed: {e}\n"
                 try:
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         DO $$
                         BEGIN
                             IF NOT EXISTS (
@@ -901,10 +901,10 @@ async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with SessionLocal() as db:
-            avail = db.execute(text(
+            avail = db.execute(sa_text(
                 "SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name='vector')"
             )).scalar()
-            installed = db.execute(text(
+            installed = db.execute(sa_text(
                 "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')"
             )).scalar()
         await (update.effective_message or update.message).reply_text(
@@ -927,16 +927,16 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await m.reply_text("🧰 Ремонт схемы начат. Пишу прогресс в логи...")
 
-        from sqlalchemy import text
+        from sqlalchemy import text as sa_text
         created = []
         with SessionLocal() as db:
 
             def has(table: str) -> bool:
-                return bool(db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{table}"}).scalar())
+                return bool(db.execute(sa_text("SELECT to_regclass(:t)"), {"t": f"public.{table}"}).scalar())
 
             # 0) vector extension — отдельно и без паники
             try:
-                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                db.execute(sa_text("CREATE EXTENSION IF NOT EXISTS vector;"))
                 db.commit()
                 log.info("repair: extension vector OK (или уже было)")
             except Exception:
@@ -945,7 +945,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # 1) USERS — СНАЧАЛА БАЗА
             if not has("users"):
-                db.execute(text("""
+                db.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS users (
                         id           BIGSERIAL PRIMARY KEY,
                         tg_user_id   BIGINT UNIQUE NOT NULL,
@@ -959,7 +959,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # 2) DIALOGS
             if not has("dialogs"):
-                db.execute(text("""
+                db.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS dialogs (
                         id              BIGSERIAL PRIMARY KEY,
                         user_id         BIGINT NOT NULL,
@@ -972,7 +972,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     );
                 """))
                 try:
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         DO $$
                         BEGIN
                             IF NOT EXISTS (
@@ -990,7 +990,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # 3) MESSAGES
             if not has("messages"):
-                db.execute(text("""
+                db.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS messages (
                         id         BIGSERIAL PRIMARY KEY,
                         dialog_id  BIGINT NOT NULL,
@@ -1001,7 +1001,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     );
                 """))
                 try:
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         DO $$
                         BEGIN
                             IF NOT EXISTS (
@@ -1022,7 +1022,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 4) KB_DOCUMENTS
             try:
                 if not has("kb_documents"):
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS kb_documents (
                             id         BIGSERIAL PRIMARY KEY,
                             path       TEXT UNIQUE NOT NULL,
@@ -1041,7 +1041,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 5) KB_CHUNKS
             try:
                 if not has("kb_chunks"):
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS kb_chunks (
                             id           BIGSERIAL PRIMARY KEY,
                             document_id  BIGINT NOT NULL,
@@ -1052,15 +1052,15 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         );
                     """))
                     try:
-                        db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
-                        db.execute(text("""
+                        db.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                        db.execute(sa_text("""
                             CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
                             ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
                         """))
                     except Exception:
                         log.exception("repair: kb_chunks indexes skipped")
                     try:
-                        db.execute(text("""
+                        db.execute(sa_text("""
                             DO $$
                             BEGIN
                                 IF NOT EXISTS (
@@ -1081,7 +1081,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 6) DIALOG_KB_LINKS
             try:
                 if not has("dialog_kb_links"):
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS dialog_kb_links (
                             id          BIGSERIAL PRIMARY KEY,
                             dialog_id   BIGINT NOT NULL,
@@ -1096,7 +1096,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 7) PDF_PASSWORDS
             try:
                 if not has("pdf_passwords"):
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS pdf_passwords (
                             id          BIGSERIAL PRIMARY KEY,
                             dialog_id   BIGINT NOT NULL,
@@ -1112,7 +1112,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 8) AUDIT_LOG
             try:
                 if not has("audit_log"):
-                    db.execute(text("""
+                    db.execute(sa_text("""
                         CREATE TABLE IF NOT EXISTS audit_log (
                             id         BIGSERIAL PRIMARY KEY,
                             user_id    BIGINT,
@@ -1134,7 +1134,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with SessionLocal() as db:
-            rows = db.execute(text("""
+            rows = db.execute(sa_text("""
                 select 'users' as t, to_regclass('public.users') is not null as ok
                 union all select 'dialogs',          to_regclass('public.dialogs') is not null
                 union all select 'messages',         to_regclass('public.messages') is not null
@@ -1173,7 +1173,7 @@ async def migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with SessionLocal() as db:
-            db.execute(text("SELECT 1"))
+            db.execute(sa_text("SELECT 1"))
         await update.message.reply_text("✅ OK: DB connection")
     except Exception:
         log.exception("health failed")
@@ -1266,7 +1266,7 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("dlg:delete:"):
             dlg_id = int(data.split(":")[-1])
             with SessionLocal() as db:
-                db.execute(text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"d": dlg_id})
+                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"d": dlg_id})
                 db.commit()
             await q.edit_message_text(f"Диалог #{dlg_id} удалён")
             return
@@ -1286,7 +1286,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         try:
             with SessionLocal() as db:
-                db.execute(text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
+                db.execute(sa_text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
                 db.commit()
             await update.message.reply_text("Название сохранено.")
         except Exception:
@@ -1425,9 +1425,9 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "SELECT id FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc",
                     d=dlg_id, doc=doc_id)
                 if exist:
-                    db.execute(text("DELETE FROM dialog_kb_links WHERE id=:i"), {"i": exist})
+                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE id=:i"), {"i": exist})
                 else:
-                    db.execute(text(
+                    db.execute(sa_text(
                         "INSERT INTO dialog_kb_links (dialog_id, document_id, created_at) VALUES (:d, :doc, now())"
                     ), {"d": dlg_id, "doc": doc_id})
                 db.commit()
