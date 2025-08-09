@@ -122,7 +122,7 @@ async def _kb_show(tg_user_id:int, update_or_callback, context, page:int, filter
                 return await _kb_reply(update_or_callback, keyboard, text, new_message)
         elif filter_name=='available':
             if conn_ids:
-                q = q.where(M.KbDocument.id.not_in(conn_ids))
+                q = q.where(M.KbDocument.id.notin_(conn_ids))
         total = len(s.execute(q).scalars().all())
         pages = max(1, (total + PAGE - 1)//PAGE)
         page = max(1, min(page, pages))
@@ -294,6 +294,14 @@ async def handle_text_message(update, context, override_text: str|None=None):
         answer+='\n\nИсточники: '+ '; '.join(sorted(set(cites))[:5])
     await update.message.reply_text(answer)
 
+
+async def kb_diag(update, context):
+    with get_session() as s:
+        docs = s.execute(select(func.count(M.KbDocument.id))).scalar() or 0
+        chunks = s.execute(select(func.count(M.KbChunk.id))).scalar() or 0
+        links = s.execute(select(func.count(M.DialogKbLink.id))).scalar() or 0
+    await update.message.reply_text(f"БЗ: документов={docs}, чанков={chunks}, связей={links}")
+
 def build_app()->Application:
     app=Application.builder().token(_settings.telegram_bot_token).build()
     app.add_handler(CommandHandler('start', start))
@@ -303,6 +311,7 @@ def build_app()->Application:
     app.add_handler(CommandHandler('revoke', revoke))
     app.add_handler(CommandHandler('stats', stats))
     app.add_handler(CommandHandler('reset', reset))
+    app.add_handler(CommandHandler('kb_diag', kb_diag))
     app.add_handler(CommandHandler('kb', kb))
     app.add_handler(CallbackQueryHandler(kb_cb, pattern=r'^kb:'))
     app.add_handler(CommandHandler('dialogs', dialogs_cmd))
