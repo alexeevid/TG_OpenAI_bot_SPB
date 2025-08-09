@@ -158,9 +158,10 @@ async def rag_selftest(update, context):
 # ---- RAG helpers ----
 from typing import List, Tuple
 
-def _vec_literal(vec: List[float]) -> Tuple[str, dict]:
+def _vec_literal(vec: list[float]) -> tuple[dict, str]:
+    # подаём строку вида "[0.1,0.2,...]" в параметре q
     arr = "[" + ",".join(f"{x:.6f}" for x in (vec or [])) + "]"
-    return ":q::vector", {"q": arr}
+    return {"q": arr}, "CAST(:q AS vector)"   # <- возвращаем params и SQL-выражение
 
 def _embed_query(text: str) -> List[float]:
     from openai import OpenAI
@@ -174,17 +175,19 @@ def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict
         return []
 
     q = _embed_query(question)
-    placeholder, params = _vec_literal(q)
+    params, qexpr = _vec_literal(q)
+    
     sql = f"""
         SELECT c.content, c.meta, d.path
         FROM kb_chunks c
-        JOIN kb_documents d      ON d.id = c.document_id AND d.is_active = TRUE
-        JOIN dialog_kb_links l   ON l.document_id = c.document_id
+        JOIN kb_documents d    ON d.id = c.document_id AND d.is_active = TRUE
+        JOIN dialog_kb_links l ON l.document_id = c.document_id
         WHERE l.dialog_id = :did
-        ORDER BY c.embedding <=> {placeholder}
+        ORDER BY c.embedding <=> {qexpr}
         LIMIT :k
     """
-    p = {"did": dialog_id, "k": k}; p.update(params)
+    p = {"did": dialog_id, "k": k}
+    p.update(params)
     rows = db.execute(text(sql), p).mappings().all()
     return [dict(r) for r in rows]
 
