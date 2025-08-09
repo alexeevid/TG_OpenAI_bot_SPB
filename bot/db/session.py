@@ -1,13 +1,16 @@
+from __future__ import annotations
+
 import logging
 import re
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from bot.settings import settings
+from bot.settings import load_settings
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# 1) Нормализуем URL (postgres:// → postgresql://)
-DB_URL = settings.database_url
+# Normalize URL (postgres:// -> postgresql://) and mask password for logs
+_settings = load_settings()
+DB_URL = _settings.database_url
 if DB_URL.startswith("postgres://"):
     DB_URL = "postgresql://" + DB_URL[len("postgres://"):]
 
@@ -16,9 +19,9 @@ def _mask(url: str) -> str:
 
 try:
     engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
-    logger.info("DB URL resolved: %s", _mask(DB_URL))
+    log.info("DB URL resolved: %s", _mask(DB_URL))
 except Exception:
-    logger.exception("Failed to create SQLAlchemy engine")
+    log.exception("Failed to create SQLAlchemy engine")
     raise
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
