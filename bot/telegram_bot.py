@@ -141,6 +141,229 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# Создаёт недостающие таблицы и расширения. Идём по факту отсутствия.
+async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await (update.effective_message or update.message).reply_text("Только для админа.")
+
+        m = update.effective_message or update.message
+        await m.reply_text("🧰 Проверяю схему и чиню недостающие объекты...")
+
+        created = []
+        with SessionLocal() as db:
+            # 0) расширение vector (на всякий случай)
+            try:
+                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                db.commit()
+            except Exception:
+                log.exception("CREATE EXTENSION vector failed (может не требоваться)")
+                db.rollback()
+
+            def has(table: str) -> bool:
+                return bool(db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{table}"}).scalar())
+
+            # 1) USERS
+            if not has("users"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id           BIGSERIAL PRIMARY KEY,
+                        tg_user_id   BIGINT UNIQUE NOT NULL,
+                        is_admin     BOOLEAN NOT NULL DEFAULT FALSE,
+                        is_allowed   BOOLEAN NOT NULL DEFAULT TRUE,
+                        lang         TEXT,
+                        created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                """))
+                created.append("users")
+
+            # 2) DIALOGS (если вдруг нет)
+            if not has("dialogs"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS dialogs (
+                        id              BIGSERIAL PRIMARY KEY,
+                        user_id         BIGINT NOT NULL,
+                        title           TEXT,
+                        style           VARCHAR(20) NOT NULL DEFAULT 'expert',
+                        model           TEXT,
+                        is_deleted      BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        last_message_at TIMESTAMPTZ
+                    );
+                """))
+                # FK добавим, только если есть users
+                if has("users"):
+                    try:
+                        db.execute(text("""
+                            DO $$
+                            BEGIN
+                                IF NOT EXISTS (
+                                   SELECT 1 FROM pg_constraint WHERE conname = 'fk_dialogs_users'
+                                ) THEN
+                                   ALTER TABLE dialogs
+                                   ADD CONSTRAINT fk_dialogs_users
+                                   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+                                END IF;
+                            END $$;
+                        """))
+                    except Exception:
+                        log.exception("FK dialogs->users skipped")
+                created.append("dialogs")
+
+            # 3) MESSAGES (если вдруг нет)
+            if not has("messages"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id         BIGSERIAL PRIMARY KEY,
+                        dialog_id  BIGINT NOT NULL,
+                        role       VARCHAR(20) NOT NULL,
+                        content    TEXT NOT NULL,
+                        tokens     INTEGER,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                """))
+                try:
+                    db.execute(text("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_messages_dialogs'
+                            ) THEN
+                               ALTER TABLE messages
+                               ADD CONSTRAINT fk_messages_dialogs
+                               FOREIGN KEY (dialog_id) REFERENCES dialogs(id) ON DELETE CASCADE;
+                            END IF;
+                        END $$;
+                    """))
+                except Exception:
+                    log.exception("FK messages->dialogs skipped")
+                created.append("messages")
+
+            # 4) KB_DOCUMENTS
+            if not has("kb_documents"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS kb_documents (
+                        id         BIGSERIAL PRIMARY KEY,
+                        path       TEXT UNIQUE NOT NULL,
+                        etag       TEXT,
+                        mime       TEXT,
+                        pages      INTEGER,
+                        bytes      BIGINT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        is_active  BOOLEAN NOT NULL DEFAULT TRUE
+                    );
+                """))
+                created.append("kb_documents")
+
+            # 5) KB_CHUNKS
+            if not has("kb_chunks"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS kb_chunks (
+                        id           BIGSERIAL PRIMARY KEY,
+                        document_id  BIGINT NOT NULL,
+                        chunk_index  INTEGER NOT NULL,
+                        content      TEXT NOT NULL,
+                        meta         JSON,
+                        embedding    vector(3072)
+                    );
+                """))
+                # индексы
+                try:
+                    db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                    db.execute(text("""
+                        CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
+                        ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
+                    """))
+                except Exception:
+                    log.exception("Indexes for kb_chunks skipped")
+                # FK
+                try:
+                    db.execute(text("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_kb_chunks_docs'
+                            ) THEN
+                               ALTER TABLE kb_chunks
+                               ADD CONSTRAINT fk_kb_chunks_docs
+                               FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
+                            END IF;
+                        END $$;
+                    """))
+                except Exception:
+                    log.exception("FK kb_chunks->kb_documents skipped")
+                created.append("kb_chunks")
+
+            # 6) DIALOG_KB_LINKS
+            if not has("dialog_kb_links"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS dialog_kb_links (
+                        id          BIGSERIAL PRIMARY KEY,
+                        dialog_id   BIGINT NOT NULL,
+                        document_id BIGINT NOT NULL,
+                        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                """))
+                try:
+                    db.execute(text("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_dkbl_dialogs'
+                            ) THEN
+                               ALTER TABLE dialog_kb_links
+                               ADD CONSTRAINT fk_dkbl_dialogs
+                               FOREIGN KEY (dialog_id) REFERENCES dialogs(id) ON DELETE CASCADE;
+                            END IF;
+                            IF NOT EXISTS (
+                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_dkbl_docs'
+                            ) THEN
+                               ALTER TABLE dialog_kb_links
+                               ADD CONSTRAINT fk_dkbl_docs
+                               FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
+                            END IF;
+                        END $$;
+                    """))
+                except Exception:
+                    log.exception("FK dialog_kb_links skipped")
+                created.append("dialog_kb_links")
+
+            # 7) PDF_PASSWORDS
+            if not has("pdf_passwords"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS pdf_passwords (
+                        id          BIGSERIAL PRIMARY KEY,
+                        dialog_id   BIGINT NOT NULL,
+                        document_id BIGINT NOT NULL,
+                        pwd_hash    TEXT,
+                        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                """))
+                created.append("pdf_passwords")
+
+            # 8) AUDIT_LOG
+            if not has("audit_log"):
+                db.execute(text("""
+                    CREATE TABLE IF NOT EXISTS audit_log (
+                        id         BIGSERIAL PRIMARY KEY,
+                        user_id    BIGINT,
+                        action     TEXT,
+                        meta       JSON,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                """))
+                created.append("audit_log")
+
+            db.commit()
+
+        if created:
+            await m.reply_text("✅ Созданы объекты: " + ", ".join(created))
+        else:
+            await m.reply_text("✅ Всё уже на месте. Ничего создавать не пришлось.")
+    except Exception:
+        log.exception("repair_schema failed")
+        await (update.effective_message or update.message).reply_text("⚠ Ошибка repair_schema. Смотри логи.")
+
 # Проверка наличия таблиц в БД
 async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -494,24 +717,19 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def build_app() -> Application:
     apply_migrations_if_needed()
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
-
     app.add_error_handler(error_handler)
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("reset", reset))
-
     app.add_handler(CommandHandler("dialogs", dialogs))
     app.add_handler(CallbackQueryHandler(dialog_cb, pattern=r"^dlg:"))
-
+    app.add_handler(CommandHandler("repair_schema", repair_schema))
     app.add_handler(CommandHandler("dbcheck", dbcheck))
     app.add_handler(CommandHandler("migrate", migrate))
-
     app.add_handler(CommandHandler("kb", kb))
     app.add_handler(CallbackQueryHandler(kb_cb, pattern=r"^kb:"))
-
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
     return app
