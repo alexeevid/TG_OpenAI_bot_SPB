@@ -1,3 +1,4 @@
+from sqlalchemy import text
 from __future__ import annotations
 from datetime import datetime
 from typing import List, Tuple
@@ -93,12 +94,25 @@ async def revoke(update, context):
         if u: u.is_allowed=False; s.commit()
     await update.message.reply_text(f'Пользователь {tg_id} запрещён.')
 
+async def health(update, context):
+    try:
+        with get_session() as s:
+            s.execute(text("SELECT 1"))
+        await update.message.reply_text("OK: DB connection")
+    except Exception:
+        logging.exception("/health failed")
+        await update.message.reply_text("FAIL: DB connection")
+
 async def stats(update, context):
-    with get_session() as s:
-        dialogs=s.execute(select(func.count(M.Dialog.id))).scalar() or 0
-        messages=s.execute(select(func.count(M.Message.id))).scalar() or 0
-        docs=s.execute(select(func.count(M.KbDocument.id))).scalar() or 0
-    await update.message.reply_text(f'Диалогов: {dialogs}\nСообщений: {messages}\nДокументов в БЗ: {docs}')
+    try:
+        with get_session() as s:
+            dialogs = s.execute(select(func.count(M.Dialog.id))).scalar() or 0
+            messages = s.execute(select(func.count(M.Message.id))).scalar() or 0
+            docs = s.execute(select(func.count(M.KbDocument.id))).scalar() or 0
+        await update.message.reply_text(f"Диалогов: {dialogs}\nСообщений: {messages}\nДокументов в БЗ: {docs}")
+    except Exception:
+        logging.exception("/stats failed")
+        await update.message.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
 
 async def reset(update, context):
     context.user_data.clear()
@@ -360,5 +374,6 @@ def build_app()->Application:
     app.add_handler(CommandHandler('mode', mode_cmd))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, voice_message))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
+    app.add_handler(CommandHandler('health', health))
     app.add_error_handler(on_error)
     return app
