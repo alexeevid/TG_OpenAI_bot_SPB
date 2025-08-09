@@ -3,20 +3,21 @@ from sqlalchemy import engine_from_config, pool
 from logging.config import fileConfig
 import os, sys
 
-# /app/alembic -> /app (где лежит пакет bot)
+# /app/alembic -> /app
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# ВАЖНО: тянем только Base и регистрируем модели, чтобы заполнить metadata
 from bot.db.base import Base
 import bot.db.models  # noqa: F401
 
 config = context.config
 
-# Если в alembic.ini указан %(DATABASE_URL)s или пусто — возьмём реальное из ENV
-if config.get_main_option("sqlalchemy.url") in (None, "", "%(DATABASE_URL)s"):
-    db_url = os.environ.get("DATABASE_URL")
-    if db_url:
-        config.set_main_option("sqlalchemy.url", db_url)
+# ВАЖНО: сразу прокидываем URL из ENV, не вызывая get_main_option()
+db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or ""
+if db_url:
+    # SQLAlchemy ожидает префикс postgresql://
+    if db_url.startswith("postgres://"):
+        db_url = "postgresql://" + db_url[len("postgres://"):]
+    config.set_main_option("sqlalchemy.url", db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
