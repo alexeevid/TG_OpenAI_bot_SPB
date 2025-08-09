@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# гарантия, что пакет bot виден Python-у
+# Чтобы Alembic и bot виделись как пакет
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 echo '🔧 Running Alembic migrations...'
