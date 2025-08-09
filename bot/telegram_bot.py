@@ -143,6 +143,68 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# Создать таблицу kb_chunks и индексы (если её нет)
+async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await m.reply_text("Только для админа.")
+        from sqlalchemy import text
+        created = []
+        with SessionLocal() as db:
+            # На всякий случай — расширение
+            try:
+                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                db.commit()
+            except Exception:
+                db.rollback()
+
+            # Таблица
+            db.execute(text("""
+                CREATE TABLE IF NOT EXISTS kb_chunks (
+                    id           BIGSERIAL PRIMARY KEY,
+                    document_id  BIGINT NOT NULL,
+                    chunk_index  INTEGER NOT NULL,
+                    content      TEXT NOT NULL,
+                    meta         JSON,
+                    embedding    vector(3072)
+                );
+            """))
+            # Индексы
+            try:
+                db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                db.execute(text("""
+                    CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
+                    ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
+                """))
+            except Exception:
+                # индексы не критичны — продолжаем без падения
+                pass
+            # FK на kb_documents
+            try:
+                db.execute(text("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                           SELECT 1 FROM pg_constraint WHERE conname = 'fk_kb_chunks_docs'
+                        ) THEN
+                           ALTER TABLE kb_chunks
+                           ADD CONSTRAINT fk_kb_chunks_docs
+                           FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
+                        END IF;
+                    END $$;
+                """))
+            except Exception:
+                pass
+
+            db.commit()
+            created.append("kb_chunks + indexes + FK")
+
+        await m.reply_text("✅ Создано: " + ", ".join(created))
+    except Exception:
+        log.exception("kb_chunks_create failed")
+        await m.reply_text("⚠ Не удалось создать kb_chunks. Смотри логи.")
+
 # создать новый диалог вручную
 async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -765,6 +827,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(kb_cb, pattern=r"^kb:"))
     app.add_handler(CommandHandler("dialog_new", dialog_new))
     app.add_handler(CommandHandler("pgvector_check", pgvector_check))
+    app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
