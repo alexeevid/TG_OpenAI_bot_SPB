@@ -141,6 +141,28 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+# создать новый диалог вручную
+async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        m = update.effective_message or update.message
+        tg_id = update.effective_user.id
+        with SessionLocal() as db:
+            uid = _ensure_user(db, tg_id)
+            did = _exec_scalar(
+                db,
+                """
+                INSERT INTO dialogs (user_id, title, style, model, is_deleted)
+                VALUES (:u, :t, 'expert', :m, FALSE)
+                RETURNING id
+                """,
+                u=uid, t=datetime.now().strftime("%Y-%m-%d | диалог"), m=settings.openai_model
+            )
+        await m.reply_text(f"✅ Создан диалог #{did}")
+    except Exception:
+        log.exception("dialog_new failed")
+        await (update.effective_message or update.message).reply_text("⚠ Не удалось создать диалог.")
+
+
 async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Чинит схему по шагам и фиксирует прогресс после КАЖДОЙ таблицы.
@@ -722,6 +744,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("migrate", migrate))
     app.add_handler(CommandHandler("kb", kb))
     app.add_handler(CallbackQueryHandler(kb_cb, pattern=r"^kb:"))
+    app.add_handler(CommandHandler("dialog_new", dialog_new))
+
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_router))
 
     return app
