@@ -141,29 +141,35 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
-# Создаёт недостающие таблицы и расширения. Идём по факту отсутствия.
 async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Чинит схему по шагам и фиксирует прогресс после КАЖДОЙ таблицы.
+    Даже если на kb_* упадёт, базовые таблицы users/dialogs/messages останутся.
+    """
+    m = update.effective_message or update.message
     try:
         if not _is_admin(update.effective_user.id):
-            return await (update.effective_message or update.message).reply_text("Только для админа.")
+            return await m.reply_text("Только для админа.")
 
-        m = update.effective_message or update.message
-        await m.reply_text("🧰 Проверяю схему и чиню недостающие объекты...")
+        await m.reply_text("🧰 Ремонт схемы начат. Пишу прогресс в логи...")
 
+        from sqlalchemy import text
         created = []
         with SessionLocal() as db:
-            # 0) расширение vector (на всякий случай)
-            try:
-                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-                db.commit()
-            except Exception:
-                log.exception("CREATE EXTENSION vector failed (может не требоваться)")
-                db.rollback()
 
             def has(table: str) -> bool:
                 return bool(db.execute(text("SELECT to_regclass(:t)"), {"t": f"public.{table}"}).scalar())
 
-            # 1) USERS
+            # 0) vector extension — отдельно и без паники
+            try:
+                db.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+                db.commit()
+                log.info("repair: extension vector OK (или уже было)")
+            except Exception:
+                db.rollback()
+                log.exception("repair: CREATE EXTENSION vector failed — продолжу без него")
+
+            # 1) USERS — СНАЧАЛА БАЗА
             if not has("users"):
                 db.execute(text("""
                     CREATE TABLE IF NOT EXISTS users (
@@ -175,9 +181,9 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
                     );
                 """))
-                created.append("users")
+                db.commit(); created.append("users"); log.info("repair: created users")
 
-            # 2) DIALOGS (если вдруг нет)
+            # 2) DIALOGS
             if not has("dialogs"):
                 db.execute(text("""
                     CREATE TABLE IF NOT EXISTS dialogs (
@@ -191,26 +197,24 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         last_message_at TIMESTAMPTZ
                     );
                 """))
-                # FK добавим, только если есть users
-                if has("users"):
-                    try:
-                        db.execute(text("""
-                            DO $$
-                            BEGIN
-                                IF NOT EXISTS (
-                                   SELECT 1 FROM pg_constraint WHERE conname = 'fk_dialogs_users'
-                                ) THEN
-                                   ALTER TABLE dialogs
-                                   ADD CONSTRAINT fk_dialogs_users
-                                   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
-                                END IF;
-                            END $$;
-                        """))
-                    except Exception:
-                        log.exception("FK dialogs->users skipped")
-                created.append("dialogs")
+                try:
+                    db.execute(text("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_dialogs_users'
+                            ) THEN
+                               ALTER TABLE dialogs
+                               ADD CONSTRAINT fk_dialogs_users
+                               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+                            END IF;
+                        END $$;
+                    """))
+                except Exception:
+                    log.exception("repair: FK dialogs->users skipped")
+                db.commit(); created.append("dialogs"); log.info("repair: created dialogs")
 
-            # 3) MESSAGES (если вдруг нет)
+            # 3) MESSAGES
             if not has("messages"):
                 db.execute(text("""
                     CREATE TABLE IF NOT EXISTS messages (
@@ -236,133 +240,121 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         END $$;
                     """))
                 except Exception:
-                    log.exception("FK messages->dialogs skipped")
-                created.append("messages")
+                    log.exception("repair: FK messages->dialogs skipped")
+                db.commit(); created.append("messages"); log.info("repair: created messages")
+
+            # --- Блок БЗ: делаем best-effort, каждый шаг в своей транзакции ---
 
             # 4) KB_DOCUMENTS
-            if not has("kb_documents"):
-                db.execute(text("""
-                    CREATE TABLE IF NOT EXISTS kb_documents (
-                        id         BIGSERIAL PRIMARY KEY,
-                        path       TEXT UNIQUE NOT NULL,
-                        etag       TEXT,
-                        mime       TEXT,
-                        pages      INTEGER,
-                        bytes      BIGINT,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        is_active  BOOLEAN NOT NULL DEFAULT TRUE
-                    );
-                """))
-                created.append("kb_documents")
+            try:
+                if not has("kb_documents"):
+                    db.execute(text("""
+                        CREATE TABLE IF NOT EXISTS kb_documents (
+                            id         BIGSERIAL PRIMARY KEY,
+                            path       TEXT UNIQUE NOT NULL,
+                            etag       TEXT,
+                            mime       TEXT,
+                            pages      INTEGER,
+                            bytes      BIGINT,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            is_active  BOOLEAN NOT NULL DEFAULT TRUE
+                        );
+                    """))
+                    db.commit(); created.append("kb_documents"); log.info("repair: created kb_documents")
+            except Exception:
+                db.rollback(); log.exception("repair: create kb_documents failed (пропускаю)")
 
             # 5) KB_CHUNKS
-            if not has("kb_chunks"):
-                db.execute(text("""
-                    CREATE TABLE IF NOT EXISTS kb_chunks (
-                        id           BIGSERIAL PRIMARY KEY,
-                        document_id  BIGINT NOT NULL,
-                        chunk_index  INTEGER NOT NULL,
-                        content      TEXT NOT NULL,
-                        meta         JSON,
-                        embedding    vector(3072)
-                    );
-                """))
-                # индексы
-                try:
-                    db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+            try:
+                if not has("kb_chunks"):
                     db.execute(text("""
-                        CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
-                        ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
+                        CREATE TABLE IF NOT EXISTS kb_chunks (
+                            id           BIGSERIAL PRIMARY KEY,
+                            document_id  BIGINT NOT NULL,
+                            chunk_index  INTEGER NOT NULL,
+                            content      TEXT NOT NULL,
+                            meta         JSON,
+                            embedding    vector(3072)
+                        );
                     """))
-                except Exception:
-                    log.exception("Indexes for kb_chunks skipped")
-                # FK
-                try:
-                    db.execute(text("""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_kb_chunks_docs'
-                            ) THEN
-                               ALTER TABLE kb_chunks
-                               ADD CONSTRAINT fk_kb_chunks_docs
-                               FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
-                            END IF;
-                        END $$;
-                    """))
-                except Exception:
-                    log.exception("FK kb_chunks->kb_documents skipped")
-                created.append("kb_chunks")
+                    try:
+                        db.execute(text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
+                        db.execute(text("""
+                            CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx
+                            ON kb_chunks USING ivfflat (embedding vector_cosine_ops);
+                        """))
+                    except Exception:
+                        log.exception("repair: kb_chunks indexes skipped")
+                    try:
+                        db.execute(text("""
+                            DO $$
+                            BEGIN
+                                IF NOT EXISTS (
+                                   SELECT 1 FROM pg_constraint WHERE conname = 'fk_kb_chunks_docs'
+                                ) THEN
+                                   ALTER TABLE kb_chunks
+                                   ADD CONSTRAINT fk_kb_chunks_docs
+                                   FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
+                                END IF;
+                            END $$;
+                        """))
+                    except Exception:
+                        log.exception("repair: FK kb_chunks->kb_documents skipped")
+                    db.commit(); created.append("kb_chunks"); log.info("repair: created kb_chunks")
+            except Exception:
+                db.rollback(); log.exception("repair: create kb_chunks failed (возможно, нет расширения vector)")
 
             # 6) DIALOG_KB_LINKS
-            if not has("dialog_kb_links"):
-                db.execute(text("""
-                    CREATE TABLE IF NOT EXISTS dialog_kb_links (
-                        id          BIGSERIAL PRIMARY KEY,
-                        dialog_id   BIGINT NOT NULL,
-                        document_id BIGINT NOT NULL,
-                        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                try:
+            try:
+                if not has("dialog_kb_links"):
                     db.execute(text("""
-                        DO $$
-                        BEGIN
-                            IF NOT EXISTS (
-                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_dkbl_dialogs'
-                            ) THEN
-                               ALTER TABLE dialog_kb_links
-                               ADD CONSTRAINT fk_dkbl_dialogs
-                               FOREIGN KEY (dialog_id) REFERENCES dialogs(id) ON DELETE CASCADE;
-                            END IF;
-                            IF NOT EXISTS (
-                               SELECT 1 FROM pg_constraint WHERE conname = 'fk_dkbl_docs'
-                            ) THEN
-                               ALTER TABLE dialog_kb_links
-                               ADD CONSTRAINT fk_dkbl_docs
-                               FOREIGN KEY (document_id) REFERENCES kb_documents(id) ON DELETE CASCADE;
-                            END IF;
-                        END $$;
+                        CREATE TABLE IF NOT EXISTS dialog_kb_links (
+                            id          BIGSERIAL PRIMARY KEY,
+                            dialog_id   BIGINT NOT NULL,
+                            document_id BIGINT NOT NULL,
+                            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
                     """))
-                except Exception:
-                    log.exception("FK dialog_kb_links skipped")
-                created.append("dialog_kb_links")
+                    db.commit(); created.append("dialog_kb_links"); log.info("repair: created dialog_kb_links")
+            except Exception:
+                db.rollback(); log.exception("repair: create dialog_kb_links failed")
 
             # 7) PDF_PASSWORDS
-            if not has("pdf_passwords"):
-                db.execute(text("""
-                    CREATE TABLE IF NOT EXISTS pdf_passwords (
-                        id          BIGSERIAL PRIMARY KEY,
-                        dialog_id   BIGINT NOT NULL,
-                        document_id BIGINT NOT NULL,
-                        pwd_hash    TEXT,
-                        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                created.append("pdf_passwords")
+            try:
+                if not has("pdf_passwords"):
+                    db.execute(text("""
+                        CREATE TABLE IF NOT EXISTS pdf_passwords (
+                            id          BIGSERIAL PRIMARY KEY,
+                            dialog_id   BIGINT NOT NULL,
+                            document_id BIGINT NOT NULL,
+                            pwd_hash    TEXT,
+                            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
+                    db.commit(); created.append("pdf_passwords"); log.info("repair: created pdf_passwords")
+            except Exception:
+                db.rollback(); log.exception("repair: create pdf_passwords failed")
 
             # 8) AUDIT_LOG
-            if not has("audit_log"):
-                db.execute(text("""
-                    CREATE TABLE IF NOT EXISTS audit_log (
-                        id         BIGSERIAL PRIMARY KEY,
-                        user_id    BIGINT,
-                        action     TEXT,
-                        meta       JSON,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                created.append("audit_log")
+            try:
+                if not has("audit_log"):
+                    db.execute(text("""
+                        CREATE TABLE IF NOT EXISTS audit_log (
+                            id         BIGSERIAL PRIMARY KEY,
+                            user_id    BIGINT,
+                            action     TEXT,
+                            meta       JSON,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
+                    db.commit(); created.append("audit_log"); log.info("repair: created audit_log")
+            except Exception:
+                db.rollback(); log.exception("repair: create audit_log failed")
 
-            db.commit()
-
-        if created:
-            await m.reply_text("✅ Созданы объекты: " + ", ".join(created))
-        else:
-            await m.reply_text("✅ Всё уже на месте. Ничего создавать не пришлось.")
+        await m.reply_text("✅ Готово. Создано: " + (", ".join(created) if created else "ничего (всё уже было)"))
     except Exception:
-        log.exception("repair_schema failed")
-        await (update.effective_message or update.message).reply_text("⚠ Ошибка repair_schema. Смотри логи.")
+        log.exception("repair_schema failed (outer)")
+        await m.reply_text("⚠ Ошибка repair_schema. Смотри логи.")
 
 # Проверка наличия таблиц в БД
 async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
