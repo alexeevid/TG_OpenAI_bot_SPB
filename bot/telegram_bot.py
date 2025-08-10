@@ -1,5 +1,6 @@
 from __future__ import annotations
 import tiktoken
+from openai import OpenAI
 
 import logging
 from datetime import datetime
