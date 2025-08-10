@@ -373,20 +373,23 @@ except NameError:
 try:
     _ya_download
 except NameError:
-    def _ya_download(path: str) -> bytes:
-        import requests
-        YA_API = "https://cloud-api.yandex.net/v1/disk"
-        headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
-        # получаем ссылку на скачивание
-        r = requests.get(f"{YA_API}/resources/download", headers=headers, params={"path": path}, timeout=30)
-        r.raise_for_status()
-        href = (r.json() or {}).get("href")
-        if not href:
-            raise RuntimeError("no href from yandex download api")
-        # скачиваем содержимое
-        d = requests.get(href, timeout=120)
-        d.raise_for_status()
-        return d.content
+    def _chunk_text(text: str, max_tokens: int = 2000, overlap: int = 0):
+        """Разбивает текст на куски по max_tokens для эмбеддингов с перекрытием overlap"""
+        enc = tiktoken.get_encoding("cl100k_base")
+        tokens = enc.encode(text)
+    
+        chunks = []
+        i = 0
+        while i < len(tokens):
+            chunk_tokens = tokens[i:i+max_tokens]
+            chunk_text = enc.decode(chunk_tokens)
+            chunks.append(chunk_text.strip())
+            if overlap > 0:
+                i += max_tokens - overlap
+            else:
+                i += max_tokens
+    
+        return chunks
 
 # 4) простая резка текста на чанки
 try:
