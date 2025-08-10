@@ -1836,6 +1836,36 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("img failed")
         await m.reply_text("⚠ Не удалось сгенерировать изображение.")
+
+async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tg_id = update.effective_user.id
+        with SessionLocal() as db:
+            uid = _ensure_user(db, tg_id)
+            ds = _exec_all(
+                db,
+                """
+                SELECT id, title
+                FROM dialogs
+                WHERE user_id=:u AND is_deleted=FALSE
+                ORDER BY created_at DESC
+                """, u=uid,
+            )
+        if not ds:
+            await (update.message or update.effective_message).reply_text("Диалогов нет.")
+            return
+        rows = []
+        for d_id, d_title in ds:
+            rows.append([
+                InlineKeyboardButton(f"📄 {d_title or d_id}", callback_data=f"dlg:open:{d_id}"),
+                InlineKeyboardButton("✏️", callback_data=f"dlg:rename:{d_id}"),
+                InlineKeyboardButton("📤", callback_data=f"dlg:export:{d_id}"),
+                InlineKeyboardButton("🗑", callback_data=f"dlg:delete:{d_id}"),
+            ])
+        await (update.message or update.effective_message).reply_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        log.exception("dialogs failed")
+        await (update.message or update.effective_message).reply_text("⚠ Что-то пошло не так.")
 def build_app() -> Application:
     apply_migrations_if_needed()
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
