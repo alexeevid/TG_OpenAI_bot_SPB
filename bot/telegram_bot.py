@@ -151,41 +151,57 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Принимает voice от пользователя, распознаёт речь (OpenAI Whisper),
-    и прогоняет распознанный текст через тот же RAG-пайплайн, что и on_text.
+    Принимает voice/audio, распознаёт речь (OpenAI), затем тот же RAG-пайплайн, что и on_text.
+    Делает подсказку на русский язык и имеет фолбэк-модель, если whisper вернул пусто.
     """
+    from openai import OpenAI  # локальный импорт на всякий случай
     m = update.effective_message or update.message
     try:
         voice = getattr(m, "voice", None)
-        if not voice:
+        audio = getattr(m, "audio", None)
+        tg_file = voice or audio
+        if not tg_file:
             return await m.reply_text("Голосовое не найдено.")
 
         # Ограничение по длительности (опционально)
-        if getattr(voice, "duration", 0) and voice.duration > 180:  # > 3 минут
+        dur = int(getattr(tg_file, "duration", 0) or 0)
+        if dur > 180:
             return await m.reply_text("Аудио длиннее 3 минут. Пришлите короче, пожалуйста.")
 
-        # Скачиваем voice из Telegram
-        file = await context.bot.get_file(voice.file_id)
+        # Скачиваем файл из Telegram
+        file = await context.bot.get_file(tg_file.file_id)
         audio_bytes = await file.download_as_bytearray()
-        buf = BytesIO(audio_bytes)
-        buf.name = "voice.ogg"  # имя нужно SDK для mime
 
-        # Распознаём через OpenAI Whisper
+        buf = BytesIO(audio_bytes)
+        # Имя файла помогает SDK определить формат; .oga / .ogg для voice из TG ок
+        buf.name = "voice.ogg"
+
         client = OpenAI(api_key=settings.openai_api_key)
+
+        # 1) Основная попытка — whisper-1 с подсказкой языка
         tr = client.audio.transcriptions.create(
             model="whisper-1",
-            file=buf
+            file=buf,
+            language="ru"
         )
-        # Поддержка как для объектов SDK, так и словаря
-        transcript_text = getattr(tr, "text", None) or tr.get("text") if isinstance(tr, dict) else None
-        if not transcript_text:
+        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None)
+
+        # 2) Фолбэк: если пусто — пробуем вторую модель распознавания
+        if not (text or "").strip():
+            buf.seek(0)
+            tr2 = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=buf,
+                language="ru"
+            )
+            text = getattr(tr2, "text", None) or (tr2.get("text") if isinstance(tr2, dict) else None)
+
+        if not (text or "").strip():
             return await m.reply_text("Не удалось распознать речь, попробуйте ещё раз.")
 
-        # Дальше — та же логика, что и в on_text (короткая версия без копипасты)
-        q = transcript_text.strip()
-        if not q:
-            return await m.reply_text("Распознавание вернуло пустой результат.")
+        q = text.strip()
 
+        # --- Далее как on_text: RAG-пайплайн ---
         with SessionLocal() as db:
             tg_id = update.effective_user.id
             user_id = _ensure_user(db, tg_id)
@@ -211,13 +227,14 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chunks:
                 answer += _format_citations(chunks)
 
-        # Отправляем пользователю и транскрипт, и ответ
+        # Отдаём пользователю результат распознавания + ответ
         await m.reply_text(f"🗣️ Распознано:\n{q}")
         await m.reply_text(answer)
 
     except Exception:
         log.exception("on_voice failed")
         await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
+
 
 def ya_download(path: str) -> bytes:
     """
