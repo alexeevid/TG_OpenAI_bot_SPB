@@ -48,9 +48,10 @@ def apply_migrations_if_needed(force: bool = False) -> None:
             log.info("Auto-migrate: applying Alembic migrations...")
             # Настраиваем Alembic программно
             import os
-import time
+            import time
             from alembic.config import Config
             from alembic import command
+
             cfg = Config("alembic.ini")  # файл лежит в корне проекта
             os.environ["DATABASE_URL"] = settings.database_url  # чтобы Alembic знал, куда подключаться
             command.upgrade(cfg, "head")
@@ -308,6 +309,37 @@ def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
             out.append(text)
         return ("\n".join(out), pages, False)
 
+# --- Fallback листинг Яндекс.Диска (если нет собственного хелпера) ---
+def _ya_list_files(root_path: str):
+    """
+    Возвращает список файлов в папке Я.Диска через REST API.
+    Элементы: name, path, type, mime_type, size, md5.
+    """
+    import requests
+    YA_API = "https://cloud-api.yandex.net/v1/disk"
+    out = []
+    limit, offset = 200, 0
+    headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
+    while True:
+        params = {
+            "path": root_path,
+            "limit": limit,
+            "offset": offset,
+            "fields": "_embedded.items.name,_embedded.items.path,_embedded.items.type,_embedded.items.mime_type,_embedded.items.size,_embedded.items.md5",
+        }
+        r = requests.get(f"{YA_API}/resources", headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        items = (data.get("_embedded") or {}).get("items") or []
+        for it in items:
+            if it.get("type") == "file":
+                out.append(it)
+        if len(items) < limit:
+            break
+        offset += limit
+    return out
+
+
 def _kb_update_pages(db, document_id: int, pages: int | None):
     if pages is None:
         return
@@ -419,6 +451,17 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("kb_sync_pdf failed")
         await (update.effective_message or update.message).reply_text(f"⚠ kb_sync_pdf: {e}")
+
+async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Временная заглушка, чтобы не падал импорт. Полная синхронизация у нас через /kb_sync_pdf."""
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await (update.effective_message or update.message).reply_text("Только для админа.")
+        return await (update.effective_message or update.message).reply_text(
+            "ℹ Используйте /kb_sync_pdf — он выполняет актуальную синхронизацию PDF и деактивацию удалённых файлов."
+        )
+    except Exception:
+        log.exception("kb_sync (stub) failed")
 
 async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
