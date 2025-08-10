@@ -393,17 +393,17 @@ try:
     _chunk_text
 except NameError:
     def _chunk_text(text: str, max_tokens: int = 2000):
-    """Разбивает текст на куски по max_tokens для эмбеддингов"""
-    enc = tiktoken.get_encoding("cl100k_base")
-    tokens = enc.encode(text)
-
-    chunks = []
-    for i in range(0, len(tokens), max_tokens):
-        chunk_tokens = tokens[i:i+max_tokens]
-        chunk_text = enc.decode(chunk_tokens)
-        chunks.append(chunk_text.strip())
-
-    return chunks
+        """Разбивает текст на куски по max_tokens для эмбеддингов"""
+        enc = tiktoken.get_encoding("cl100k_base")
+        tokens = enc.encode(text)
+    
+        chunks = []
+        for i in range(0, len(tokens), max_tokens):
+            chunk_tokens = tokens[i:i+max_tokens]
+            chunk_text = enc.decode(chunk_tokens)
+            chunks.append(chunk_text.strip())
+    
+        return chunks
 
 # 5) эмбеддинги пачкой (OpenAI)
 try:
