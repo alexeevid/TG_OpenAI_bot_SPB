@@ -148,6 +148,76 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/whoami, /grant <id>, /revoke <id>"
     )
 
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Принимает voice от пользователя, распознаёт речь (OpenAI Whisper),
+    и прогоняет распознанный текст через тот же RAG-пайплайн, что и on_text.
+    """
+    m = update.effective_message or update.message
+    try:
+        voice = getattr(m, "voice", None)
+        if not voice:
+            return await m.reply_text("Голосовое не найдено.")
+
+        # Ограничение по длительности (опционально)
+        if getattr(voice, "duration", 0) and voice.duration > 180:  # > 3 минут
+            return await m.reply_text("Аудио длиннее 3 минут. Пришлите короче, пожалуйста.")
+
+        # Скачиваем voice из Telegram
+        file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await file.download_as_bytearray()
+        buf = BytesIO(audio_bytes)
+        buf.name = "voice.ogg"  # имя нужно SDK для mime
+
+        # Распознаём через OpenAI Whisper
+        client = OpenAI(api_key=settings.openai_api_key)
+        tr = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=buf
+        )
+        # Поддержка как для объектов SDK, так и словаря
+        transcript_text = getattr(tr, "text", None) or tr.get("text") if isinstance(tr, dict) else None
+        if not transcript_text:
+            return await m.reply_text("Не удалось распознать речь, попробуйте ещё раз.")
+
+        # Дальше — та же логика, что и в on_text (короткая версия без копипасты)
+        q = transcript_text.strip()
+        if not q:
+            return await m.reply_text("Распознавание вернуло пустой результат.")
+
+        with SessionLocal() as db:
+            tg_id = update.effective_user.id
+            user_id = _ensure_user(db, tg_id)
+            dialog_id = _ensure_dialog(db, user_id)
+
+            chunks = _retrieve_chunks(db, dialog_id, q, k=6)
+
+            if chunks:
+                ctx_blocks = [r["content"][:800] for r in chunks]
+                prompt = _build_prompt(ctx_blocks, q)
+            else:
+                prompt = q
+
+            resp = client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[
+                    {"role": "system", "content": "Ты полезный помощник."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+            )
+            answer = resp.choices[0].message.content or "…"
+            if chunks:
+                answer += _format_citations(chunks)
+
+        # Отправляем пользователю и транскрипт, и ответ
+        await m.reply_text(f"🗣️ Распознано:\n{q}")
+        await m.reply_text(answer)
+
+    except Exception:
+        log.exception("on_voice failed")
+        await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
+
 def ya_download(path: str) -> bytes:
     """
     Скачивает файл с Я.Диска по абсолютному пути (например, 'disk:/База Знаний/file.pdf').
@@ -1598,7 +1668,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
 
-
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     return app
