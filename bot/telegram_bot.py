@@ -1,6 +1,8 @@
 from __future__ import annotations
 import tiktoken
 
+from bot.yandex_rest import ya_download as _ya_download
+
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -260,6 +262,34 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("on_text failed")
         await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
 
+# === DIAG: показать статус всех PDF на диске и что с ними при разборе ===
+async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await m.reply_text("Только для админа.")
+
+        root = settings.yandex_root_path
+        files = [f for f in _ya_list_files(root) if (f.get("name") or "").lower().endswith(".pdf")]
+
+        lines = []
+        for it in files:
+            path = it.get("path") or it.get("name")
+            try:
+                blob = ya_download(path)
+                txt, pages, is_prot = _pdf_extract_text(blob)
+                sample = (txt or "").strip().replace("\n", " ")
+                sample = (sample[:120] + "…") if len(sample) > 120 else sample
+                lines.append(f"• {path.split('/')[-1]} | pages={pages} | prot={'yes' if is_prot else 'no'} | text_len={len(txt or '')} | sample='{sample}'")
+            except Exception as e:
+                lines.append(f"• {path.split('/')[-1]} | ERROR: {e}")
+        if not lines:
+            lines = ["(PDF не найдены)"]
+        await m.reply_text("PDF DIAG:\n" + "\n".join(lines[:30]))
+    except Exception:
+        log.exception("kb_pdf_diag failed")
+        await m.reply_text("⚠ kb_pdf_diag: ошибка. Смотри логи.")
+
 async def rag_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     q = " ".join(context.args) if context.args else ""
@@ -286,14 +316,13 @@ async def rag_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
     """
     Возвращает (текст, pages, is_protected).
-    Если PDF защищён и пароль не известен — is_protected=True и текст пустой.
+    1) PyMuPDF
+    2) Fallback на pdfminer.six, если текст пустой и не защищён
     """
     import fitz  # PyMuPDF
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        # защищённый? (true/false)
         is_prot = bool(doc.is_encrypted)
         if is_prot:
-            # пробуем пустой пароль: некоторые "псевдозащищённые" открываются
             try:
                 if doc.authenticate(""):
                     is_prot = False
@@ -310,7 +339,19 @@ def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
             except Exception:
                 text = ""
             out.append(text)
-        return ("\n".join(out), pages, False)
+        txt = "\n".join(out)
+
+    # Fallback: если пусто, попробуем pdfminer
+    if not txt.strip():
+        try:
+            from io import BytesIO
+            from pdfminer.high_level import extract_text
+            txt = extract_text(BytesIO(pdf_bytes)) or ""
+        except Exception:
+            pass
+
+    return (txt, pages, False)
+
 
 # 0) какого типа колонка embedding в kb_chunks: 'vector' | 'bytea' | 'none'
 try:
@@ -520,7 +561,7 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Скачиваем
                 try:
-                    blob = _ya_download(path)
+                    blob = ya_download(path)
                 except Exception as e:
                     log.exception("pdf download failed: %s (%s)", path, e)
                     continue
@@ -1488,6 +1529,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_sync_pdf", kb_sync_pdf))
     app.add_handler(CommandHandler("rag_diag", rag_diag))
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
+    app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
+
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
