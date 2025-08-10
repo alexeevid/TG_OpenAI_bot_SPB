@@ -1,4 +1,5 @@
 from __future__ import annotations
+import tiktoken
 
 import logging
 from datetime import datetime
@@ -391,20 +392,18 @@ except NameError:
 try:
     _chunk_text
 except NameError:
-    def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 150):
-        text = text or ""
-        chunk_size = max(300, int(chunk_size or 1200))
-        overlap = max(0, min(int(overlap or 150), chunk_size // 2))
-        chunks = []
-        i = 0
-        n = len(text)
-        while i < n:
-            j = min(n, i + chunk_size)
-            chunks.append(text[i:j])
-            if j == n:
-                break
-            i = j - overlap
-        return chunks
+    def _chunk_text(text: str, max_tokens: int = 2000):
+    """Разбивает текст на куски по max_tokens для эмбеддингов"""
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = enc.encode(text)
+
+    chunks = []
+    for i in range(0, len(tokens), max_tokens):
+        chunk_tokens = tokens[i:i+max_tokens]
+        chunk_text = enc.decode(chunk_tokens)
+        chunks.append(chunk_text.strip())
+
+    return chunks
 
 # 5) эмбеддинги пачкой (OpenAI)
 try:
