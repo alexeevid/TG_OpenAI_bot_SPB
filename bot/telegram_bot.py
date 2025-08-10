@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from io import BytesIO
+# ==== KB RAG helpers (safe define if missing) ====
+import json
 
 # PTB 20.4 не содержит BufferedInputFile. Делаем совместимый импорт.
 try:
@@ -308,6 +310,137 @@ def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
                 text = ""
             out.append(text)
         return ("\n".join(out), pages, False)
+
+# 0) какого типа колонка embedding в kb_chunks: 'vector' | 'bytea' | 'none'
+try:
+    _kb_embedding_column_kind
+except NameError:
+    def _kb_embedding_column_kind(db) -> str:
+        try:
+            t = db.execute(sa_text("SELECT pg_typeof(embedding)::text FROM kb_chunks LIMIT 1")).scalar()
+            if t:
+                t = str(t).lower()
+                if "vector" in t:
+                    return "vector"
+                if "bytea" in t:
+                    return "bytea"
+            # fallback через information_schema
+            t = db.execute(sa_text("""
+                SELECT COALESCE(udt_name, data_type)
+                FROM information_schema.columns
+                WHERE table_name='kb_chunks' AND column_name='embedding'
+                LIMIT 1
+            """)).scalar()
+            t = (t or "").lower()
+            if "vector" in t:
+                return "vector"
+            if "bytea" in t:
+                return "bytea"
+        except Exception:
+            pass
+        return "none"
+
+# 1) upsert документа в kb_documents (возвращаем id)
+try:
+    _kb_upsert_document
+except NameError:
+    def _kb_upsert_document(db, path: str, mime: str, size: int, etag: str) -> int:
+        sql = sa_text("""
+            INSERT INTO kb_documents (path, mime, bytes, etag, updated_at, is_active)
+            VALUES (:p, :m, :b, :e, now(), TRUE)
+            ON CONFLICT (path) DO UPDATE
+              SET mime = EXCLUDED.mime,
+                  bytes = EXCLUDED.bytes,
+                  etag  = EXCLUDED.etag,
+                  updated_at = now(),
+                  is_active = TRUE
+            RETURNING id
+        """)
+        doc_id = db.execute(sql, {"p": path, "m": mime, "b": size, "e": etag}).scalar()
+        db.commit()
+        return int(doc_id)
+
+# 2) очистка чанков по document_id
+try:
+    _kb_clear_chunks
+except NameError:
+    def _kb_clear_chunks(db, document_id: int):
+        db.execute(sa_text("DELETE FROM kb_chunks WHERE document_id=:d"), {"d": document_id})
+        db.commit()
+
+# 3) загрузка файла с Я.Диска по пути
+try:
+    _ya_download
+except NameError:
+    def _ya_download(path: str) -> bytes:
+        import requests
+        YA_API = "https://cloud-api.yandex.net/v1/disk"
+        headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
+        # получаем ссылку на скачивание
+        r = requests.get(f"{YA_API}/resources/download", headers=headers, params={"path": path}, timeout=30)
+        r.raise_for_status()
+        href = (r.json() or {}).get("href")
+        if not href:
+            raise RuntimeError("no href from yandex download api")
+        # скачиваем содержимое
+        d = requests.get(href, timeout=120)
+        d.raise_for_status()
+        return d.content
+
+# 4) простая резка текста на чанки
+try:
+    _chunk_text
+except NameError:
+    def _chunk_text(text: str, chunk_size: int = 1200, overlap: int = 150):
+        text = text or ""
+        chunk_size = max(300, int(chunk_size or 1200))
+        overlap = max(0, min(int(overlap or 150), chunk_size // 2))
+        chunks = []
+        i = 0
+        n = len(text)
+        while i < n:
+            j = min(n, i + chunk_size)
+            chunks.append(text[i:j])
+            if j == n:
+                break
+            i = j - overlap
+        return chunks
+
+# 5) эмбеддинги пачкой (OpenAI)
+try:
+    _get_embeddings
+except NameError:
+    def _get_embeddings(chunks: list[str]) -> list[list[float]]:
+        if not chunks:
+            return []
+        from openai import OpenAI
+        client = OpenAI(api_key=settings.openai_api_key)
+        # API принимает список строк; возвращает список data в том же порядке
+        resp = client.embeddings.create(model=settings.embedding_model, input=chunks)
+        # поддерживаем и объект с .data, и словарь
+        data = getattr(resp, "data", None) or resp.get("data", [])
+        return [item.embedding for item in data]
+
+# 6) SQL-фрагменты для вставки эмбеддингов
+try:
+    _format_vector_sql
+except NameError:
+    def _format_vector_sql(vec: list[float]) -> tuple[str, dict]:
+        arr = "[" + ",".join(f"{x:.6f}" for x in (vec or [])) + "]"
+        return " CAST(:emb AS vector) ", {"emb": arr}
+
+try:
+    _format_bytea_sql
+except NameError:
+    def _format_bytea_sql(vec: list[float]) -> tuple[str, dict]:
+        try:
+            import struct
+            from psycopg2 import Binary
+            b = struct.pack(f"{len(vec)}f", *vec) if vec else b""
+            return " :emb ", {"emb": Binary(b)}
+        except Exception:
+            return " NULL ", {}
+# ==== /KB RAG helpers ====
 
 # --- Fallback листинг Яндекс.Диска (если нет собственного хелпера) ---
 def _ya_list_files(root_path: str):
