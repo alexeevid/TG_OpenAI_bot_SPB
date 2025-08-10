@@ -1,8 +1,6 @@
 from __future__ import annotations
 import tiktoken
 
-from bot.yandex_rest import ya_download as _ya_download
-
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -149,6 +147,32 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/web <query>\n"
         "/whoami, /grant <id>, /revoke <id>"
     )
+
+def ya_download(path: str) -> bytes:
+    """
+    Скачивает файл с Я.Диска по абсолютному пути (например, 'disk:/База Знаний/file.pdf').
+    Возвращает бинарное содержимое файла.
+    """
+    import requests
+    YA_API = "https://cloud-api.yandex.net/v1/disk"
+    headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
+
+    # 1) получаем href для скачивания
+    r = requests.get(
+        f"{YA_API}/resources/download",
+        headers=headers,
+        params={"path": path},
+        timeout=60,
+    )
+    r.raise_for_status()
+    href = (r.json() or {}).get("href")
+    if not href:
+        raise RuntimeError("download href not returned by Yandex Disk")
+
+    # 2) скачиваем сам файл
+    f = requests.get(href, timeout=300)
+    f.raise_for_status()
+    return f.content
 
 async def rag_selftest(update, context):
     from sqlalchemy import text as sa_text
