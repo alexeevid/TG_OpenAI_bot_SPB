@@ -478,15 +478,58 @@ try:
     _get_embeddings
 except NameError:
     def _get_embeddings(chunks: list[str]) -> list[list[float]]:
+        """
+        Считает эмбеддинги безопасно, батчами:
+        - лимит по суммарным токенам ~250k на запрос (запас от 300k);
+        - доп. лимит на размер батча по количеству элементов, чтобы не раздувать payload.
+        """
         if not chunks:
             return []
+    
+        enc = tiktoken.get_encoding("cl100k_base")
         from openai import OpenAI
         client = OpenAI(api_key=settings.openai_api_key)
-        # API принимает список строк; возвращает список data в том же порядке
-        resp = client.embeddings.create(model=settings.embedding_model, input=chunks)
-        # поддерживаем и объект с .data, и словарь
-        data = getattr(resp, "data", None) or resp.get("data", [])
-        return [item.embedding for item in data]
+    
+        MAX_TOKENS_PER_REQ = 250_000   # запас от лимита 300k
+        MAX_ITEMS_PER_REQ  = 128       # на всякий случай ограничим и по числу строк
+    
+        out: list[list[float]] = []
+        batch: list[str] = []
+        batch_tok_sum = 0
+    
+        def flush_batch():
+            nonlocal out, batch, batch_tok_sum
+            if not batch:
+                return
+            resp = client.embeddings.create(model=settings.embedding_model, input=batch)
+            data = getattr(resp, "data", None) or resp.get("data", [])
+            # order гарантирован, просто дописываем
+            out.extend([item.embedding for item in data])
+            batch = []
+            batch_tok_sum = 0
+    
+        for ch in chunks:
+            t = len(enc.encode(ch or ""))
+            # если одиночный чанк вдруг больше лимита — уже порезан ранее; но на всякий случай:
+            if t > MAX_TOKENS_PER_REQ:
+                # дополнительная защита: дорезать на подчанки по 2000 токенов
+                subchunks = []
+                toks = enc.encode(ch or "")
+                for i in range(0, len(toks), 2000):
+                    subchunks.append(enc.decode(toks[i:i+2000]))
+                # рекурсивно прогоняем подчанки тем же механизмом
+                out.extend(_get_embeddings(subchunks))
+                continue
+    
+            # если текущий не влезает в батч — шлём то, что накоплено
+            if batch and (batch_tok_sum + t > MAX_TOKENS_PER_REQ or len(batch) >= MAX_ITEMS_PER_REQ):
+                flush_batch()
+    
+            batch.append(ch)
+            batch_tok_sum += t
+    
+        flush_batch()
+        return out
 
 # 6) SQL-фрагменты для вставки эмбеддингов
 try:
