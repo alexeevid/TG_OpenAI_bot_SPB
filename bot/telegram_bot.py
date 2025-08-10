@@ -27,6 +27,7 @@ from telegram.ext import (
 from sqlalchemy import text as sa_text
 
 from bot.settings import load_settings
+from bot.openai_helper import chat as ai_chat, embed as ai_embed
 from bot.db.session import SessionLocal  # engine импортируем внутри apply_migrations_if_needed
 
 log = logging.getLogger(__name__)
@@ -111,6 +112,38 @@ def _ensure_dialog(db, user_id: int) -> int:
     return did
 
 def _is_admin(tg_id: int) -> bool:
+    # сначала смотрим список из env
+    try:
+        if settings.admin_user_ids and tg_id in [int(x) for x in settings.admin_user_ids]:
+            return True
+    except Exception:
+        pass
+    # далее смотрим флаг в БД
+    with SessionLocal() as db:
+        uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id=:tg", tg=tg_id)
+        if not uid:
+            return False
+        return bool(_exec_scalar(db, "SELECT is_admin FROM users WHERE id=:id", id=uid))
+
+def _is_allowed_user(tg_id: int) -> bool:
+    """True, если ALLOWED_USER_IDS пусто или польз. явно разрешён/админ."""
+    if _is_admin(tg_id):
+        return True
+    allow_list = (settings.allowed_user_ids or [])
+    if allow_list:
+        try:
+            if tg_id in [int(x) for x in allow_list]:
+                return True
+        except Exception:
+            pass
+        # если список задан, но пользователя в нём нет — проверим users.is_allowed
+        with SessionLocal() as db:
+            uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id=:tg", tg=tg_id)
+            if not uid:
+                return False
+            return bool(_exec_scalar(db, "SELECT is_allowed FROM users WHERE id=:id", id=uid))
+    return True  # если список пустой — разрешить всем
+
     try:
         ids = [int(x.strip()) for x in (settings.admin_user_ids or "").split(",") if x.strip()]
         return tg_id in ids
@@ -150,6 +183,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_user(update.effective_user.id):
+        return
     """
     Принимает voice/audio, распознаёт речь (OpenAI), затем тот же RAG-пайплайн, что и on_text.
     Делает подсказку на русский язык и имеет фолбэк-модель, если whisper вернул пусто.
@@ -207,7 +242,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = _ensure_user(db, tg_id)
             dialog_id = _ensure_dialog(db, user_id)
 
-            chunks = _retrieve_chunks(db, dialog_id, q, k=6)
+            chunks = await _retrieve_chunks(db, dialog_id, q, k=6)
 
             if chunks:
                 ctx_blocks = [r["content"][:800] for r in chunks]
@@ -215,15 +250,11 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 prompt = q
 
-            resp = client.chat.completions.create(
-                model=settings.openai_model,
-                messages=[
-                    {"role": "system", "content": "Ты полезный помощник."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-            )
-            answer = resp.choices[0].message.content or "…"
+            answer = await ai_chat([
+                {"role":"system","content":"Отвечай кратко и по делу."},
+                {"role":"user","content": prompt}
+            ], model=_dialog_model(db, dialog_id) or settings.openai_model)
+
             if chunks:
                 answer += _format_citations(chunks)
 
@@ -282,18 +313,18 @@ def _vec_literal(vec: list[float]) -> tuple[dict, str]:
     arr = "[" + ",".join(f"{x:.6f}" for x in (vec or [])) + "]"
     return {"q": arr}, "CAST(:q AS vector)"   # <- возвращаем params и SQL-выражение
 
-def _embed_query(text: str) -> List[float]:
+async def _embed_query_async(text: str) -> List[float]:
     from openai import OpenAI
     client = OpenAI(api_key=settings.openai_api_key)
-    return client.embeddings.create(model=settings.embedding_model, input=[text]).data[0].embedding
+    return (await ai_embed([text]))[0]
 
-def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict]:
+async def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict]:
     # если столбец embedding не в vector-типе — просто вернём пусто (RAG отключится)
     kind = _kb_embedding_column_kind(db)
     if kind != "vector":
         return []
 
-    q = _embed_query(question)
+    q = await _embed_query_async(question)
     params, qexpr = _vec_literal(q)
     
     sql = f"""
@@ -333,6 +364,8 @@ def _format_citations(chunks: List[dict]) -> str:
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_user(update.effective_user.id):
+        return
     m = update.effective_message or update.message
     q = (m.text or "").strip()
     if not q:
@@ -345,25 +378,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dialog_id = _ensure_dialog(db, user_id)  # активный диалог
 
             # 1) пробуем достать контекст из подключённых документов
-            chunks = _retrieve_chunks(db, dialog_id, q, k=6)
-
-            from openai import OpenAI
-            client = OpenAI(api_key=settings.openai_api_key)
+            chunks = await _retrieve_chunks(db, dialog_id, q, k=6)
 
             if chunks:
-                ctx_blocks = [r["content"][:800] for r in chunks]  # аккуратно ограничим
+                ctx_blocks = [r["content"][:800] for r in chunks]
                 prompt = _build_prompt(ctx_blocks, q)
             else:
-                # без RAG — обычный ответ модели
                 prompt = q
+            answer = await ai_chat([{"role":"user","content": prompt}], model=_dialog_model(db, dialog_id) or settings.openai_model)
 
-            resp = client.chat.completions.create(
-                model=settings.openai_model,
-                messages=[{"role":"system","content":"Ты полезный помощник."},
-                          {"role":"user","content": prompt}],
-                temperature=0.2,
-            )
-            answer = resp.choices[0].message.content or "…"
 
             # добавим источники, если был контекст
             if chunks:
@@ -1659,6 +1682,143 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # ---------- build ----------
+
+# ---------- extra commands: access control, model/mode, dialog switch ----------
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tg_id = update.effective_user.id
+        with SessionLocal() as db:
+            row = db.execute(sa_text("SELECT id, is_admin, is_allowed, lang FROM users WHERE tg_user_id=:tg"), {"tg": tg_id}).first()
+            if not row:
+                uid = _ensure_user(db, tg_id)
+                row = db.execute(sa_text("SELECT id, is_admin, is_allowed, lang FROM users WHERE id=:id"), {"id": uid}).first()
+            is_admin = bool(row[1]) if row else False
+            is_allowed = bool(row[2]) if row else True
+            lang = (row[3] or "ru") if row else "ru"
+        role = "admin" if is_admin else ("allowed" if is_allowed else "guest")
+        await (update.message or update.effective_message).reply_text(f"whoami: tg={tg_id}, role={role}, lang={lang}")
+    except Exception:
+        log.exception("whoami failed")
+        await (update.message or update.effective_message).reply_text("⚠ Ошибка whoami")
+
+async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await (update.message or update.effective_message).reply_text("⛔ Доступ запрещён (нужно быть админом).")
+        args = (update.message.text or "").split()
+        if len(args) < 2 or not args[1].isdigit():
+            return await (update.message or update.effective_message).reply_text("Использование: /grant <tg_id>")
+        target = int(args[1])
+        with SessionLocal() as db:
+            uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id=:tg", tg=target)
+            if not uid:
+                uid = _exec_scalar(db, "INSERT INTO users (tg_user_id, is_admin, is_allowed, lang) VALUES (:tg,FALSE,TRUE,'ru') RETURNING id", tg=target)
+            else:
+                db.execute(sa_text("UPDATE users SET is_allowed=TRUE WHERE id=:id"), {"id": uid})
+            db.commit()
+        await (update.message or update.effective_message).reply_text(f"✅ Выдан доступ пользователю {target}")
+    except Exception:
+        log.exception("grant failed")
+        await (update.message or update.effective_message).reply_text("⚠ Ошибка grant")
+
+async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _is_admin(update.effective_user.id):
+            return await (update.message or update.effective_message).reply_text("⛔ Доступ запрещён (нужно быть админом).")
+        args = (update.message.text or "").split()
+        if len(args) < 2 or not args[1].isdigit():
+            return await (update.message or update.effective_message).reply_text("Использование: /revoke <tg_id>")
+        target = int(args[1])
+        with SessionLocal() as db:
+            uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id=:tg", tg=target)
+            if uid:
+                db.execute(sa_text("UPDATE users SET is_allowed=FALSE WHERE id=:id"), {"id": uid})
+                db.commit()
+        await (update.message or update.effective_message).reply_text(f"🚫 Доступ отозван у {target}")
+    except Exception:
+        log.exception("revoke failed")
+        await (update.message or update.effective_message).reply_text("⚠ Ошибка revoke")
+
+async def model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /model <name>. Stores per-dialog model name."""
+    try:
+        args = (update.message.text or "").split(maxsplit=1)
+        if len(args) < 2:
+            return await (update.message or update.effective_message).reply_text(f"Текущая модель: {settings.openai_model}\nИспользование: /model <имя_модели>")
+        new_model = args[1].strip()
+        tg_id = update.effective_user.id
+        with SessionLocal() as db:
+            uid = _ensure_user(db, tg_id)
+            did = _ensure_dialog(db, uid)
+            db.execute(sa_text("UPDATE dialogs SET model=:m WHERE id=:d"), {"m": new_model, "d": did})
+            db.commit()
+        await (update.message or update.effective_message).reply_text(f"✅ Модель установлена: {new_model}")
+    except Exception:
+        log.exception("model failed")
+        await (update.message or update.effective_message).reply_text("⚠ Ошибка model")
+
+async def mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /mode <ceo|expert|pro|user>."""
+    try:
+        args = (update.message.text or "").split(maxsplit=1)
+        if len(args) < 2:
+            return await (update.message or update.effective_message).reply_text("Использование: /mode <ceo|expert|pro|user>")
+        style = args[1].strip().lower()
+        if style not in ("ceo","expert","pro","user"):
+            return await (update.message or update.effective_message).reply_text("Недопустимый стиль. Доступны: ceo, expert, pro, user.")
+        tg_id = update.effective_user.id
+        with SessionLocal() as db:
+            uid = _ensure_user(db, tg_id)
+            did = _ensure_dialog(db, uid)
+            db.execute(sa_text("UPDATE dialogs SET style=:s WHERE id=:d"), {"s": style, "d": did})
+            db.commit()
+        await (update.message or update.effective_message).reply_text(f"✅ Стиль установлен: {style}")
+    except Exception:
+        log.exception("mode failed")
+        await (update.message or update.effective_message).reply_text("⚠ Ошибка mode")
+
+async def dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /dialog <id> — сделать диалог активным."""
+    try:
+        args = (update.message.text or "").split()
+        if len(args) < 2 or not args[1].isdigit():
+            return await (update.message or update.effective_message).reply_text("Использование: /dialog <id>")
+        dlg_id = int(args[1])
+        tg_id = update.effective_user.id
+        with SessionLocal() as db:
+            uid = _ensure_user(db, tg_id)
+            owner_id = _exec_scalar(db, "SELECT user_id FROM dialogs WHERE id=:d AND is_deleted=FALSE", d=dlg_id)
+            if owner_id != uid:
+                return await (update.message or update.effective_message).reply_text("⛔ Диалог не найден.")
+            db.execute(sa_text("UPDATE dialogs SET created_at=now() WHERE id=:d"), {"d": dlg_id})
+            db.commit()
+        await (update.message or update.effective_message).reply_text(f"📄 Активен диалог #{dlg_id}")
+    except Exception:
+        log.exception("dialog switch failed")
+        await (update.message or update.effective_message).reply_text("⚠ Ошибка переключения диалога")
+
+
+async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    q = (m.text or "").split(maxsplit=1)
+    if len(q) < 2:
+        return await m.reply_text("Использование: /img <описание>")
+    try:
+        from bot.openai_helper import generate_image
+        content = await generate_image(q[1])
+        await m.reply_photo(photo=content, caption="🖼️ Сгенерировано DALL·E 3")
+    except Exception:
+        log.exception("img failed")
+        await m.reply_text("⚠ Не удалось сгенерировать изображение.")
+
+
+async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    q = (m.text or "").split(maxsplit=1)
+    if len(q) < 2:
+        return await m.reply_text("Использование: /web <запрос>")
+    await m.reply_text("🔎 Веб-поиск не сконфигурирован. Добавьте ключ внешнего поиска и реализуйте интеграцию.")
+
 def build_app() -> Application:
     apply_migrations_if_needed()
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
@@ -1668,6 +1828,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("dialog", dialog))
     app.add_handler(CommandHandler("mode", mode))
     app.add_handler(CommandHandler("model", model))
+    app.add_handler(CommandHandler("img", cmd_img))
+    app.add_handler(CommandHandler("web", cmd_web))
     app.add_handler(CommandHandler("revoke", revoke))
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CommandHandler("help", help_cmd))
