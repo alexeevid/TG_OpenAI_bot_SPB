@@ -182,9 +182,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 uid = _ensure_user(db, user.id)
                 _ensure_dialog(db, uid)
         text = (
-            "Привет! Я помогу искать ответы в документах из БЗ.\n"
-            "Откройте /kb (кнопки внутри) или задайте вопрос.\n\n"
-            "/help — список команд."
+            "Привет! Я помогу искать ответы в документах из БЗ и вести диалоги в разных стилях.\n\n"
+            "/start — это сообщение\n"
+            "/help — краткая справка по командам\n"
+            "/dialogs — список диалогов (открыть/переименовать/экспорт/удалить)\n"
+            "/dialog_new — создать новый диалог\n"
+            "/kb — подключение документов из БЗ (Я.Диск)\n"
+            "/stats — карточка активного диалога\n"
+            "/model — выбрать модель из плана OpenAI\n"
+            "/mode — выбрать стиль ответа (pro/expert/user/ceo)\n"
+            "/img <описание> — сгенерировать изображение\n"
+            "/reset — сбросить контекст активного диалога\n"
+            "/whoami — показать мои права\n"
         )
         if update.message:
             await update.message.reply_text(text)
@@ -205,11 +214,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Принимает voice/audio, распознаёт речь (OpenAI), затем тот же RAG-пайплайн, что и on_text.
-    Делает подсказку на русский язык и имеет фолбэк-модель, если whisper вернул пусто.
-    """
-    from openai import OpenAI  # локальный импорт на всякий случай
+    """Обработка voice/audio: распознаём и отвечаем как on_text, плюс голосовые команды типа «Нарисуй: ...»."""
+    from openai import OpenAI
     m = update.effective_message or update.message
     try:
         voice = getattr(m, "voice", None)
@@ -217,75 +223,57 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = voice or audio
         if not tg_file:
             return await m.reply_text("Голосовое не найдено.")
-
-        # Ограничение по длительности (опционально)
         dur = int(getattr(tg_file, "duration", 0) or 0)
-        if dur > 180:
-            return await m.reply_text("Аудио длиннее 3 минут. Пришлите короче, пожалуйста.")
-
-        # Скачиваем файл из Telegram
-        file = await context.bot.get_file(tg_file.file_id)
-        audio_bytes = await file.download_as_bytearray()
-
-        buf = BytesIO(audio_bytes)
-        # Имя файла помогает SDK определить формат; .oga / .ogg для voice из TG ок
-        buf.name = "voice.ogg"
-
+        fobj = await tg_file.get_file()
+        bio = BytesIO()
+        await fobj.download_to_memory(out=bio)
+        bio.seek(0)
         client = OpenAI(api_key=settings.openai_api_key)
-
-        # 1) Основная попытка — whisper-1 с подсказкой языка
-        tr = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=buf,
-            language="ru"
-        )
-        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None)
-
-        # 2) Фолбэк: если пусто — пробуем вторую модель распознавания
-        if not (text or "").strip():
-            buf.seek(0)
-            tr2 = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=buf,
-                language="ru"
-            )
-            text = getattr(tr2, "text", None) or (tr2.get("text") if isinstance(tr2, dict) else None)
-
-        if not (text or "").strip():
+        tr = client.audio.transcriptions.create(model="whisper-1", file=bio, language="ru")
+        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or ""
+        if not text.strip():
+            bio.seek(0)
+            tr2 = client.audio.transcriptions.create(model="gpt-4o-mini-transcribe", file=bio, language="ru")
+            text = getattr(tr2, "text", None) or (tr2.get("text") if isinstance(tr2, dict) else None) or ""
+        if not text.strip():
             return await m.reply_text("Не удалось распознать речь, попробуйте ещё раз.")
-
         q = text.strip()
-
-        # --- Далее как on_text: RAG-пайплайн ---
+        # Голосовая команда на генерацию изображения
+        low = q.lower()
+        if low.startswith("нарисуй") or low.startswith("сгенерируй картинку"):
+            prompt = q.split(":", 1)[1].strip() if ":" in q else q.replace("Нарисуй", "").replace("нарисуй", "").replace("Сгенерируй картинку", "").strip()
+            if prompt:
+                from bot.openai_helper import generate_image_bytes
+                img_bytes, final_prompt = await generate_image_bytes(prompt)
+                return await m.reply_photo(photo=img_bytes, caption=f"🖼️ Сгенерировано по голосовой команде\nPrompt → {final_prompt}")
+        # RAG ответ с учётом стиля
+        from bot.openai_helper import chat as ai_chat
         with SessionLocal() as db:
             tg_id = update.effective_user.id
-            user_id = _ensure_user(db, tg_id)
-            dialog_id = _ensure_dialog(db, user_id)
-
-            chunks = _retrieve_chunks(db, dialog_id, q, k=6)
-
-            if chunks:
-                ctx_blocks = [r["content"][:800] for r in chunks]
-                prompt = _build_prompt(ctx_blocks, q)
-            else:
-                prompt = q
-
-            resp = client.chat.completions.create(
-                model=settings.openai_model,
-                messages=[
-                    {"role": "system", "content": "Ты полезный помощник."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-            )
-            answer = resp.choices[0].message.content or "…"
-            if chunks:
-                answer += _format_citations(chunks)
-
-        # Отдаём пользователю результат распознавания + ответ
-        await m.reply_text(f"🗣️ Распознано:\n{q}")
+            uid = _ensure_user(db, tg_id)
+            did = _ensure_dialog(db, uid)
+            row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
+            dia_model = row[0] if row and row[0] else settings.openai_model
+            dia_style = row[1] if row and row[1] else "pro"
+            chunks = _retrieve_chunks(db, did, q, k=6)
+            ctx_blocks = [c.get("content","") for c in chunks] if chunks else []
+        prompt = _build_prompt_with_style(ctx_blocks, q, dia_style)
+        answer = await ai_chat([{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}], model=dia_model, max_tokens=800)
+        if chunks:
+            answer += _format_citations(chunks)
+        # Сохраняем историю
+        try:
+            with SessionLocal() as db:
+                tg_id = update.effective_user.id
+                uid = _ensure_user(db, tg_id)
+                did = _ensure_dialog(db, uid)
+                db.execute(sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d, :r, :c, now())"), {"d": did, "r": "user", "c": q})
+                db.execute(sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d, :r, :c, now())"), {"d": did, "r": "assistant", "c": answer})
+                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
+                db.commit()
+        except Exception:
+            log.exception("save voice messages failed")
         await m.reply_text(answer)
-
     except Exception:
         log.exception("on_voice failed")
         await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
@@ -365,6 +353,23 @@ def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict
     rows = db.execute(sa_text(sql), p).mappings().all()
     return [dict(r) for r in rows]
 
+
+
+def _build_prompt_with_style(ctx_blocks: List[str], user_q: str, dialog_style: str) -> str:
+    style_map = {
+        "pro":   "Профессионал: максимально ёмко и по делу, шаги и чек-лист.",
+        "expert":"Эксперт: развернуто, причины/следствия, с цитатами из источников.",
+        "user":  "Пользователь: простыми словами, с примерами.",
+        "ceo":   "CEO: фокус на бизнес-ценности, рисках и решениях."
+    }
+    style_line = style_map.get(dialog_style or "pro", style_map["pro"])
+    header = (
+        "Ты аккуратный ассистент. Используй Базу знаний как опору. "
+        "Дай цельный ответ в выбранном стиле и приведи 2–5 коротких цитат с источниками в конце. "
+        "Не ограничивайся цитатами — синтезируй ответ."
+    )
+    ctx = "\n\n".join([f"[Фрагмент #{i+1}]\n{t}" for i,t in enumerate(ctx_blocks)])
+    return f"{header}\nСтиль: {style_line}\n\nКонтекст:\n{ctx}\n\nВопрос: {user_q}"
 def _build_prompt(context_blocks: List[str], question: str) -> str:
     ctx = "\n\n".join(f"[{i+1}] {b}" for i, b in enumerate(context_blocks))
     return (
@@ -389,6 +394,20 @@ def _format_citations(chunks: List[dict]) -> str:
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
+    # Перехват переименования диалога
+    if "rename_dialog_id" in context.user_data:
+        dlg_id = context.user_data.pop("rename_dialog_id")
+        new_title = (m.text or "").strip()[:100]
+        if not new_title:
+            return await m.reply_text("Название пустое. Отменено.")
+        try:
+            with SessionLocal() as db:
+                db.execute(sa_text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
+                db.commit()
+            return await m.reply_text("Название сохранено.")
+        except Exception:
+            log.exception("rename dialog title failed")
+            return await m.reply_text("⚠ Не удалось сохранить название.")
     q = (m.text or "").strip()
     if not q:
         return
@@ -1451,7 +1470,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "",
             f"Итого: диалогов {total_dialogs}, сообщений {total_msgs}, документов в БЗ {total_docs}, чанков {total_chunks}"
         ]
-        await m.reply_text("\\n".join(lines))
+        await m.reply_text("\n".join(lines))
     except Exception:
         log.exception("stats failed")
         await m.reply_text("⚠ Ошибка /stats")
@@ -1538,7 +1557,7 @@ def _kb_keyboard(rows, page, pages, filter_name, admin: bool):
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("« Назад", callback_data=f"kb:list:{page-1}:{filter_name}"))
-    nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="kb:nop"))
+    nav.append(InlineKeyboardButton(f"Страница {page}/{pages}", callback_data="kb:nop"))
     if page < pages:
         nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"kb:list:{page+1}:{filter_name}"))
 
@@ -1699,8 +1718,19 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- service ----------
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
     context.user_data.clear()
-    await update.message.reply_text("Контекст текущего диалога очищен.")
+    try:
+        with SessionLocal() as db:
+            tg_id = update.effective_user.id
+            uid = _ensure_user(db, tg_id)
+            did = _ensure_dialog(db, uid)
+            db.execute(sa_text("DELETE FROM messages WHERE dialog_id=:d"), {"d": did})
+            db.execute(sa_text("DELETE FROM pdf_passwords WHERE dialog_id=:d"), {"d": did})
+            db.commit()
+    except Exception:
+        log.exception("reset cleanup failed")
+    await m.reply_text("Контекст текущего диалога очищен.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error", exc_info=context.error)
@@ -1723,10 +1753,29 @@ async def model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("list_models failed")
         return await m.reply_text("⚠ Не удалось получить список моделей: " + str(e))
-    page = 0
+    # Получим текущую модель активного диалога
+    cur = None
+    try:
+        with SessionLocal() as db:
+            tg_id = m.from_user.id if m.from_user else None
+            if tg_id:
+                uid = _ensure_user(db, tg_id)
+                did = _ensure_dialog(db, uid)
+                row = db.execute(sa_text("SELECT model FROM dialogs WHERE id=:d"), {"d": did}).first()
+                cur = row[0] if row else None
+    except Exception:
+        pass
     context.user_data["model_ids"] = ids
-    context.user_data["model_page"] = page
-    await _send_model_page(m, ids, page)
+    context.user_data["model_more_shown"] = False
+    top = ids[:10]
+    kb = []
+    for mid in top:
+        label = ("✅ " if cur and mid==cur else "") + mid
+        kb.append([InlineKeyboardButton(text=label, callback_data=f"model:set:{mid}")])
+    if len(ids) > 10:
+        kb.append([InlineKeyboardButton("Показать ещё", callback_data="model:more")])
+    kb.append([InlineKeyboardButton("Закрыть", callback_data="model:close")])
+    await m.reply_text("Выберите модель для текущего диалога:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def _send_model_page(m, ids: list[str], page: int, page_size: int = 8):
     start = page * page_size
@@ -1750,6 +1799,32 @@ async def model_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
     if data == "model:close":
+        try:
+            await q.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if data == "model:more":
+        ids = context.user_data.get("model_ids") or []
+        # показать все оставшиеся
+        rest = ids[10:]
+        kb = [[InlineKeyboardButton(text=mid, callback_data=f"model:set:{mid}")]
+              for mid in rest]
+        kb.append([InlineKeyboardButton("Закрыть", callback_data="model:close")])
+        return await q.message.reply_text("Остальные модели:", reply_markup=InlineKeyboardMarkup(kb))
+    if data.startswith("model:set:"):
+        mid = data.split(":", 2)[2]
+        try:
+            from bot.openai_helper import chat as ai_chat
+            _ = await ai_chat([{"role":"user","content":"ping"}], model=mid, max_tokens=4)
+        except Exception as e:
+            return await q.message.reply_text(f"⛔ Модель недоступна: {mid}\n{e}\nПопробуйте выбрать другую.")
+        with SessionLocal() as db:
+            uid = _ensure_user(db, q.from_user.id)
+            did = _ensure_dialog(db, uid)
+            db.execute(sa_text("UPDATE dialogs SET model=:m WHERE id=:d"), {"m": mid, "d": did})
+            db.commit()
+        await q.message.reply_text(f"✅ Установлена модель: {mid}")
         try:
             await q.message.edit_reply_markup(reply_markup=None)
         except Exception:
