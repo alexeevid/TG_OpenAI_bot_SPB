@@ -173,6 +173,18 @@ async def _chat_full(model: str, messages: list, temperature: float = 0.3, max_t
         hist.append({"role": "user", "content": "Продолжай с того места. Не повторяйся."})
     return full
 
+def _get_active_dialog_id(db, tg_id: int) -> int | None:
+    row = db.execute(sa_text("""
+        SELECT d.id
+        FROM dialogs d
+        JOIN users u ON u.id = d.user_id
+        WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+        ORDER BY COALESCE(d.last_message_at, to_timestamp(0)) DESC,
+                 COALESCE(d.created_at,      to_timestamp(0)) DESC,
+                 d.id DESC
+        LIMIT 1
+    """), {"tg": tg_id}).first()
+    return row[0] if row else None
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1584,6 +1596,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg = update.effective_user.id
         with SessionLocal() as db:
+            # whoami
             u = db.execute(sa_text(
                 "SELECT id, is_admin, is_allowed, COALESCE(lang,'ru') "
                 "FROM users WHERE tg_user_id=:tg ORDER BY id LIMIT 1"
@@ -1591,29 +1604,19 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if u:
                 uid, is_admin, is_allowed, lang = u
             else:
-                uid, is_admin, is_allowed, lang = (None, False, True if not getattr(settings, 'allowed_user_ids', '') else False, 'ru')
-            role = "admin" if is_admin else ("allowed" if is_allowed or not getattr(settings, 'allowed_user_ids', '') else "guest")
+                uid, is_admin, is_allowed, lang = (None, False, True if not getattr(settings,'allowed_user_ids','') else False, 'ru')
+            role = "admin" if is_admin else ("allowed" if is_allowed or not getattr(settings,'allowed_user_ids','') else "guest")
 
-            row = db.execute(sa_text("""
-                SELECT d.id, d.title, d.model, d.style, d.created_at, d.last_message_at
-                FROM dialogs d
-                JOIN users u ON u.id = d.user_id
-                WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
-                ORDER BY COALESCE(d.created_at, to_timestamp(0)) DESC, d.id DESC
-                LIMIT 1
-            """), {"tg": tg}).first()
-
-            if not row:
+            did = _get_active_dialog_id(db, tg)
+            if not did:
                 return await m.reply_text(
-                    f"tg ID={tg}, role={role}, lang={lang}\n\n"
+                    f"whoami: tg={tg}, role={role}, lang={lang}\n\n"
                     "Активного диалога нет. Создайте /dialog_new."
                 )
 
-            did, title, model, style, created_dt, updated_dt = row
-            if created_dt is None:
-                db.execute(sa_text("UPDATE dialogs SET created_at=now() WHERE id=:d"), {"d": did})
-                db.commit()
-                created_dt = datetime.now()
+            row = db.execute(sa_text(
+                "SELECT title, model, style, created_at, last_message_at FROM dialogs WHERE id=:d"
+            ), {"d": did}).first()
 
             links = db.execute(sa_text("""
                 SELECT kd.path
@@ -1630,12 +1633,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
             """, tg=tg) or 0
 
+        title, model, style, created_dt, updated_dt = row
         created = created_dt.strftime("%Y-%m-%d %H:%M") if created_dt else "-"
         updated = updated_dt.strftime("%Y-%m-%d %H:%M") if updated_dt else "-"
         docs = [r[0] for r in links] if links else []
 
         await m.reply_text("\n".join([
-            f"tg ID={tg}, role={role}, lang={lang}",
+            f"whoami: tg={tg}, role={role}, lang={lang}",
             "",
             f"Диалог: {did} — {title or ''}",
             f"Модель: {model or settings.openai_model} | Стиль: {style or '-'}",
