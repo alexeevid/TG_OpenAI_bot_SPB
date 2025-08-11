@@ -1249,28 +1249,31 @@ async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg = update.effective_user.id
         with SessionLocal() as db:
-            uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id = :tg ORDER BY id LIMIT 1", tg=tg)
-            if not uid:
-                uid = _ensure_user(db, tg)
-
-            # БЫЛО: datetime.date.today() — падало, т.к. импортирована только datetime
-            today = datetime.now().date().isoformat()
-            cnt = _exec_scalar(db, """
-                SELECT count(*) FROM dialogs d
-                JOIN users u ON u.id = d.user_id
-                WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
-            """, tg=tg) or 0
-            title = f"{today} | диалог {cnt+1}"
-            did = _exec_scalar(db, """
-                INSERT INTO dialogs (user_id, title, style, model, is_deleted)
-                VALUES (:u, :t, :s, :m, FALSE) RETURNING id
-            """, u=uid, t=title, s="pro", m=settings.openai_model)
-            db.commit()
-
+            did = _create_new_dialog_for_tg(db, tg)
         await m.reply_text(f"✅ Создан диалог #{did}")
     except Exception:
         log.exception("dialog_new failed")
         await m.reply_text("⚠ Ошибка создания диалога")
+
+def _create_new_dialog_for_tg(db, tg_id: int) -> int:
+    uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id=:tg ORDER BY id LIMIT 1", tg=tg_id)
+    if not uid:
+        uid = _ensure_user(db, tg_id)
+
+    today = datetime.now().date().isoformat()
+    cnt = _exec_scalar(db, """
+        SELECT count(*) FROM dialogs d
+        JOIN users u ON u.id = d.user_id
+        WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+    """, tg=tg_id) or 0
+    title = f"{today} | диалог {cnt+1}"
+
+    did = _exec_scalar(db, """
+        INSERT INTO dialogs (user_id, title, style, model, is_deleted, created_at, last_message_at)
+        VALUES (:u, :t, :s, :m, FALSE, now(), NULL) RETURNING id
+    """, u=uid, t=title, s="pro", m=settings.openai_model)
+    db.commit()
+    return did
 
 async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2070,6 +2073,8 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 DIALOGS_PAGE_SIZE = 6
 
+DIALOGS_PAGE_SIZE = 6
+
 async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
@@ -2084,7 +2089,8 @@ async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, tg=tg)
 
         if not ds:
-            return await m.reply_text("Диалогов нет. Используйте /dialog_new.")
+            kb = [[InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")]]
+            return await m.reply_text("Диалогов нет.", reply_markup=InlineKeyboardMarkup(kb))
 
         page = 1
         pages = max(1, (len(ds) + DIALOGS_PAGE_SIZE - 1) // DIALOGS_PAGE_SIZE)
@@ -2105,6 +2111,7 @@ async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pages > 1:
             nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"dlg:page:{page+1}"))
         rows.append(nav or [InlineKeyboardButton(" ", callback_data="dlg:nop")])
+        rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")])
 
         await m.reply_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(rows))
     except Exception:
@@ -2120,6 +2127,11 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "dlg:nop":
             return
+
+        if data == "dlg:new":
+            with SessionLocal() as db:
+                did = _create_new_dialog_for_tg(db, tg)
+            return await q.edit_message_text(f"✅ Создан диалог #{did}")
 
         if data.startswith("dlg:page:"):
             page = int(data.split(":")[-1])
@@ -2153,14 +2165,15 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if page < pages:
                 nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"dlg:page:{page+1}"))
             rows.append(nav)
+            rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")])
 
             return await q.edit_message_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(rows))
 
         if data.startswith("dlg:open:"):
             dlg_id = int(data.split(":")[-1])
-            # отметим активность, чтобы _ensure_dialog выбирал его
+            # активируем диалог, НЕ меняя created_at — используем last_message_at
             with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET created_at = now() WHERE id = :d"), {"d": dlg_id})
+                db.execute(sa_text("UPDATE dialogs SET last_message_at = now() WHERE id = :d"), {"d": dlg_id})
                 db.commit()
             return await q.edit_message_text(f"Открыт диалог #{dlg_id}")
 
@@ -2189,9 +2202,10 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("dlg:delete:"):
             dlg_id = int(data.split(":")[-1])
             with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"d": dlg_id})
+                db.execute(sa_text("UPDATE dialogs SET is_deleted = TRUE WHERE id = :d"), {"d": dlg_id})
                 db.commit()
             return await q.edit_message_text(f"Диалог #{dlg_id} удалён")
+
     except Exception:
         log.exception("dialog_cb failed")
         try:
