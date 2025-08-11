@@ -6,6 +6,7 @@ from io import BytesIO
 import os, re, inspect
 from datetime import datetime
 from urllib.parse import urlparse
+import tempfile
 
 import logging
 from datetime import datetime
