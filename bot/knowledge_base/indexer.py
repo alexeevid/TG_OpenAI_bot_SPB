@@ -33,3 +33,17 @@ def sync_kb(session: Session):
             session.add(KbChunk(document_id=doc.id, chunk_index=i, content=content, meta=None, embedding=embs[i]))
         session.commit(); updated+=1
     return {'updated':updated,'skipped':skipped,'total':len(files)}
+
+# --- совместимость со старым API бота ---
+def sync_all(SessionLocal, settings=None):
+    """Обёртка для telegram_bot.kb_sync — возвращает (updated_docs, total_chunks)."""
+    from sqlalchemy import func, select
+    with SessionLocal() as s:
+        info = sync_kb(s)  # твоя основная функция
+        updated = int(info.get("updated", 0))
+        total_chunks = int(s.execute(select(func.count()).select_from(KbChunk)).scalar() or 0)
+        return updated, total_chunks
+
+def sync_from_yandex(SessionLocal, settings=None):
+    """Алиас для совместимости."""
+    return sync_all(SessionLocal, settings)
