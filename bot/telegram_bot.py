@@ -1,6 +1,7 @@
 from __future__ import annotations
 import tiktoken
 from openai import OpenAI
+from io import BytesIO
 
 import logging
 from datetime import datetime
@@ -174,43 +175,27 @@ async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await (update.message or update.effective_message).reply_text("⚠ Ошибка revoke")
 # ---------- commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        chat_id = update.effective_chat.id if update.effective_chat else None
-        user = update.effective_user
-        if user:
-            with SessionLocal() as db:
-                uid = _ensure_user(db, user.id)
-                _ensure_dialog(db, uid)
-        text = (
-            "Привет! Я помогу искать ответы в документах из БЗ и вести диалоги в разных стилях.\n\n"
-            "/start — это сообщение\n"
-            "/help — краткая справка по командам\n"
-            "/dialogs — список диалогов (открыть/переименовать/экспорт/удалить)\n"
-            "/dialog_new — создать новый диалог\n"
-            "/kb — подключение документов из БЗ (Я.Диск)\n"
-            "/stats — карточка активного диалога\n"
-            "/model — выбрать модель из плана OpenAI\n"
-            "/mode — выбрать стиль ответа (pro/expert/user/ceo)\n"
-            "/img <описание> — сгенерировать изображение\n"
-            "/reset — сбросить контекст активного диалога\n"
-            "/whoami — показать мои права\n"
-        )
-        if update.message:
-            await update.message.reply_text(text)
-        elif chat_id is not None:
-            await context.bot.send_message(chat_id, text)
-    except Exception:
-        log.exception("start failed")
+    m = update.effective_message or update.message
+    await m.reply_text(
+        "Здоров! Я помогу искать ответы в документах из БЗ и вести диалоги в разных стилях.\n"
+        "Все команды тут — /help"
+    )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start /help /reset /stats\n"
-        "/dialogs, /dialog <id>\n"
-        "/kb, /kb_diag\n"
-        "/model, /mode\n"
-        "/img <prompt>\n"
-        "/web <query>\n"
-        "/whoami, /grant <id>, /revoke <id>"
+    m = update.effective_message or update.message
+    await m.reply_text(
+        "/start — приветствие\n"
+        "/help — полный список команд\n"
+        "/dialogs — список диалогов (открыть/переименовать/экспорт/удалить)\n"
+        "/dialog_new — создать новый диалог\n"
+        "/kb — подключить/отключить документы из БЗ\n"
+        "/stats — карточка активного диалога\n"
+        "/model — выбрать модель (ТОП-10 + Показать ещё)\n"
+        "/mode — стиль ответа (pro/expert/user/ceo)\n"
+        "/img <описание> — генерация изображения (покажу итоговый prompt)\n"
+        "/web <запрос> — (заглушка) веб-поиск\n"
+        "/reset — сброс контекста активного диалога\n"
+        "/whoami — мои права\n"
     )
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1485,6 +1470,10 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"Открыт диалог #{dlg_id}")
             return
 
+        if data == "dlg:nop" or data.startswith("dlg:page:"):
+            # просто перерисуем список
+            return await dialogs(update, context)
+
         if data.startswith("dlg:rename:"):
             dlg_id = int(data.split(":")[-1])
             context.user_data["rename_dialog_id"] = dlg_id
@@ -1913,6 +1902,7 @@ async def cmd_img(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("⚠ Не удалось сгенерировать изображение.")
 
 async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
     try:
         tg_id = update.effective_user.id
         with SessionLocal() as db:
@@ -1926,21 +1916,44 @@ async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ORDER BY created_at DESC
                 """, u=uid,
             )
+
         if not ds:
-            await (update.message or update.effective_message).reply_text("Диалогов нет.")
-            return
+            return await m.reply_text("Диалогов нет. Используйте /dialog_new.")
+
+        # пагинация
+        PAGE = 6
+        page = 0
+        if update.callback_query and update.callback_query.data.startswith("dlg:page:"):
+            page = int(update.callback_query.data.split(":")[2])
+        context.user_data["dlg_total"] = len(ds)
+
+        pages = max(1, (len(ds) + PAGE - 1) // PAGE)
+        page = max(0, min(page, pages - 1))
+        start = page * PAGE
+        sub = ds[start:start + PAGE]
+
         rows = []
-        for d_id, d_title in ds:
+        for d_id, d_title in sub:
             rows.append([
                 InlineKeyboardButton(f"📄 {d_title or d_id}", callback_data=f"dlg:open:{d_id}"),
                 InlineKeyboardButton("✏️", callback_data=f"dlg:rename:{d_id}"),
                 InlineKeyboardButton("📤", callback_data=f"dlg:export:{d_id}"),
                 InlineKeyboardButton("🗑", callback_data=f"dlg:delete:{d_id}"),
             ])
-        await (update.message or update.effective_message).reply_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(rows))
+
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("« Назад", callback_data=f"dlg:page:{page-1}"))
+        nav.append(InlineKeyboardButton(f"Страница {page+1}/{pages}", callback_data="dlg:nop"))
+        if page + 1 < pages:
+            nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"dlg:page:{page+1}"))
+        rows.append(nav)
+
+        await m.reply_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(rows))
     except Exception:
         log.exception("dialogs failed")
-        await (update.message or update.effective_message).reply_text("⚠ Что-то пошло не так.")
+        await m.reply_text("⚠ Что-то пошло не так.")
+        
 def build_app() -> Application:
     apply_migrations_if_needed()
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
@@ -1975,6 +1988,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("rag_diag", rag_diag))
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
+    app.add_handler(CommandHandler("web", cmd_web))
 
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
