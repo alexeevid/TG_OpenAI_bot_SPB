@@ -5,6 +5,7 @@ from openai import OpenAI
 from io import BytesIO
 import os, re, inspect
 from datetime import datetime
+from urllib.parse import urlparse
 
 import logging
 from datetime import datetime
@@ -141,6 +142,34 @@ def _split_for_tg(text: str, limit: int = TELEGRAM_CHUNK):
         parts.append(s)
     return parts
 
+async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    text = (m.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await m.reply_text("Использование: /web <запрос>")
+
+    query = parts[1].strip()
+    note = await m.reply_text("🔎 Ищу в вебе, подожди пару секунд…")
+
+    try:
+        from bot.web_search import web_search_digest, sources_footer
+        answer, sources = await web_search_digest(query, max_results=6, openai_api_key=settings.openai_api_key)
+
+        footer = ("\n\nИсточники:\n" + sources_footer(sources)) if sources else ""
+        await _send_long(m, (answer or "Готово.") + footer)
+
+        if sources:
+            buttons = [[InlineKeyboardButton(f"[{i+1}] {urlparse(s['url']).netloc}", url=s['url'])] for i, s in enumerate(sources)]
+            await m.reply_text("Открыть источники:", reply_markup=InlineKeyboardMarkup(buttons), disable_web_page_preview=True)
+    except Exception as e:
+        await m.reply_text(f"⚠ Веб-поиск недоступен: {e}")
+    finally:
+        try:
+            await note.delete()
+        except Exception:
+            pass
+
 async def _send_long(m, text: str):
     """Отправляет текст пачками, если он длиннее лимита Telegram."""
     for chunk in _split_for_tg(text):
@@ -276,6 +305,13 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Голос:
+    1) скачиваем voice/audio, кладём во временный файл с правильным расширением;
+    2) распознаём (gpt-4o-mini-transcribe -> whisper-1 fallback);
+    3) если команда «Нарисуй…» — генерим изображение, показываем финальный prompt и пишем в историю;
+    4) иначе — обычный RAG-ответ с автопродолжением, сохраняем user+assistant в тот же did, отправляем по частям.
+    """
     m = update.effective_message or update.message
     try:
         voice = getattr(m, "voice", None)
@@ -283,69 +319,107 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = voice or audio
         if not tg_file:
             return await m.reply_text("Голосовое не найдено.")
+
+        # --- качаем файл в память ---
         fobj = await tg_file.get_file()
         bio = BytesIO()
         await fobj.download_to_memory(out=bio)
         bio.seek(0)
 
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".ogg") as tmp:
+        # --- выбираем подходящее расширение (важно для OpenAI) ---
+        import os, tempfile
+        file_path = getattr(fobj, "file_path", "") or ""
+        ext = os.path.splitext(file_path)[1].lower()
+        allowed = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".oga", ".ogg", ".wav", ".webm"}
+        if ext not in allowed:
+            ext = ".ogg"
+
+        # --- распознаём речь ---
+        client = (_oa_client if "_oa_client" in globals() else OpenAI(api_key=settings.openai_api_key))
+        with tempfile.NamedTemporaryFile(suffix=ext) as tmp:
             tmp.write(bio.getbuffer())
             tmp.flush()
             with open(tmp.name, "rb") as fh:
                 try:
-                    tr = _oa_client.audio.transcriptions.create(
+                    tr = client.audio.transcriptions.create(
                         model="gpt-4o-mini-transcribe", file=fh, language="ru"
                     )
                 except Exception:
                     fh.seek(0)
-                    tr = _oa_client.audio.transcriptions.create(
+                    tr = client.audio.transcriptions.create(
                         model="whisper-1", file=fh, language="ru"
                     )
 
         text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or ""
-        if not text.strip():
-            return await m.reply_text("Не удалось распознать речь, попробуйте ещё раз.")
         q = text.strip()
+        if not q:
+            return await m.reply_text("Не удалось распознать речь, попробуйте ещё раз.")
 
-        # голосовая команда "Нарисуй ..."
-        if q.lower().startswith(("нарисуй", "сгенерируй картинку")):
-            prompt = q.split(":", 1)[1].strip() if ":" in q else q.split(maxsplit=1)[-1]
-            if prompt:
+        # --- быстрые голосовые команды: «Нарисуй ...» / «Сгенерируй картинку ...» ---
+        low = q.lower()
+        if low.startswith(("нарисуй", "сгенерируй картинку", "создай изображение", "сделай картинку")):
+            # извлечём prompt после ":" или после первого слова
+            if ":" in q:
+                prompt = q.split(":", 1)[1].strip()
+            else:
+                parts = q.split(maxsplit=1)
+                prompt = parts[1].strip() if len(parts) > 1 else ""
+            if not prompt:
+                return await m.reply_text("Уточните, что рисовать: «Нарисуй: стиль, объект, детали».")
+            try:
                 from bot.openai_helper import generate_image_bytes
                 img_bytes, final_prompt = await generate_image_bytes(prompt)
-                return await m.reply_photo(photo=img_bytes, caption=f"🖼️ Сгенерировано по голосовой команде\nPrompt → {final_prompt}")
+                await m.reply_photo(photo=img_bytes, caption=f"🖼️ Сгенерировано по голосовой команде\nPrompt → {final_prompt}")
+                # сохраняем историю в активный диалог
+                with SessionLocal() as db:
+                    tg_id = update.effective_user.id
+                    did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
+                    db.execute(sa_text(
+                        "INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'user',:c,now())"
+                    ), {"d": did, "c": q})
+                    db.execute(sa_text(
+                        "INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'assistant',:c,now())"
+                    ), {"d": did, "c": f"[image]\nPrompt → {final_prompt}"})
+                    db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
+                    db.commit()
+                return
+            except Exception:
+                log.exception("voice->image failed")
+                return await m.reply_text("⚠ Не удалось сгенерировать изображение. Попробуйте ещё раз позже.")
 
+        # --- обычный RAG-диалог ---
         with SessionLocal() as db:
-            uid = _ensure_user(db, update.effective_user.id)
-            did = _ensure_dialog(db, uid)
+            tg_id = update.effective_user.id
+            did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
             chunks = _retrieve_chunks(db, did, q, k=6)
-            ctx_blocks = [c.get("content", "") for c in chunks] if chunks else []
+            ctx_blocks = [c.get("content", "")[:1000] for c in chunks] if chunks else []
 
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
+
         system = {"role": "system", "content": "RAG assistant"}
         user = {"role": "user", "content": prompt}
         answer = await _chat_full(dia_model, [system, user], temperature=0.3)
         if chunks:
             answer += _format_citations(chunks)
 
-        # сохраняем и отправляем по частям
+        # --- сохраняем историю в ТОТ ЖЕ did ---
         try:
             with SessionLocal() as db:
-                uid = _ensure_user(db, update.effective_user.id)
-                did = _ensure_dialog(db, uid)
-                db.execute(sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'user',:c,now())"),
-                           {"d": did, "c": q})
-                db.execute(sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'assistant',:c,now())"),
-                           {"d": did, "c": answer})
+                db.execute(sa_text(
+                    "INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'user',:c,now())"
+                ), {"d": did, "c": q})
+                db.execute(sa_text(
+                    "INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'assistant',:c,now())"
+                ), {"d": did, "c": answer})
                 db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
                 db.commit()
         except Exception:
             log.exception("save voice messages failed")
 
+        # --- отправляем ответ длинными кусками, если нужно ---
         await _send_long(m, answer)
 
     except Exception:
@@ -462,8 +536,17 @@ def _format_citations(chunks: List[dict]) -> str:
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает текст пользователя:
+    1) берёт/создаёт активный диалог для этого tg-пользователя;
+    2) тянет контекст из БЗ для ИМЕННО ЭТОГО диалога;
+    3) генерирует полный ответ (с автопродолжением);
+    4) сохраняет оба сообщения (user+assistant) в ТОТ ЖЕ did;
+    5) отправляет ответ пачками, если длинный.
+    """
     m = update.effective_message or update.message
-    # перехват переименования
+
+    # --- режим переименования диалога ---
     if "rename_dialog_id" in context.user_data:
         dlg_id = context.user_data.pop("rename_dialog_id")
         new_title = (m.text or "").strip()[:100]
@@ -478,50 +561,63 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("rename dialog title failed")
             return await m.reply_text("⚠ Не удалось сохранить название.")
 
+    # --- обычный текстовый запрос ---
     q = (m.text or "").strip()
     if not q:
         return
+
     try:
+        # 1) Определяем АКТИВНЫЙ диалог (или создаём новый) — ЭТОТ did используем везде дальше
         with SessionLocal() as db:
-            uid = _ensure_user(db, update.effective_user.id)
-            did = _ensure_dialog(db, uid)
+            tg = update.effective_user.id
+            did = _get_active_dialog_id(db, tg)
+            if not did:
+                did = _create_new_dialog_for_tg(db, tg)
+
+            # 2) Модель и стиль из карточки диалога
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
-            chunks = _retrieve_chunks(db, did, q, k=6)
-            ctx_blocks = [r.get("content", "")[:1000] for r in chunks] if chunks else []
 
-        # строим промпт
+            # 3) Ретрив контекста ИЗ ПРИВЯЗАННЫХ К ЭТОМУ DIALOG ДОКУМЕНТОВ
+            chunks = _retrieve_chunks(db, did, q, k=6)
+            ctx_blocks = [c.get("content", "")[:1000] for c in chunks] if chunks else []
+
+        # 4) Строим промпт под стиль
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
 
-        # ПОЛНЫЙ ответ (автопродолжение)
+        # 5) Жмём модель до полного ответа (автопродолжение / multi-turn)
         system = {"role": "system", "content": "RAG assistant"}
         user = {"role": "user", "content": prompt}
         answer = await _chat_full(dia_model, [system, user], temperature=0.3)
 
+        # 6) Цитаты по найденным чанкам (если были)
         if chunks:
             answer += _format_citations(chunks)
 
-        # сохраняем историю (целиком)
+        # 7) Сохраняем оба сообщения РОВНО в тот же did + отмечаем активность
         try:
             with SessionLocal() as db:
-                uid = _ensure_user(db, update.effective_user.id)
-                did = _ensure_dialog(db, uid)
-                db.execute(sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'user',:c,now())"),
-                           {"d": did, "c": q})
-                db.execute(sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'assistant',:c,now())"),
-                           {"d": did, "c": answer})
+                db.execute(
+                    sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'user',:c,now())"),
+                    {"d": did, "c": q},
+                )
+                db.execute(
+                    sa_text("INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'assistant',:c,now())"),
+                    {"d": did, "c": answer},
+                )
                 db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
                 db.commit()
         except Exception:
             log.exception("save messages failed")
 
-        # отправляем по частям
+        # 8) Отправляем ответ пользователю (дробим на части при необходимости)
         await _send_long(m, answer)
 
     except Exception:
         log.exception("on_text failed")
         await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+
 
 # === DIAG: показать статус всех PDF на диске и что с ними при разборе ===
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2290,6 +2386,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
     app.add_handler(CommandHandler("web", cmd_web))
+    app.add_handler(CommandHandler("web", web_cmd))
 
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
