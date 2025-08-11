@@ -860,8 +860,25 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await (update.effective_message or update.message).reply_text(f"⚠ kb_sync_pdf: {e}")
 
 async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # запуск полной индексации PDF (деактивация удалённых и т.д.)
-    return await kb_sync_pdf(update, context)
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+    await m.reply_text("🔄 Синхронизация запущена...")
+
+    try:
+        # ПОДГОН ПОД ТВОЙ ИНДЕКСАТОР:
+        # пробуем sync_all(SessionLocal, settings) → если нет, пробуем sync_from_yandex(...)
+        from bot.knowledge_base import indexer
+        if hasattr(indexer, "sync_all"):
+            n_docs, n_chunks = await asyncio.to_thread(indexer.sync_all, SessionLocal, settings)
+        elif hasattr(indexer, "sync_from_yandex"):
+            n_docs, n_chunks = await asyncio.to_thread(indexer.sync_from_yandex, SessionLocal, settings)
+        else:
+            raise RuntimeError("Не найден entrypoint: indexer.sync_all / indexer.sync_from_yandex")
+        await m.reply_text(f"✅ Готово: документов {n_docs}, чанков {n_chunks}")
+    except Exception as e:
+        log.exception("kb_sync failed")
+        await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
 
 async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -1126,25 +1143,31 @@ async def kb_chunks_create(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # создать новый диалог вручную
 async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
     try:
-        m = update.effective_message or update.message
-        tg_id = update.effective_user.id
+        tg = update.effective_user.id
         with SessionLocal() as db:
-            uid = _ensure_user(db, tg_id)
-            did = _exec_scalar(
-                db,
-                """
+            uid = _exec_scalar(db, "SELECT id FROM users WHERE tg_user_id = :tg ORDER BY id LIMIT 1", tg=tg)
+            if not uid:
+                uid = _ensure_user(db, tg)
+
+            today = datetime.date.today().isoformat()
+            cnt = _exec_scalar(db, """
+                SELECT count(*) FROM dialogs d
+                JOIN users u ON u.id = d.user_id
+                WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+            """, tg=tg) or 0
+            title = f"{today} | диалог {cnt+1}"
+            did = _exec_scalar(db, """
                 INSERT INTO dialogs (user_id, title, style, model, is_deleted)
-                VALUES (:u, :t, 'expert', :m, FALSE)
-                RETURNING id
-                """,
-                u=uid, t=datetime.now().strftime("%Y-%m-%d | диалог"), m=settings.openai_model
-            )
-        db.commit()
+                VALUES (:u, :t, :s, :m, FALSE) RETURNING id
+            """, u=uid, t=title, s="pro", m=settings.openai_model)
+            db.commit()
+
         await m.reply_text(f"✅ Создан диалог #{did}")
     except Exception:
         log.exception("dialog_new failed")
-        await (update.effective_message or update.message).reply_text("⚠ Не удалось создать диалог.")
+        await m.reply_text("⚠ Ошибка создания диалога")
 
 async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1427,26 +1450,38 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("health failed")
         await update.message.reply_text("❌ FAIL: DB connection")
 
-
-
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
+        tg = update.effective_user.id
         with SessionLocal() as db:
-            uid = _ensure_user(db, update.effective_user.id)
-            did = _ensure_dialog(db, uid)
             row = db.execute(sa_text("""
                 SELECT d.id, d.title, d.model, d.style, d.created_at, d.last_message_at
-                FROM dialogs d WHERE d.id=:d
-            """), {"d": did}).first()
+                FROM dialogs d
+                JOIN users u ON u.id = d.user_id
+                WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+                ORDER BY d.created_at DESC
+                LIMIT 1
+            """), {"tg": tg}).first()
+
+            if not row:
+                return await m.reply_text("Нет активного диалога. Нажми /dialog_new")
+
+            did = row[0]
             links = db.execute(sa_text("""
-                SELECT kd.path FROM dialog_kb_links l
+                SELECT kd.path
+                FROM dialog_kb_links l
                 JOIN kb_documents kd ON kd.id = l.document_id
-                WHERE l.dialog_id=:d
+                WHERE l.dialog_id = :d
                 ORDER BY kd.path
             """), {"d": did}).fetchall()
-            total_dialogs = _exec_scalar(db, "SELECT count(*) FROM dialogs WHERE user_id=:u AND is_deleted=FALSE", u=uid) or 0
-            total_msgs = _exec_scalar(db, "SELECT count(*) FROM messages WHERE dialog_id=:d", d=did) or 0
+
+            total_dialogs = _exec_scalar(db, """
+                SELECT count(*) FROM dialogs d
+                JOIN users u ON u.id = d.user_id
+                WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+            """, tg=tg) or 0
+            total_msgs = _exec_scalar(db, "SELECT count(*) FROM messages WHERE dialog_id = :d", d=did) or 0
 
         title = row[1] or ""
         model = row[2] or settings.openai_model
@@ -1455,16 +1490,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated = row[5].strftime("%Y-%m-%d %H:%M") if row and row[5] else "-"
         docs = [r[0] for r in links] if links else []
 
-        lines = [
-            f"Диалог: {row[0]} — {title}",
+        await m.reply_text("\n".join([
+            f"Диалог: {did} — {title}",
             f"Модель: {model} | Стиль: {style}",
             f"Создан: {created} | Изменён: {updated}",
             f"Подключённые документы ({len(docs)}):",
             *[f"• {p}" for p in docs],
             "",
             f"Всего твоих диалогов: {total_dialogs} | Сообщений в этом диалоге: {total_msgs}",
-        ]
-        await m.reply_text("\n".join(lines))
+        ]))
     except Exception:
         log.exception("stats failed")
         await m.reply_text("⚠ Ошибка /stats")
@@ -1760,21 +1794,109 @@ def _model_score(mid: str) -> int:
     if "3.5" in m: score += 1
     return score
 
+# фильтруем только чатовые семейства и исключаем всё лишнее
+def _keep_chat_model(mid: str) -> bool:
+    m = mid.lower()
+    if any(x in m for x in ["embedding", "text-embedding", "dall-e", "whisper", "tts", "audio", "moderation", "computer-use"]):
+        return False
+    # скрываем явный мусор/несуществующие
+    if m.startswith("babbage") or m.startswith("davinci") or m.startswith("curie") or m.startswith("ada"):
+        return False
+    if m.startswith("gpt-5"):  # не показываем
+        return False
+    # оставляем gpt-4/4o/4.1/o4, 3.5, chatgpt-4o-latest
+    return any(x in m for x in ["gpt-4", "gpt-3.5", "chatgpt-4o", "o4"])
+
+def _sort_models(models):
+    # сортируем по created (desc), если есть; иначе по эвристике
+    def score(item):
+        mid = getattr(item, "id", "")
+        created = getattr(item, "created", 0) or 0
+        return (created, len(mid) * -1)
+    return sorted(models, key=score, reverse=True)
+
 async def model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
         client = OpenAI(api_key=settings.openai_api_key)
-        models = client.models.list()
-        ids = [it.id for it in getattr(models, "data", [])]
-        ids = sorted(set(ids), key=_model_score, reverse=True)
+        res = client.models.list()
+        models = [it for it in getattr(res, "data", []) if _keep_chat_model(getattr(it, "id", ""))]
+        models = _sort_models(models)
+        ids = [it.id for it in models]
+
+        # сохраним для "Показать ещё"
+        context.user_data["all_models_sorted"] = ids
+
         top10 = ids[:10]
         buttons = [[InlineKeyboardButton(mid, callback_data=f"model:set:{mid}")] for mid in top10]
-        buttons.append([InlineKeyboardButton("Показать ещё", callback_data="model:more:1")])
+        if len(ids) > 10:
+            buttons.append([InlineKeyboardButton("Показать ещё", callback_data="model:more:2")])
         buttons.append([InlineKeyboardButton("Закрыть", callback_data="model:close")])
         await m.reply_text("Выберите модель для текущего диалога:", reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         log.exception("model_menu failed")
         await m.reply_text("⚠ Не удалось получить список моделей")
+
+def _page_models(ids: list[str], page: int, page_size: int = 10):
+    pages = max(1, (len(ids) + page_size - 1) // page_size)
+    page = max(1, min(page, pages))
+    beg = (page - 1) * page_size
+    chunk = ids[beg:beg + page_size]
+    rows = [[InlineKeyboardButton(mid, callback_data=f"model:set:{mid}")] for mid in chunk]
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("« Назад", callback_data=f"model:more:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="model:nop"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"model:more:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("Закрыть", callback_data="model:close")])
+    return InlineKeyboardMarkup(rows)
+
+async def model_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        data = q.data or ""
+        if data in ("model:close", "model:nop"):
+            try: await q.delete_message()
+            except Exception: pass
+            return
+
+        if data.startswith("model:more:"):
+            page = int(data.split(":")[-1])
+            ids = context.user_data.get("all_models_sorted") or []
+            return await q.edit_message_reply_markup(reply_markup=_page_models(ids, page))
+
+        if data.startswith("model:set:"):
+            mid = data.split(":", 2)[-1]
+            # проверим быстро доступность
+            try:
+                client = OpenAI(api_key=settings.openai_api_key)
+                client.chat.completions.create(model=mid, messages=[{"role": "user", "content": "ping"}], max_tokens=1)
+            except Exception:
+                return await q.edit_message_text(f"❌ Не удалось выбрать модель «{mid}». Попробуйте другую.")
+
+            tg = update.effective_user.id
+            with SessionLocal() as db:
+                did = _exec_scalar(db, """
+                    SELECT d.id
+                    FROM dialogs d
+                    JOIN users u ON u.id = d.user_id
+                    WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+                    ORDER BY d.created_at DESC
+                    LIMIT 1
+                """, tg=tg)
+                if not did:
+                    return await q.edit_message_text("Нет активного диалога. Нажми /dialog_new.")
+                db.execute(sa_text("UPDATE dialogs SET model=:m WHERE id=:d"), {"m": mid, "d": did})
+                db.commit()
+            return await q.edit_message_text(f"✅ Установлена модель: {mid}")
+    except Exception:
+        log.exception("model_cb failed")
+        try: await q.message.reply_text("⚠ Ошибка выбора модели")
+        except Exception: pass
+
 
 def _send_model_page(all_ids, page: int, qmsg):
     PAGE = 10
@@ -1792,57 +1914,6 @@ def _send_model_page(all_ids, page: int, qmsg):
     rows.append(nav)
     rows.append([InlineKeyboardButton("Закрыть", callback_data="model:close")])
     return InlineKeyboardMarkup(rows)
-
-async def model_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    try:
-        data = q.data or ""
-        if data == "model:close" or data == "model:nop":
-            try:
-                await q.delete_message()
-            except Exception:
-                pass
-            return
-
-        if data.startswith("model:more:"):
-            page = int(data.split(":")[-1])
-            client = OpenAI(api_key=settings.openai_api_key)
-            models = client.models.list()
-            ids = [it.id for it in getattr(models, "data", [])]
-            ids = sorted(set(ids), key=_model_score, reverse=True)[10:]  # всё, кроме ТОП-10
-            await q.edit_message_reply_markup(reply_markup=_send_model_page(ids, page, q))
-            return
-
-        if data.startswith("model:set:"):
-            mid = data.split(":", 2)[-1]
-            # пробуем простое эхо-обращение к модели, если упадёт — не сохраняем
-            ok = True
-            try:
-                client = OpenAI(api_key=settings.openai_api_key)
-                client.chat.completions.create(
-                    model=mid,
-                    messages=[{"role": "user", "content": "ping"}],
-                    max_tokens=1
-                )
-            except Exception:
-                ok = False
-            if not ok:
-                await q.edit_message_text(f"❌ Не удалось выбрать модель «{mid}». Попробуйте другую.")
-                return
-            with SessionLocal() as db:
-                uid = _ensure_user(db, update.effective_user.id)
-                did = _ensure_dialog(db, uid)
-                db.execute(sa_text("UPDATE dialogs SET model=:m WHERE id=:d"), {"m": mid, "d": did})
-                db.commit()
-            await q.edit_message_text(f"✅ Установлена модель: {mid}")
-            return
-    except Exception:
-        log.exception("model_cb failed")
-        try:
-            await q.message.reply_text("⚠ Ошибка выбора модели")
-        except Exception:
-            pass
 
 async def mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -1900,17 +1971,22 @@ DIALOGS_PAGE_SIZE = 6
 async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
+        tg = update.effective_user.id
         with SessionLocal() as db:
-            uid = _ensure_user(db, update.effective_user.id)
             ds = _exec_all(db, """
-                SELECT id, COALESCE(title, '') FROM dialogs
-                WHERE user_id=:u AND is_deleted=FALSE
-                ORDER BY created_at DESC
-            """, u=uid)
-        total = len(ds)
+                SELECT d.id, COALESCE(d.title,'')
+                FROM dialogs d
+                JOIN users u ON u.id = d.user_id
+                WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+                ORDER BY d.created_at DESC
+            """, tg=tg)
+
+        if not ds:
+            return await m.reply_text("Диалогов нет. Используйте /dialog_new.")
+
         page = 1
-        pages = max(1, (total + DIALOGS_PAGE_SIZE - 1) // DIALOGS_PAGE_SIZE)
-        beg = (page-1) * DIALOGS_PAGE_SIZE
+        pages = max(1, (len(ds) + DIALOGS_PAGE_SIZE - 1) // DIALOGS_PAGE_SIZE)
+        beg = (page - 1) * DIALOGS_PAGE_SIZE
         chunk = ds[beg:beg + DIALOGS_PAGE_SIZE]
 
         rows = []
@@ -1938,19 +2014,25 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     try:
         data = q.data or ""
+        tg = update.effective_user.id
+
+        if data == "dlg:nop":
+            return
+
         if data.startswith("dlg:page:"):
             page = int(data.split(":")[-1])
             with SessionLocal() as db:
-                uid = _ensure_user(db, update.effective_user.id)
                 ds = _exec_all(db, """
-                    SELECT id, COALESCE(title, '') FROM dialogs
-                    WHERE user_id=:u AND is_deleted=FALSE
-                    ORDER BY created_at DESC
-                """, u=uid)
+                    SELECT d.id, COALESCE(d.title,'')
+                    FROM dialogs d
+                    JOIN users u ON u.id = d.user_id
+                    WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
+                    ORDER BY d.created_at DESC
+                """, tg=tg)
             total = len(ds)
             pages = max(1, (total + DIALOGS_PAGE_SIZE - 1) // DIALOGS_PAGE_SIZE)
             page = max(1, min(page, pages))
-            beg = (page-1) * DIALOGS_PAGE_SIZE
+            beg = (page - 1) * DIALOGS_PAGE_SIZE
             chunk = ds[beg:beg + DIALOGS_PAGE_SIZE]
 
             rows = []
@@ -1970,23 +2052,20 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"dlg:page:{page+1}"))
             rows.append(nav)
 
-            await q.edit_message_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(rows))
-            return
+            return await q.edit_message_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(rows))
 
         if data.startswith("dlg:open:"):
             dlg_id = int(data.split(":")[-1])
-            # делаем выбранный диалог активным (поскольку активный берётся как «последний созданный»)
+            # отметим активность (упрощённо) — чтобы /_ensure_dialog выбрал его
             with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET created_at = now() WHERE id=:d"), {"d": dlg_id})
+                db.execute(sa_text("UPDATE dialogs SET created_at = now() WHERE id = :d"), {"d": dlg_id})
                 db.commit()
-            await q.edit_message_text(f"Открыт диалог #{dlg_id}")
-            return
+            return await q.edit_message_text(f"Открыт диалог #{dlg_id}")
 
         if data.startswith("dlg:rename:"):
             dlg_id = int(data.split(":")[-1])
             context.user_data["rename_dialog_id"] = dlg_id
-            await q.edit_message_text("Введите новое название диалога:")
-            return
+            return await q.edit_message_text("Введите новое название диалога:")
 
         if data.startswith("dlg:export:"):
             dlg_id = int(data.split(":")[-1])
@@ -1994,7 +2073,7 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msgs = _exec_all(db, """
                     SELECT role, content, created_at
                     FROM messages
-                    WHERE dialog_id=:d
+                    WHERE dialog_id = :d
                     ORDER BY created_at
                 """, d=dlg_id)
             lines = ["# Экспорт диалога", ""]
@@ -2009,10 +2088,10 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("dlg:delete:"):
             dlg_id = int(data.split(":")[-1])
             with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"d": dlg_id})
+                db.execute(sa_text("UPDATE dialogs SET is_deleted = TRUE WHERE id = :d"), {"d": dlg_id})
                 db.commit()
-            await q.edit_message_text(f"Диалог #{dlg_id} удалён")
-            return
+            return await q.edit_message_text(f"Диалог #{dlg_id} удалён")
+
     except Exception:
         log.exception("dialog_cb failed")
         try:
