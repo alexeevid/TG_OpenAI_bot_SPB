@@ -920,6 +920,9 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("kb_sync_pdf failed")
         await (update.effective_message or update.message).reply_text(f"⚠ kb_sync_pdf: {e}")
 
+# --- KB sync (унифицированный вызов indexer) ---
+import os, re, inspect, asyncio
+
 async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
@@ -930,57 +933,77 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         from bot.knowledge_base import indexer
 
-        # 1) Явное имя из env/настроек (если задано)
+        # 0) Явный entrypoint через settings/ENV (если задали)
         explicit = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT")
         fn = getattr(indexer, explicit, None) if explicit else None
 
-        # 2) Эвристика по известным именам
+        # 1) Основные имена
         if not fn:
-            for name in ("sync_all","sync_from_yandex","sync","run_sync","full_sync","reindex",
-                         "index_all","ingest_all","ingest","main"):
+            for name in ("sync_kb","sync_all","sync_from_yandex","sync","run_sync","full_sync",
+                         "reindex","index_all","ingest_all","ingest","main"):
                 if hasattr(indexer, name) and callable(getattr(indexer, name)):
                     fn = getattr(indexer, name)
                     break
 
-        # 3) Поиск по паттерну, если выше не нашли
+        # 2) Любая публичная функция с подстрокой sync/index/ingest
         if not fn:
-            # любые публичные callables, где в имени есть sync|index|ingest
-            cands = [(n, getattr(indexer, n)) for n in dir(indexer)
-                     if not n.startswith("_") and re.search(r"(sync|index|ingest)", n, re.I)]
-            cands = [(n, f) for n, f in cands if callable(f)]
-            if len(cands) == 1:
-                fn = cands[0][1]
-
-        if not fn:
-            # покажем, что вообще есть в модуле
-            public = [n for n in dir(indexer) if not n.startswith("_")]
-            raise RuntimeError("Не найден entrypoint. Доступные символы: " + ", ".join(public))
-
-        # 4) Пробуем несколько сигнатур
-        def _try_call():
-            for call in (
-                lambda: fn(SessionLocal, settings),
-                lambda: fn(settings),
-                lambda: fn(SessionLocal),
-                lambda: fn(),
-            ):
-                try:
-                    return call()
-                except TypeError:
+            for name in dir(indexer):
+                if name.startswith("_"):
                     continue
-            raise RuntimeError("Подходящая сигнатура indexer.* не найдена.")
+                if re.search(r"(sync|index|ingest)", name, re.I) and callable(getattr(indexer, name)):
+                    fn = getattr(indexer, name)
+                    break
 
-        result = await asyncio.to_thread(_try_call)
+        if not fn:
+            raise RuntimeError("Не найден entrypoint в indexer.py. Задай KB_SYNC_ENTRYPOINT или добавь функцию sync_kb().")
 
-        # 5) Ответ пользователю
-        if isinstance(result, (tuple, list)) and len(result) >= 2:
-            n_docs, n_chunks = result[0], result[1]
-            await m.reply_text(f"✅ Готово: документов {n_docs}, чанков {n_chunks}")
+        # --- Подготовим аргументы по именам параметров (чтобы не перепутать порядок) ---
+        sig = inspect.signature(fn)
+        kwargs = {}
+        session_to_close = None
+        for p in sig.parameters.values():
+            nm = p.name.lower()
+            if nm in ("session", "db", "conn", "dbsession"):
+                sess = SessionLocal()
+                kwargs[p.name] = sess
+                session_to_close = sess
+            elif nm in ("sessionlocal", "session_factory", "factory"):
+                kwargs[p.name] = SessionLocal
+            elif nm in ("settings", "cfg", "config"):
+                kwargs[p.name] = settings
+            elif p.default is not inspect._empty:
+                # опциональные — просто не передаём
+                pass
+            else:
+                # неизвестный позиционный — подставим None
+                kwargs[p.name] = None
+
+        def _call():
+            try:
+                return fn(**kwargs)
+            finally:
+                if session_to_close is not None:
+                    try:
+                        session_to_close.close()
+                    except Exception:
+                        pass
+
+        result = await asyncio.to_thread(_call)
+
+        # --- Формируем ответ пользователю ---
+        if isinstance(result, dict):
+            upd = result.get("updated"); skp = result.get("skipped"); tot = result.get("total")
+            msg = "✅ Синхронизация завершена."
+            if upd is not None or skp is not None or tot is not None:
+                msg += f" Обновлено: {upd or 0}, пропущено: {skp or 0}, всего файлов на диске: {tot or 0}."
+            return await m.reply_text(msg)
+        elif isinstance(result, (tuple, list)) and len(result) >= 2:
+            return await m.reply_text(f"✅ Готово: документов {result[0]}, чанков {result[1]}")
         else:
-            await m.reply_text("✅ Синхронизация завершена.")
+            return await m.reply_text("✅ Синхронизация завершена.")
     except Exception as e:
         log.exception("kb_sync failed")
-        await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
+        return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
 
 async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
