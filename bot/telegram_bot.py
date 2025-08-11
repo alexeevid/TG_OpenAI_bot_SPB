@@ -1605,7 +1605,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if not row:
                 return await m.reply_text(
-                    f"whoami: tg={tg}, role={role}, lang={lang}\n\n"
+                    f"tg ID={tg}, role={role}, lang={lang}\n\n"
                     "Активного диалога нет. Создайте /dialog_new."
                 )
 
@@ -1635,7 +1635,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         docs = [r[0] for r in links] if links else []
 
         await m.reply_text("\n".join([
-            f"whoami: tg={tg}, role={role}, lang={lang}",
+            f"tg ID={tg}, role={role}, lang={lang}",
             "",
             f"Диалог: {did} — {title or ''}",
             f"Модель: {model or settings.openai_model} | Стиль: {style or '-'}",
