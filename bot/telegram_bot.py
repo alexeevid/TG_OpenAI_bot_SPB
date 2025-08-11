@@ -2851,48 +2851,6 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-def _get_chunk_params():
-    """Возвращает (size, overlap, embedding_model) из settings."""
-    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
-    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
-    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
-    return int(size), int(overlap), str(emb)
-
-    """Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
-    m = update.effective_message or update.message
-    if not _is_admin(update.effective_user.id):
-        return await m.reply_text("⛔ Доступ только админам.")
-
-    parts = (m.text or "").split()
-    if len(parts) < 3:
-        s, o, _ = _get_chunk_params()
-        return await m.reply_text(
-            "Использование: /kb_chunks <size> <overlap> [<kb_top_k>]\n"
-            f"Текущие: size={s}, overlap={o}. Для постоянной смены правьте CHUNK_SIZE/CHUNK_OVERLAP в env."
-        )
-
-    try:
-        size = int(parts[1]); overlap = int(parts[2])
-        if size < 200 or size > 8000:  return await m.reply_text("size должен быть 200..8000.")
-        if overlap < 0 or overlap >= size: return await m.reply_text("overlap должен быть 0..(size-1).")
-
-        for attr in ("chunk_size","CHUNK_SIZE"):
-            if hasattr(settings, attr): setattr(settings, attr, size)
-        for attr in ("chunk_overlap","CHUNK_OVERLAP"):
-            if hasattr(settings, attr): setattr(settings, attr, overlap)
-
-        if len(parts) >= 4:
-            kb_top_k = int(parts[3])
-            for attr in ("kb_top_k","KB_TOP_K"):
-                if hasattr(settings, attr): setattr(settings, attr, kb_top_k)
-
-        s, o, _ = _get_chunk_params()
-        await m.reply_text(f"✅ Параметры обновлены: size={s}, overlap={o}. Для пересчёта существующих файлов — /kb_reindex.")
-    except Exception:
-        log.exception("/kb_chunks failed")
-        await m.reply_text("⚠ Не удалось применить параметры.")
-
-
 async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
     m = update.effective_message or update.message
@@ -2909,25 +2867,40 @@ async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         size = int(parts[1]); overlap = int(parts[2])
-        if size < 200 or size > 8000:  return await m.reply_text("size должен быть 200..8000.")
-        if overlap < 0 or overlap >= size: return await m.reply_text("overlap должен быть 0..(size-1).")
+        if size < 200 or size > 8000:
+            return await m.reply_text("size должен быть 200..8000.")
+        if overlap < 0 or overlap >= size:
+            return await m.reply_text("overlap должен быть 0..(size-1).")
 
-        for attr in ("chunk_size","CHUNK_SIZE"):
-            if hasattr(settings, attr): setattr(settings, attr, size)
-        for attr in ("chunk_overlap","CHUNK_OVERLAP"):
-            if hasattr(settings, attr): setattr(settings, attr, overlap)
+        for attr in ("chunk_size", "CHUNK_SIZE"):
+            if hasattr(settings, attr):
+                setattr(settings, attr, size)
+        for attr in ("chunk_overlap", "CHUNK_OVERLAP"):
+            if hasattr(settings, attr):
+                setattr(settings, attr, overlap)
 
         if len(parts) >= 4:
             kb_top_k = int(parts[3])
-            for attr in ("kb_top_k","KB_TOP_K"):
-                if hasattr(settings, attr): setattr(settings, attr, kb_top_k)
+            for attr in ("kb_top_k", "KB_TOP_K"):
+                if hasattr(settings, attr):
+                    setattr(settings, attr, kb_top_k)
 
         s, o, _ = _get_chunk_params()
-        await m.reply_text(f"✅ Параметры обновлены: size={s}, overlap={o}. Для пересчёта существующих файлов — /kb_reindex.")
+        await m.reply_text(
+            f"✅ Параметры обновлены: size={s}, overlap={o}. "
+            f"Для пересчёта существующих файлов — /kb_reindex."
+        )
     except Exception:
         log.exception("/kb_chunks failed")
         await m.reply_text("⚠ Не удалось применить параметры.")
 
+def _get_chunk_params():
+    """Возвращает (size, overlap, embedding_model) из settings (snake/UPPER case)."""
+    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
+    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
+    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
+    return int(size), int(overlap), str(emb)
+    
 async def kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Полный реиндекс: чистим чанки, сбрасываем etag/chunk_schema и запускаем обычный синк. Только для админов."""
     m = update.effective_message or update.message
