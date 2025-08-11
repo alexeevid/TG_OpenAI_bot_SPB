@@ -143,14 +143,12 @@ def _split_for_tg(text: str, limit: int = TELEGRAM_CHUNK):
         parts.append(s)
     return parts
 
-def _get_chunk_params():
-    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
+size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
     overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
     emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
     return int(size), int(overlap), str(emb)
 
-async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
+"""Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Доступ только админам.")
@@ -183,8 +181,7 @@ async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("⚠ Не удалось применить параметры.")
 
 
-async def kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
+"""
     Полный реиндекс: чистим чанки, сбрасываем etag/chunk_schema и запускаем обычный синк.
     Только для админов.
     """
@@ -604,8 +601,7 @@ def _format_citations(chunks: List[dict]) -> str:
         return ""
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
+"""
     Обрабатывает текст пользователя:
     1) берёт/создаёт активный диалог для этого tg-пользователя;
     2) тянет контекст из БЗ для ИМЕННО ЭТОГО диалога;
@@ -1161,8 +1157,7 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 KB_PAGE_SIZE = 10
 
-def _kb_build_ui(db, tg_id: int, mode: str, page: int):
-    """Возвращает (text, markup, total_pages, page, linked_ids_set)."""
+"""Возвращает (text, markup, total_pages, page, linked_ids_set)."""
     # активный диалог + привязки
     did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
     linked = set(x[0] for x in db.execute(sa_text(
@@ -1212,8 +1207,7 @@ def _kb_build_ui(db, tg_id: int, mode: str, page: int):
     text = "Меню БЗ: выберите документы для подключения к активному диалогу."
     return text, InlineKeyboardMarkup(rows), pages, page, linked
 
-async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message or update.message
+m = update.effective_message or update.message
     try:
         mode = context.user_data.get("kb_mode", "all")
         page = context.user_data.get("kb_page", 1)
@@ -1225,8 +1219,7 @@ async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("kb failed")
         await m.reply_text("⚠ Ошибка /kb")
 
-async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+q = update.callback_query
     data = q.data or ""
     await q.answer()
     try:
@@ -1288,8 +1281,7 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 import os, re, inspect
-async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ-синк БЗ. Надёжно вызывает entrypoint из bot.knowledge_base.indexer."""
+"""Админ-синк БЗ. Надёжно вызывает entrypoint из bot.knowledge_base.indexer."""
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Доступ только админам.")
@@ -2144,8 +2136,7 @@ def _kb_fetch(db, user_id: int, page: int, filter_name: str):
 
 KB_PAGE_SIZE = 10
 
-async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главное меню БЗ с чекбоксами. Чекбоксы отражают dialog_kb_links активного диалога."""
+"""Главное меню БЗ с чекбоксами. Чекбоксы отражают dialog_kb_links активного диалога."""
     m = update.effective_message or update.message
     try:
         tg = update.effective_user.id
@@ -2209,8 +2200,7 @@ async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("⚠ Ошибка /kb")
 
 
-async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
+q = update.callback_query
     data = q.data or ""
     await q.answer()
     try:
@@ -2653,7 +2643,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
     app.add_handler(CommandHandler("kb_chunks_fix", kb_chunks_fix))
     app.add_handler(CommandHandler("kb_chunks_force", kb_chunks_force))
-    app.add_handler(CommandHandler("kb_sync", kb_sync))
+    app.add_handler(CommandHandler("kb_sync", kb_sync_admin))
     app.add_handler(CommandHandler("kb_sync_pdf", kb_sync_pdf))
     app.add_handler(CommandHandler("rag_diag", rag_diag))
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
@@ -2668,3 +2658,364 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     return app
+
+import os, re, inspect
+
+async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ-синк БЗ. Надёжно вызывает entrypoint из bot.knowledge_base.indexer."""
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+    await m.reply_text("🔄 Синхронизация запущена...")
+
+    try:
+        from bot.knowledge_base import indexer
+
+        explicit = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT")
+        fn = getattr(indexer, explicit, None) if explicit else None
+        if not fn:
+            for name in ("sync_kb","sync_all","sync_from_yandex","sync","run_sync","full_sync",
+                         "reindex","index_all","ingest_all","ingest","main"):
+                if hasattr(indexer, name) and callable(getattr(indexer, name)):
+                    fn = getattr(indexer, name); break
+        if not fn:
+            # last-chance: любое имя, где встречается sync/index/ingest
+            for name in dir(indexer):
+                if name.startswith("_"): continue
+                if re.search(r"(sync|index|ingest)", name, re.I) and callable(getattr(indexer, name)):
+                    fn = getattr(indexer, name); break
+        if not fn:
+            raise RuntimeError("Не найден entrypoint в indexer.py. Укажите KB_SYNC_ENTRYPOINT или реализуйте sync_kb(session).")
+
+        # Подготовка kwargs по именам параметров
+        sig = inspect.signature(fn)
+        kwargs, session_to_close = {}, None
+        for p in sig.parameters.values():
+            nm = p.name.lower()
+            if nm in ("session","db","dbsession","conn","connection"):
+                sess = SessionLocal(); kwargs[p.name] = sess; session_to_close = sess
+            elif nm in ("sessionlocal","session_factory","factory","engine"):
+                kwargs[p.name] = SessionLocal
+            elif nm in ("settings","cfg","config","conf"):
+                kwargs[p.name] = settings
+            elif p.default is inspect._empty:
+                kwargs[p.name] = None
+
+        # ВАЖНО: без to_thread. Если корутина — await, иначе синхронно.
+        try:
+            if inspect.iscoroutinefunction(fn):
+                result = await fn(**kwargs)
+            else:
+                result = fn(**kwargs)
+        finally:
+            if session_to_close is not None:
+                try: session_to_close.close()
+                except Exception: pass
+
+        # Унифицированные ответы
+        if isinstance(result, dict):
+            upd = result.get("updated"); skp = result.get("skipped"); tot = result.get("total")
+            msg = "✅ Синхронизация завершена."
+            if upd is not None or skp is not None or tot is not None:
+                msg += f" Обновлено: {upd or 0}, пропущено: {skp or 0}, всего файлов на диске: {tot or 0}."
+            return await m.reply_text(msg)
+        elif isinstance(result, (tuple, list)) and len(result) >= 2:
+            return await m.reply_text(f"✅ Готово: документов {result[0]}, чанков {result[1]}")
+        else:
+            return await m.reply_text("✅ Синхронизация завершена.")
+    except Exception as e:
+        log.exception("kb_sync_admin failed")
+        return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
+
+KB_PAGE_SIZE = 10
+
+def _kb_build_ui(db, tg_id: int, mode: str, page: int):
+    """Возвращает (text, markup, total_pages, page, linked_ids_set)."""
+    did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
+    linked = set(x[0] for x in db.execute(sa_text(
+        "SELECT document_id FROM dialog_kb_links WHERE dialog_id=:d"
+    ), {"d": did}).fetchall())
+
+    docs = db.execute(sa_text("""
+        SELECT id, path, is_active
+        FROM kb_documents
+        ORDER BY path
+    """)).fetchall()
+
+    def is_linked(doc_id): return doc_id in linked
+
+    if mode == "linked":
+        docs = [r for r in docs if is_linked(r[0])]
+    elif mode == "avail":
+        docs = [r for r in docs if not is_linked(r[0])]
+
+    total = len(docs)
+    pages = max(1, (total + KB_PAGE_SIZE - 1) // KB_PAGE_SIZE)
+    page = max(1, min(page, pages))
+    beg = (page - 1) * KB_PAGE_SIZE
+    chunk = docs[beg:beg + KB_PAGE_SIZE]
+
+    rows = []
+    for doc_id, path, is_active in chunk:
+        check = "☑" if doc_id in linked else "☐"
+        title = (path or f"doc #{doc_id}")[:70]
+        rows.append([InlineKeyboardButton(f"{check} {title}", callback_data=f"kb:toggle:{doc_id}")])
+
+    nav = []
+    if page > 1:   nav.append(InlineKeyboardButton("«", callback_data=f"kb:page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"Страница {page}/{pages}", callback_data="kb:nop"))
+    if page < pages: nav.append(InlineKeyboardButton("»", callback_data=f"kb:page:{page+1}"))
+    if nav: rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton("Все", callback_data="kb:mode:all"),
+        InlineKeyboardButton("Подключённые", callback_data="kb:mode:linked"),
+        InlineKeyboardButton("Доступные", callback_data="kb:mode:avail"),
+    ])
+    rows.append([InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")])
+    rows.append([InlineKeyboardButton("📊 Статус БЗ", callback_data="kb:status")])
+
+    text = "Меню БЗ: выберите документы для подключения к активному диалогу."
+    return text, InlineKeyboardMarkup(rows), pages, page, linked
+
+async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    try:
+        mode = context.user_data.get("kb_mode", "all")
+        page = context.user_data.get("kb_page", 1)
+        with SessionLocal() as db:
+            text, markup, pages, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+        context.user_data["kb_page"] = page
+        await m.reply_text(text, reply_markup=markup)
+    except Exception:
+        log.exception("kb failed")
+        await m.reply_text("⚠ Ошибка /kb")
+
+async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()
+    try:
+        mode = context.user_data.get("kb_mode", "all")
+        page = context.user_data.get("kb_page", 1)
+
+        if data == "kb:nop":
+            return
+
+        if data.startswith("kb:page:"):
+            page = int(data.split(":")[-1])
+            context.user_data["kb_page"] = page
+            with SessionLocal() as db:
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data.startswith("kb:mode:"):
+            mode = data.split(":")[-1]
+            context.user_data["kb_mode"] = mode
+            context.user_data["kb_page"] = 1
+            with SessionLocal() as db:
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, 1)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data.startswith("kb:toggle:"):
+            doc_id = int(data.split(":")[-1])
+            with SessionLocal() as db:
+                did = _get_active_dialog_id(db, update.effective_user.id) or _create_new_dialog_for_tg(db, update.effective_user.id)
+                exists = _exec_scalar(db,
+                    "SELECT 1 FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc LIMIT 1",
+                    d=did, doc=doc_id)
+                if exists:
+                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc"),
+                               {"d": did, "doc": doc_id})
+                else:
+                    db.execute(sa_text(
+                        "INSERT INTO dialog_kb_links (dialog_id, document_id, created_at) "
+                        "VALUES (:d,:doc,now()) ON CONFLICT DO NOTHING"),
+                        {"d": did, "doc": doc_id})
+                db.commit()
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data in ("kb:sync", "kb:sync:run"):
+            return await kb_sync_admin(update, context)
+
+        if data == "kb:status":
+            with SessionLocal() as db:
+                d = _exec_scalar(db, "SELECT count(*) FROM kb_documents") or 0
+                c = _exec_scalar(db, "SELECT count(*) FROM kb_chunks") or 0
+            return await q.message.reply_text(f"БЗ: документов {d}, чанков {c}")
+    except Exception:
+        log.exception("kb_cb failed")
+        try:
+            await q.message.reply_text("⚠ Ошибка меню БЗ.")
+        except Exception:
+            pass
+
+def _get_chunk_params():
+    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
+    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
+    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
+    return int(size), int(overlap), str(emb)
+
+"""Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+
+    parts = (m.text or "").split()
+    if len(parts) < 3:
+        s, o, _ = _get_chunk_params()
+        return await m.reply_text(
+            "Использование: /kb_chunks <size> <overlap> [<kb_top_k>]\n"
+            f"Текущие: size={s}, overlap={o}. Для постоянной смены правьте CHUNK_SIZE/CHUNK_OVERLAP в env."
+        )
+
+    try:
+        size = int(parts[1]); overlap = int(parts[2])
+        if size < 200 or size > 8000:  return await m.reply_text("size должен быть 200..8000.")
+        if overlap < 0 or overlap >= size: return await m.reply_text("overlap должен быть 0..(size-1).")
+
+        for attr in ("chunk_size","CHUNK_SIZE"):
+            if hasattr(settings, attr): setattr(settings, attr, size)
+        for attr in ("chunk_overlap","CHUNK_OVERLAP"):
+            if hasattr(settings, attr): setattr(settings, attr, overlap)
+
+        if len(parts) >= 4:
+            kb_top_k = int(parts[3])
+            for attr in ("kb_top_k","KB_TOP_K"):
+                if hasattr(settings, attr): setattr(settings, attr, kb_top_k)
+
+        s, o, _ = _get_chunk_params()
+        await m.reply_text(f"✅ Параметры обновлены: size={s}, overlap={o}. Для пересчёта существующих файлов — /kb_reindex.")
+    except Exception:
+        log.exception("/kb_chunks failed")
+        await m.reply_text("⚠ Не удалось применить параметры.")
+
+def _get_chunk_params():
+    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
+    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
+    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
+    return int(size), int(overlap), str(emb)
+
+async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+
+    parts = (m.text or "").split()
+    if len(parts) < 3:
+        s, o, _ = _get_chunk_params()
+        return await m.reply_text(
+            "Использование: /kb_chunks <size> <overlap> [<kb_top_k>]\n"
+            f"Текущие: size={s}, overlap={o}. Для постоянной смены правьте CHUNK_SIZE/CHUNK_OVERLAP в env."
+        )
+
+    try:
+        size = int(parts[1]); overlap = int(parts[2])
+        if size < 200 or size > 8000:  return await m.reply_text("size должен быть 200..8000.")
+        if overlap < 0 or overlap >= size: return await m.reply_text("overlap должен быть 0..(size-1).")
+
+        for attr in ("chunk_size","CHUNK_SIZE"):
+            if hasattr(settings, attr): setattr(settings, attr, size)
+        for attr in ("chunk_overlap","CHUNK_OVERLAP"):
+            if hasattr(settings, attr): setattr(settings, attr, overlap)
+
+        if len(parts) >= 4:
+            kb_top_k = int(parts[3])
+            for attr in ("kb_top_k","KB_TOP_K"):
+                if hasattr(settings, attr): setattr(settings, attr, kb_top_k)
+
+        s, o, _ = _get_chunk_params()
+        await m.reply_text(f"✅ Параметры обновлены: size={s}, overlap={o}. Для пересчёта существующих файлов — /kb_reindex.")
+    except Exception:
+        log.exception("/kb_chunks failed")
+        await m.reply_text("⚠ Не удалось применить параметры.")
+
+async def kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полный реиндекс: чистим чанки, сбрасываем etag/chunk_schema и запускаем обычный синк. Только для админов."""
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+
+    size, overlap, emb = _get_chunk_params()
+    await m.reply_text(f"♻️ Полный реиндекс: size={size}, overlap={overlap}, embedding={emb}.\n"
+                       f"Очищаю чанки и перезапускаю синхронизацию…")
+    try:
+        with SessionLocal() as db:
+            db.execute(sa_text("DELETE FROM kb_chunks"))
+            db.execute(sa_text("UPDATE kb_documents SET etag=NULL, updated_at=now()"))
+            try:
+                db.execute(sa_text("UPDATE kb_documents SET chunk_schema=NULL"))
+            except Exception:
+                pass
+            db.commit()
+        return await kb_sync_admin(update, context)
+    except Exception as e:
+        log.exception("kb_reindex failed")
+        return await m.reply_text(f"⚠ Ошибка реиндекса: {e}")
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Текстовый запрос: активный диалог, RAG, сохранение истории, длинные ответы."""
+    m = update.effective_message or update.message
+
+    if "rename_dialog_id" in context.user_data:
+        dlg_id = context.user_data.pop("rename_dialog_id")
+        new_title = (m.text or "").strip()[:100]
+        if not new_title:
+            return await m.reply_text("Название пустое. Отменено.")
+        try:
+            with SessionLocal() as db:
+                db.execute(sa_text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
+                db.commit()
+            return await m.reply_text("Название сохранено.")
+        except Exception:
+            log.exception("rename dialog title failed")
+            return await m.reply_text("⚠ Не удалось сохранить название.")
+
+    q = (m.text or "").strip()
+    if not q:
+        return
+
+    try:
+        with SessionLocal() as db:
+            tg = update.effective_user.id
+            did = _get_active_dialog_id(db, tg)
+            if not did:
+                did = _create_new_dialog_for_tg(db, tg)
+
+            row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
+            dia_model = row[0] if row and row[0] else settings.openai_model
+            dia_style = row[1] if row and row[1] else "pro"
+
+            chunks = _retrieve_chunks(db, did, q, k=6)
+            ctx_blocks = [c.get("content", "")[:1000] for c in chunks] if chunks else []
+
+        prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
+
+        system = {"role": "system", "content": "RAG assistant"}
+        user = {"role": "user", "content": prompt}
+        answer = await _chat_full(dia_model, [system, user], temperature=0.3)
+
+        if chunks:
+            answer += _format_citations(chunks)
+
+        try:
+            with SessionLocal() as db:
+                db.execute(sa_text(
+                    "INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'user',:c,now())"
+                ), {"d": did, "c": q})
+                db.execute(sa_text(
+                    "INSERT INTO messages (dialog_id, role, content, created_at) VALUES (:d,'assistant',:c,now())"
+                ), {"d": did, "c": answer})
+                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
+                db.commit()
+        except Exception:
+            log.exception("save messages failed")
+
+        await _send_long(m, answer)
+
+    except Exception:
+        log.exception("on_text failed")
+        await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+
