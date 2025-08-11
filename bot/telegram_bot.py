@@ -143,6 +143,97 @@ def _split_for_tg(text: str, limit: int = TELEGRAM_CHUNK):
         parts.append(s)
     return parts
 
+async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /kb_chunks <size> <overlap> [<kb_top_k>]
+    Меняет параметры чанкинга в settings на текущий рантайм. Только админ.
+    """
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+
+    text = (m.text or "").strip()
+    parts = text.split()
+    if len(parts) < 3:
+        s, o, _ = _get_chunk_params()
+        return await m.reply_text(
+            "Использование: /kb_chunks <size> <overlap> [<kb_top_k>]\n"
+            f"Текущие: size={s}, overlap={o}. Изменение работает до перезапуска.\n"
+            "Для постоянной смены — обновите переменные окружения CHUNK_SIZE и CHUNK_OVERLAP."
+        )
+
+    try:
+        size = int(parts[1]); overlap = int(parts[2])
+        if size < 200 or size > 8000:
+            return await m.reply_text("Размер чанка должен быть в диапазоне 200..8000.")
+        if overlap < 0 or overlap >= size:
+            return await m.reply_text("Перекрытие должно быть 0..(size-1) и меньше самого чанка.")
+        # применяем
+        if hasattr(settings, "chunk_size"): setattr(settings, "chunk_size", size)
+        if hasattr(settings, "CHUNK_SIZE"): setattr(settings, "CHUNK_SIZE", size)
+        if hasattr(settings, "chunk_overlap"): setattr(settings, "chunk_overlap", overlap)
+        if hasattr(settings, "CHUNK_OVERLAP"): setattr(settings, "CHUNK_OVERLAP", overlap)
+
+        # необязательный kb_top_k
+        if len(parts) >= 4:
+            kb_top_k = int(parts[3])
+            if hasattr(settings, "kb_top_k"): setattr(settings, "kb_top_k", kb_top_k)
+            if hasattr(settings, "KB_TOP_K"): setattr(settings, "KB_TOP_K", kb_top_k)
+
+        s, o, _ = _get_chunk_params()
+        await m.reply_text(f"✅ Параметры обновлены: size={s}, overlap={o}. "
+                           f"Старые документы нужно переиндексировать командой /kb_reindex.")
+    except Exception:
+        log.exception("/kb_chunks failed")
+        await m.reply_text("⚠ Не удалось применить параметры. Проверьте числовые значения.")
+
+async def kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Полный реиндекс: чистим чанки + сбрасываем признаки актуальности, затем
+    запускаем обычную синхронизацию (которая порежет и пересчитает эмбеддинги).
+    Только админ.
+    """
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+
+    size, overlap, emb = _get_chunk_params()
+    await m.reply_text(f"♻️ Полный реиндекс: size={size}, overlap={overlap}, embedding={emb}.\n"
+                       f"Очищаю чанки и перезапускаю синхронизацию…")
+
+    try:
+        with SessionLocal() as db:
+            # Если есть колонка chunk_schema — сбросим её; если нет — просто обнулим etag.
+            try:
+                db.execute(sa_text("DELETE FROM kb_chunks"))
+                db.execute(sa_text("UPDATE kb_documents SET etag=NULL, updated_at=now()"))
+                # опционально: если у вас есть поле chunk_schema — сбросим
+                try:
+                    db.execute(sa_text("UPDATE kb_documents SET chunk_schema=NULL"))
+                except Exception:
+                    pass
+                db.commit()
+            except Exception:
+                log.exception("kb_reindex cleanup failed")
+                return await m.reply_text("⚠ Не удалось очистить старые чанки/метаданные.")
+
+        # обычная синхронизация (используется текущая реализация kb_sync)
+        return await (update, context)
+    except Exception as e:
+        log.exception("kb_reindex failed")
+        return await m.reply_text(f"⚠ Ошибка реиндекса: {e}")
+
+
+def _get_chunk_params():
+    """
+    Берём параметры из settings. Поддерживаем и snake_case, и UPPER_CASE,
+    чтобы не зависеть от реализации Settings.
+    """
+    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
+    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
+    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
+    return int(size), int(overlap), str(emb)
+
 async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     text = (m.text or "").strip()
@@ -1036,70 +1127,46 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Доступ только админам.")
-
     await m.reply_text("🔄 Синхронизация запущена...")
 
     try:
         from bot.knowledge_base import indexer
 
-        # 0) Явный entrypoint через settings/ENV (если задали)
         explicit = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT")
         fn = getattr(indexer, explicit, None) if explicit else None
-
-        # 1) Основные имена
         if not fn:
             for name in ("sync_kb","sync_all","sync_from_yandex","sync","run_sync","full_sync",
                          "reindex","index_all","ingest_all","ingest","main"):
                 if hasattr(indexer, name) and callable(getattr(indexer, name)):
-                    fn = getattr(indexer, name)
-                    break
-
-        # 2) Любая публичная функция с подстрокой sync/index/ingest
+                    fn = getattr(indexer, name); break
         if not fn:
             for name in dir(indexer):
-                if name.startswith("_"):
-                    continue
+                if name.startswith("_"): continue
                 if re.search(r"(sync|index|ingest)", name, re.I) and callable(getattr(indexer, name)):
-                    fn = getattr(indexer, name)
-                    break
-
+                    fn = getattr(indexer, name); break
         if not fn:
-            raise RuntimeError("Не найден entrypoint в indexer.py. Задай KB_SYNC_ENTRYPOINT или добавь функцию sync_kb().")
+            raise RuntimeError("Не найден entrypoint в indexer.py. Укажите KB_SYNC_ENTRYPOINT или реализуйте sync_kb(session).")
 
-        # --- Подготовим аргументы по именам параметров (чтобы не перепутать порядок) ---
         sig = inspect.signature(fn)
-        kwargs = {}
-        session_to_close = None
+        kwargs, session_to_close = {}, None
         for p in sig.parameters.values():
             nm = p.name.lower()
-            if nm in ("session", "db", "conn", "dbsession"):
-                sess = SessionLocal()
-                kwargs[p.name] = sess
-                session_to_close = sess
-            elif nm in ("sessionlocal", "session_factory", "factory"):
+            if nm in ("session","db","dbsession","conn","connection"):
+                sess = SessionLocal(); kwargs[p.name] = sess; session_to_close = sess
+            elif nm in ("sessionlocal","session_factory","factory","engine"):
                 kwargs[p.name] = SessionLocal
-            elif nm in ("settings", "cfg", "config"):
+            elif nm in ("settings","cfg","config","conf"):
                 kwargs[p.name] = settings
-            elif p.default is not inspect._empty:
-                # опциональные — просто не передаём
-                pass
-            else:
-                # неизвестный позиционный — подставим None
-                kwargs[p.name] = None
-
+            elif p.default is inspect._empty:
+                kwargs[p.name] = None  # обязательный неизвестный параметр
         def _call():
-            try:
-                return fn(**kwargs)
+            try: return fn(**kwargs)
             finally:
                 if session_to_close is not None:
-                    try:
-                        session_to_close.close()
-                    except Exception:
-                        pass
-
+                    try: session_to_close.close()
+                    except Exception: pass
         result = await asyncio.to_thread(_call)
 
-        # --- Формируем ответ пользователю ---
         if isinstance(result, dict):
             upd = result.get("updated"); skp = result.get("skipped"); tot = result.get("total")
             msg = "✅ Синхронизация завершена."
@@ -1113,6 +1180,7 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("kb_sync failed")
         return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
+
 
 async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -2388,6 +2456,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
     app.add_handler(CommandHandler("web", cmd_web))
     app.add_handler(CommandHandler("web", web_cmd))
+    app.add_handler(CommandHandler("kb_chunks", kb_chunks_cmd))   # admin only
+    app.add_handler(CommandHandler("kb_reindex", kb_reindex))      # admin only
+    app.add_handler(CommandHandler("kb_sync", kb_sync))            # admin only
+
 
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
