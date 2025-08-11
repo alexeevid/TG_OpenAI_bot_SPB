@@ -143,55 +143,50 @@ def _split_for_tg(text: str, limit: int = TELEGRAM_CHUNK):
         parts.append(s)
     return parts
 
+def _get_chunk_params():
+    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
+    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
+    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
+    return int(size), int(overlap), str(emb)
+
 async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /kb_chunks <size> <overlap> [<kb_top_k>]
-    Меняет параметры чанкинга в settings на текущий рантайм. Только админ.
-    """
+    """Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Доступ только админам.")
 
-    text = (m.text or "").strip()
-    parts = text.split()
+    parts = (m.text or "").split()
     if len(parts) < 3:
         s, o, _ = _get_chunk_params()
         return await m.reply_text(
             "Использование: /kb_chunks <size> <overlap> [<kb_top_k>]\n"
-            f"Текущие: size={s}, overlap={o}. Изменение работает до перезапуска.\n"
-            "Для постоянной смены — обновите переменные окружения CHUNK_SIZE и CHUNK_OVERLAP."
+            f"Текущие: size={s}, overlap={o}. Для постоянной смены правьте CHUNK_SIZE/CHUNK_OVERLAP в env."
         )
 
     try:
         size = int(parts[1]); overlap = int(parts[2])
-        if size < 200 or size > 8000:
-            return await m.reply_text("Размер чанка должен быть в диапазоне 200..8000.")
-        if overlap < 0 or overlap >= size:
-            return await m.reply_text("Перекрытие должно быть 0..(size-1) и меньше самого чанка.")
-        # применяем
-        if hasattr(settings, "chunk_size"): setattr(settings, "chunk_size", size)
-        if hasattr(settings, "CHUNK_SIZE"): setattr(settings, "CHUNK_SIZE", size)
-        if hasattr(settings, "chunk_overlap"): setattr(settings, "chunk_overlap", overlap)
-        if hasattr(settings, "CHUNK_OVERLAP"): setattr(settings, "CHUNK_OVERLAP", overlap)
+        if size < 200 or size > 8000:  return await m.reply_text("size должен быть 200..8000.")
+        if overlap < 0 or overlap >= size: return await m.reply_text("overlap должен быть 0..(size-1).")
 
-        # необязательный kb_top_k
+        # применяем оба варианта имён
+        for attr in ("chunk_size","CHUNK_SIZE"):       setattr(settings, attr, size)      if hasattr(settings, attr) else None
+        for attr in ("chunk_overlap","CHUNK_OVERLAP"): setattr(settings, attr, overlap)   if hasattr(settings, attr) else None
+
         if len(parts) >= 4:
             kb_top_k = int(parts[3])
-            if hasattr(settings, "kb_top_k"): setattr(settings, "kb_top_k", kb_top_k)
-            if hasattr(settings, "KB_TOP_K"): setattr(settings, "KB_TOP_K", kb_top_k)
+            for attr in ("kb_top_k","KB_TOP_K"): setattr(settings, attr, kb_top_k) if hasattr(settings, attr) else None
 
         s, o, _ = _get_chunk_params()
-        await m.reply_text(f"✅ Параметры обновлены: size={s}, overlap={o}. "
-                           f"Старые документы нужно переиндексировать командой /kb_reindex.")
+        await m.reply_text(f"✅ Параметры обновлены: size={s}, overlap={o}. Для пересчёта существующих файлов — /kb_reindex.")
     except Exception:
         log.exception("/kb_chunks failed")
-        await m.reply_text("⚠ Не удалось применить параметры. Проверьте числовые значения.")
+        await m.reply_text("⚠ Не удалось применить параметры.")
+
 
 async def kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Полный реиндекс: чистим чанки + сбрасываем признаки актуальности, затем
-    запускаем обычную синхронизацию (которая порежет и пересчитает эмбеддинги).
-    Только админ.
+    Полный реиндекс: чистим чанки, сбрасываем etag/chunk_schema и запускаем обычный синк.
+    Только для админов.
     """
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
@@ -200,39 +195,21 @@ async def kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     size, overlap, emb = _get_chunk_params()
     await m.reply_text(f"♻️ Полный реиндекс: size={size}, overlap={overlap}, embedding={emb}.\n"
                        f"Очищаю чанки и перезапускаю синхронизацию…")
-
     try:
         with SessionLocal() as db:
-            # Если есть колонка chunk_schema — сбросим её; если нет — просто обнулим etag.
+            db.execute(sa_text("DELETE FROM kb_chunks"))
+            db.execute(sa_text("UPDATE kb_documents SET etag=NULL, updated_at=now()"))
             try:
-                db.execute(sa_text("DELETE FROM kb_chunks"))
-                db.execute(sa_text("UPDATE kb_documents SET etag=NULL, updated_at=now()"))
-                # опционально: если у вас есть поле chunk_schema — сбросим
-                try:
-                    db.execute(sa_text("UPDATE kb_documents SET chunk_schema=NULL"))
-                except Exception:
-                    pass
-                db.commit()
+                db.execute(sa_text("UPDATE kb_documents SET chunk_schema=NULL"))
             except Exception:
-                log.exception("kb_reindex cleanup failed")
-                return await m.reply_text("⚠ Не удалось очистить старые чанки/метаданные.")
+                pass
+            db.commit()
 
-        # обычная синхронизация (используется текущая реализация kb_sync)
-        return await (update, context)
+        # ВАЖНО: вызываем новую функцию синка
+        return await kb_sync_admin(update, context)
     except Exception as e:
         log.exception("kb_reindex failed")
         return await m.reply_text(f"⚠ Ошибка реиндекса: {e}")
-
-
-def _get_chunk_params():
-    """
-    Берём параметры из settings. Поддерживаем и snake_case, и UPPER_CASE,
-    чтобы не зависеть от реализации Settings.
-    """
-    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
-    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
-    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
-    return int(size), int(overlap), str(emb)
 
 async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -1182,6 +1159,68 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
 
 
+import os, re, inspect, asyncio
+async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ-синк БЗ. Находит entrypoint в indexer.py и корректно подставляет аргументы."""
+    m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Доступ только админам.")
+    await m.reply_text("🔄 Синхронизация запущена...")
+
+    try:
+        from bot.knowledge_base import indexer
+
+        explicit = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT")
+        fn = getattr(indexer, explicit, None) if explicit else None
+        if not fn:
+            for name in ("sync_kb","sync_all","sync_from_yandex","sync","run_sync","full_sync",
+                         "reindex","index_all","ingest_all","ingest","main"):
+                if hasattr(indexer, name) and callable(getattr(indexer, name)):
+                    fn = getattr(indexer, name); break
+        if not fn:
+            for name in dir(indexer):
+                if name.startswith("_"): continue
+                if re.search(r"(sync|index|ingest)", name, re.I) and callable(getattr(indexer, name)):
+                    fn = getattr(indexer, name); break
+        if not fn:
+            raise RuntimeError("Не найден entrypoint в indexer.py. Укажите KB_SYNC_ENTRYPOINT или реализуйте sync_kb(session).")
+
+        sig = inspect.signature(fn)
+        kwargs, session_to_close = {}, None
+        for p in sig.parameters.values():
+            nm = p.name.lower()
+            if nm in ("session","db","dbsession","conn","connection"):
+                sess = SessionLocal(); kwargs[p.name] = sess; session_to_close = sess
+            elif nm in ("sessionlocal","session_factory","factory","engine"):
+                kwargs[p.name] = SessionLocal
+            elif nm in ("settings","cfg","config","conf"):
+                kwargs[p.name] = settings
+            elif p.default is inspect._empty:
+                kwargs[p.name] = None  # на всякий случай
+
+        def _call():
+            try: return fn(**kwargs)
+            finally:
+                if session_to_close is not None:
+                    try: session_to_close.close()
+                    except Exception: pass
+
+        result = await asyncio.to_thread(_call)
+
+        if isinstance(result, dict):
+            upd = result.get("updated"); skp = result.get("skipped"); tot = result.get("total")
+            msg = "✅ Синхронизация завершена."
+            if upd is not None or skp is not None or tot is not None:
+                msg += f" Обновлено: {upd or 0}, пропущено: {skp or 0}, всего файлов на диске: {tot or 0}."
+            return await m.reply_text(msg)
+        elif isinstance(result, (tuple, list)) and len(result) >= 2:
+            return await m.reply_text(f"✅ Готово: документов {result[0]}, чанков {result[1]}")
+        else:
+            return await m.reply_text("✅ Синхронизация завершена.")
+    except Exception as e:
+        log.exception("kb_sync_admin failed")
+        return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
+
 async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
@@ -1970,92 +2009,124 @@ def _kb_fetch(db, user_id: int, page: int, filter_name: str):
     )
     return dlg_id, rows, page, pages, conn_ids
 
+KB_PAGE_SIZE = 10
+
 async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню БЗ с чекбоксами. Чекбоксы отражают dialog_kb_links активного диалога."""
+    m = update.effective_message or update.message
     try:
-        tg_id = update.effective_user.id
+        tg = update.effective_user.id
+        mode = context.user_data.get("kb_mode", "all")   # all|linked|avail
+        page = context.user_data.get("kb_page", 1)
+
         with SessionLocal() as db:
-            uid = _ensure_user(db, tg_id)
-            _ensure_dialog(db, uid)
-            dlg_id, rows, page, pages, conn_ids = _kb_fetch(db, uid, 1, "all")
-        buttons = []
-        for d_id, path in rows:
-            checked = "☑" if d_id in conn_ids else "☐"
-            fname = path.split("/")[-1]
-            buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:all")])
-        kb_markup = _kb_keyboard(buttons, page, pages, "all", admin=_is_admin(tg_id))
-        await update.message.reply_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
+            did = _get_active_dialog_id(db, tg) or _create_new_dialog_for_tg(db, tg)
+            linked = set(x[0] for x in db.execute(sa_text(
+                "SELECT document_id FROM dialog_kb_links WHERE dialog_id=:d"
+            ), {"d": did}).fetchall())
+
+            # Получаем все документы
+            docs = db.execute(sa_text("""
+                SELECT id, path, is_active
+                FROM kb_documents
+                ORDER BY path
+            """)).fetchall()
+
+        # Фильтрация
+        def _is_linked(doc_id): return doc_id in linked
+        if mode == "linked":
+            docs = [r for r in docs if _is_linked(r[0])]
+        elif mode == "avail":
+            docs = [r for r in docs if not _is_linked(r[0])]
+
+        total = len(docs)
+        pages = max(1, (total + KB_PAGE_SIZE - 1) // KB_PAGE_SIZE)
+        page = max(1, min(page, pages))
+        context.user_data["kb_page"] = page
+
+        beg = (page - 1) * KB_PAGE_SIZE
+        chunk = docs[beg:beg + KB_PAGE_SIZE]
+
+        rows = []
+        for doc_id, path, is_active in chunk:
+            check = "☑" if doc_id in linked else "☐"
+            title = (path or f"doc #{doc_id}")[:60]
+            rows.append([InlineKeyboardButton(f"{check} {title}", callback_data=f"kb:toggle:{doc_id}")])
+
+        nav = []
+        if page > 1:   nav.append(InlineKeyboardButton("«", callback_data=f"kb:page:{page-1}"))
+        nav.append(InlineKeyboardButton(f"Страница {page}/{pages}", callback_data="kb:nop"))
+        if page < pages: nav.append(InlineKeyboardButton("»", callback_data=f"kb:page:{page+1}"))
+        if nav: rows.append(nav)
+
+        rows.append([
+            InlineKeyboardButton("Все", callback_data="kb:mode:all"),
+            InlineKeyboardButton("Подключённые", callback_data="kb:mode:linked"),
+            InlineKeyboardButton("Доступные", callback_data="kb:mode:avail"),
+        ])
+        rows.append([
+            InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync"),
+        ])
+        rows.append([InlineKeyboardButton("📊 Статус БЗ", callback_data="kb:status")])
+
+        await m.reply_text("Меню БЗ: выберите документы для подключения к активному диалогу.", 
+                           reply_markup=InlineKeyboardMarkup(rows))
     except Exception:
         log.exception("kb failed")
-        await update.message.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+        await m.reply_text("⚠ Ошибка /kb")
+
 
 async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    data = q.data or ""
     await q.answer()
     try:
-        data = q.data or ""
-        tg_id = update.effective_user.id
-        with SessionLocal() as db:
-            uid = _ensure_user(db, tg_id)
+        if data == "kb:nop":
+            return
 
-            if data.startswith("kb:list:"):
-                _, _, page, flt = data.split(":", 3)
-                dlg_id, rows, page, pages, conn_ids = _kb_fetch(db, uid, int(page), flt)
-                buttons = []
-                for d_id, path in rows:
-                    checked = "☑" if d_id in conn_ids else "☐"
-                    fname = path.split("/")[-1]
-                    buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:{flt}")])
-                kb_markup = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
-                await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
-                return
+        if data.startswith("kb:page:"):
+            context.user_data["kb_page"] = int(data.split(":")[-1])
+            return await q.edit_message_reply_markup(reply_markup=None) or await kb(update, context)
 
-            if data.startswith("kb:toggle:"):
-                _, _, doc_id, page, flt = data.split(":", 4)
-                doc_id = int(doc_id)
-                dlg_id = _exec_scalar(db,
-                    """
-                    SELECT id FROM dialogs WHERE user_id=:u AND is_deleted=FALSE
-                    ORDER BY created_at DESC LIMIT 1
-                    """, u=uid)
-                if not dlg_id:
-                    dlg_id = _ensure_dialog(db, uid)
+        if data.startswith("kb:mode:"):
+            mode = data.split(":")[-1]
+            context.user_data["kb_mode"] = mode
+            context.user_data["kb_page"] = 1
+            return await q.edit_message_reply_markup(reply_markup=None) or await kb(update, context)
 
-                exist = _exec_scalar(db,
-                    "SELECT id FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc",
-                    d=dlg_id, doc=doc_id)
-                if exist:
-                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE id=:i"), {"i": exist})
+        if data.startswith("kb:toggle:"):
+            doc_id = int(data.split(":")[-1])
+            tg = update.effective_user.id
+            with SessionLocal() as db:
+                did = _get_active_dialog_id(db, tg) or _create_new_dialog_for_tg(db, tg)
+                exists = _exec_scalar(db,
+                    "SELECT 1 FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc LIMIT 1",
+                    d=did, doc=doc_id)
+                if exists:
+                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc"),
+                               {"d": did, "doc": doc_id})
                 else:
                     db.execute(sa_text(
-                        "INSERT INTO dialog_kb_links (dialog_id, document_id, created_at) VALUES (:d, :doc, now())"
-                    ), {"d": dlg_id, "doc": doc_id})
+                        "INSERT INTO dialog_kb_links (dialog_id, document_id, created_at) "
+                        "VALUES (:d,:doc,now()) ON CONFLICT DO NOTHING"),
+                        {"d": did, "doc": doc_id})
                 db.commit()
+            # перерисуем
+            return await kb(update, context)
 
-                dlg_id, rows, page, pages, conn_ids = _kb_fetch(db, uid, int(page), flt)
-                buttons = []
-                for d_id, path in rows:
-                    checked = "☑" if d_id in conn_ids else "☐"
-                    fname = path.split("/")[-1]
-                    buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:{flt}")])
-                kb_markup = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
-                await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
-                return
+        if data in ("kb:sync", "kb:sync:run"):
+            return await kb_sync_admin(update, context)
 
-            if data == "kb:status":
-                docs = _exec_scalar(db, "SELECT COUNT(*) FROM kb_documents WHERE is_active") or 0
-                chunks = _exec_scalar(db, "SELECT COUNT(*) FROM kb_chunks") or 0
-                await q.edit_message_text(f"Документов: {docs}\nЧанков: {chunks}")
-                return
+        if data == "kb:status":
+            with SessionLocal() as db:
+                d = _exec_scalar(db, "SELECT count(*) FROM kb_documents") or 0
+                c = _exec_scalar(db, "SELECT count(*) FROM kb_chunks") or 0
+            return await q.message.reply_text(f"БЗ: документов {d}, чанков {c}")
 
-            if data in ("kb:sync", "kb:sync:run"):
-                return await kb_sync(update, context)
-
-            if data == "kb:nop":
-                return
     except Exception:
         log.exception("kb_cb failed")
         try:
-            await q.message.reply_text("⚠ Ошибка обработчика /kb. Попробуйте ещё раз.")
+            await q.message.reply_text("⚠ Ошибка меню БЗ.")
         except Exception:
             pass
 
@@ -2459,7 +2530,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("kb_chunks", kb_chunks_cmd))   # admin only
     app.add_handler(CommandHandler("kb_reindex", kb_reindex))      # admin only
     app.add_handler(CommandHandler("kb_sync", kb_sync))            # admin only
-
+    app.add_handler(CommandHandler("kb_sync", kb_sync_admin))   # admin
 
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
