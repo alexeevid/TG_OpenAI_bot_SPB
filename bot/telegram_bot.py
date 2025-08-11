@@ -1,5 +1,6 @@
 from __future__ import annotations
 import tiktoken
+import asyncio
 from openai import OpenAI
 from io import BytesIO
 
@@ -32,6 +33,7 @@ from bot.db.session import SessionLocal  # engine импортируем вну�
 
 log = logging.getLogger(__name__)
 settings = load_settings()
+_oa_client = OpenAI(api_key=settings.openai_api_key)
 
 # --- Авто-миграция при старте (если нет таблиц) ---
 def apply_migrations_if_needed(force: bool = False) -> None:
@@ -117,6 +119,57 @@ def _is_admin(tg_id: int) -> bool:
         return tg_id in ids
     except Exception:
         return False
+
+TELEGRAM_CHUNK = 3500  # безопасный размер сообщения
+
+def _split_for_tg(text: str, limit: int = TELEGRAM_CHUNK):
+    """Делит длинный текст так, чтобы не рвать слова/абзацы."""
+    parts, s = [], text.strip()
+    while len(s) > limit:
+        cut = s.rfind("\n\n", 0, limit)
+        if cut == -1:
+            cut = s.rfind("\n", 0, limit)
+        if cut == -1:
+            cut = s.rfind(" ", 0, limit)
+        if cut == -1:
+            cut = limit
+        parts.append(s[:cut].rstrip())
+        s = s[cut:].lstrip()
+    if s:
+        parts.append(s)
+    return parts
+
+async def _send_long(m, text: str):
+    """Отправляет текст пачками, если он длиннее лимита Telegram."""
+    for chunk in _split_for_tg(text):
+        await m.reply_text(chunk)
+
+async def _chat_full(model: str, messages: list, temperature: float = 0.3, max_turns: int = 6):
+    """
+    Вызывает Chat Completions столько раз, сколько нужно, пока finish_reason != 'length'
+    или не исчерпан лимит max_turns. Возвращает полный склеенный ответ.
+    """
+    hist = list(messages)
+    full = ""
+    turns = 0
+    while turns < max_turns:
+        turns += 1
+        resp = _oa_client.chat.completions.create(
+            model=model,
+            messages=hist,
+            temperature=temperature,
+            max_tokens=1024,  # можно увеличить, но мы всё равно автопродолжим
+        )
+        choice = resp.choices[0]
+        piece = choice.message.content or ""
+        full += piece
+        finish = choice.finish_reason
+        if finish != "length":
+            break
+        # просим продолжить
+        hist.append({"role": "assistant", "content": piece})
+        hist.append({"role": "user", "content": "Продолжай с того места. Не повторяйся."})
+    return full
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,29 +274,27 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fobj.download_to_memory(out=bio)
         bio.seek(0)
 
-        # наиболее стабильный способ для OpenAI — реальный файл с расширением
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".ogg") as tmp:
             tmp.write(bio.getbuffer())
             tmp.flush()
-            client = OpenAI(api_key=settings.openai_api_key)
             with open(tmp.name, "rb") as fh:
                 try:
-                    tr = client.audio.transcriptions.create(
+                    tr = _oa_client.audio.transcriptions.create(
                         model="gpt-4o-mini-transcribe", file=fh, language="ru"
                     )
                 except Exception:
                     fh.seek(0)
-                    tr = client.audio.transcriptions.create(
+                    tr = _oa_client.audio.transcriptions.create(
                         model="whisper-1", file=fh, language="ru"
                     )
 
         text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or ""
         if not text.strip():
             return await m.reply_text("Не удалось распознать речь, попробуйте ещё раз.")
-
         q = text.strip()
-        # быстрый хэндлер на генерацию изображения голосом
+
+        # голосовая команда "Нарисуй ..."
         if q.lower().startswith(("нарисуй", "сгенерируй картинку")):
             prompt = q.split(":", 1)[1].strip() if ":" in q else q.split(maxsplit=1)[-1]
             if prompt:
@@ -251,8 +302,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 img_bytes, final_prompt = await generate_image_bytes(prompt)
                 return await m.reply_photo(photo=img_bytes, caption=f"🖼️ Сгенерировано по голосовой команде\nPrompt → {final_prompt}")
 
-        # обычный RAG-ответ
-        from bot.openai_helper import chat as ai_chat
         with SessionLocal() as db:
             uid = _ensure_user(db, update.effective_user.id)
             did = _ensure_dialog(db, uid)
@@ -261,15 +310,15 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dia_style = row[1] if row and row[1] else "pro"
             chunks = _retrieve_chunks(db, did, q, k=6)
             ctx_blocks = [c.get("content", "") for c in chunks] if chunks else []
+
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-        answer = await ai_chat(
-            [{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}],
-            model=dia_model, max_tokens=800
-        )
+        system = {"role": "system", "content": "RAG assistant"}
+        user = {"role": "user", "content": prompt}
+        answer = await _chat_full(dia_model, [system, user], temperature=0.3)
         if chunks:
             answer += _format_citations(chunks)
 
-        # сохраняем историю
+        # сохраняем и отправляем по частям
         try:
             with SessionLocal() as db:
                 uid = _ensure_user(db, update.effective_user.id)
@@ -283,7 +332,8 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("save voice messages failed")
 
-        await m.reply_text(answer)
+        await _send_long(m, answer)
+
     except Exception:
         log.exception("on_voice failed")
         await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
@@ -399,7 +449,7 @@ def _format_citations(chunks: List[dict]) -> str:
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
-    # перехват ввода для переименования
+    # перехват переименования
     if "rename_dialog_id" in context.user_data:
         dlg_id = context.user_data.pop("rename_dialog_id")
         new_title = (m.text or "").strip()[:100]
@@ -425,19 +475,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
             chunks = _retrieve_chunks(db, did, q, k=6)
-            ctx_blocks = [r["content"][:900] for r in chunks] if chunks else []
+            ctx_blocks = [r.get("content", "")[:1000] for r in chunks] if chunks else []
 
-        from bot.openai_helper import chat as ai_chat
+        # строим промпт
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-        answer = await ai_chat(
-            [{"role": "system", "content": "RAG assistant"}, {"role": "user", "content": prompt}],
-            model=dia_model,
-            max_tokens=900
-        )
+
+        # ПОЛНЫЙ ответ (автопродолжение)
+        system = {"role": "system", "content": "RAG assistant"}
+        user = {"role": "user", "content": prompt}
+        answer = await _chat_full(dia_model, [system, user], temperature=0.3)
+
         if chunks:
             answer += _format_citations(chunks)
 
-        # сохраняем историю
+        # сохраняем историю (целиком)
         try:
             with SessionLocal() as db:
                 uid = _ensure_user(db, update.effective_user.id)
@@ -451,7 +502,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("save messages failed")
 
-        await m.reply_text(answer)
+        # отправляем по частям
+        await _send_long(m, answer)
+
     except Exception:
         log.exception("on_text failed")
         await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
@@ -869,17 +922,51 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Доступ только админам.")
+
     await m.reply_text("🔄 Синхронизация запущена...")
 
     try:
         from bot.knowledge_base import indexer
-        if hasattr(indexer, "sync_all"):
-            n_docs, n_chunks = await asyncio.to_thread(indexer.sync_all, SessionLocal, settings)
-        elif hasattr(indexer, "sync_from_yandex"):
-            n_docs, n_chunks = await asyncio.to_thread(indexer.sync_from_yandex, SessionLocal, settings)
+
+        # Подберём функцию-энтрипоинт динамически
+        candidates = [
+            "sync_all", "sync_from_yandex", "sync", "run_sync", "full_sync",
+            "reindex", "index_all", "ingest_all", "ingest", "main"
+        ]
+        fn = None
+        for name in candidates:
+            if hasattr(indexer, name) and callable(getattr(indexer, name)):
+                fn = getattr(indexer, name)
+                break
+        if not fn:
+            raise RuntimeError("Не найден entrypoint: " + ", ".join(candidates))
+
+        # Пробуем разные сигнатуры
+        result = None
+        errors = []
+        for call in (
+            lambda: fn(SessionLocal, settings),
+            lambda: fn(settings),
+            lambda: fn(SessionLocal),
+            lambda: fn(),
+        ):
+            try:
+                result = await asyncio.to_thread(call)
+                break
+            except TypeError as te:
+                errors.append(str(te))
+                continue
+
+        if result is None:
+            raise RuntimeError("Подходящая сигнатура indexer.* не найдена. Ошибки: " + " | ".join(errors))
+
+        # ожидаем (docs, chunks) или просто сообщение/число
+        if isinstance(result, (tuple, list)) and len(result) >= 2:
+            n_docs, n_chunks = result[0], result[1]
+            await m.reply_text(f"✅ Готово: документов {n_docs}, чанков {n_chunks}")
         else:
-            raise RuntimeError("Не найден entrypoint: indexer.sync_all / indexer.sync_from_yandex")
-        await m.reply_text(f"✅ Готово: документов {n_docs}, чанков {n_chunks}")
+            await m.reply_text("✅ Синхронизация завершена.")
+
     except Exception as e:
         log.exception("kb_sync failed")
         await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
@@ -1481,18 +1568,20 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ORDER BY kd.path
             """), {"d": did}).fetchall()
 
+            msg_count = _exec_scalar(db, "SELECT count(*) FROM messages WHERE dialog_id = :d", d=did) or 0
             total_dialogs = _exec_scalar(db, """
                 SELECT count(*) FROM dialogs d
                 JOIN users u ON u.id = d.user_id
                 WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
             """, tg=tg) or 0
-            total_msgs = _exec_scalar(db, "SELECT count(*) FROM messages WHERE dialog_id = :d", d=did) or 0
 
         title = row[1] or ""
         model = row[2] or settings.openai_model
         style = row[3] or "-"
-        created = row[4].strftime("%Y-%m-%d %H:%M") if row and row[4] else "-"
-        updated = row[5].strftime("%Y-%m-%d %H:%M") if row and row[5] else "-"
+        created_dt = row[4]
+        updated_dt = row[5]
+        created = created_dt.strftime("%Y-%m-%d %H:%M") if created_dt else "-"
+        updated = updated_dt.strftime("%Y-%m-%d %H:%M") if updated_dt else "-"
         docs = [r[0] for r in links] if links else []
 
         await m.reply_text("\n".join([
@@ -1502,7 +1591,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Подключённые документы ({len(docs)}):",
             *[f"• {p}" for p in docs],
             "",
-            f"Всего твоих диалогов: {total_dialogs} | Сообщений в этом диалоге: {total_msgs}",
+            f"Всего твоих диалогов: {total_dialogs} | Сообщений в этом диалоге: {msg_count}",
         ]))
     except Exception:
         log.exception("stats failed")
@@ -1737,9 +1826,7 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(f"Документов: {docs}\nЧанков: {chunks}")
                 return
 
-            if data == "kb:sync":
-                # сразу запускаем настоящую синхронизацию (без заглушек)
-                await q.message.reply_text("🔄 Стартую синхронизацию БЗ…")
+            if data in ("kb:sync", "kb:sync:run"):
                 return await kb_sync(update, context)
 
             if data == "kb:nop":
