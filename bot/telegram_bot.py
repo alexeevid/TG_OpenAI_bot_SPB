@@ -3,6 +3,8 @@ import tiktoken
 import asyncio
 from openai import OpenAI
 from io import BytesIO
+import os, re, inspect
+from datetime import datetime
 
 import logging
 from datetime import datetime
@@ -928,45 +930,54 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         from bot.knowledge_base import indexer
 
-        # Подберём функцию-энтрипоинт динамически
-        candidates = [
-            "sync_all", "sync_from_yandex", "sync", "run_sync", "full_sync",
-            "reindex", "index_all", "ingest_all", "ingest", "main"
-        ]
-        fn = None
-        for name in candidates:
-            if hasattr(indexer, name) and callable(getattr(indexer, name)):
-                fn = getattr(indexer, name)
-                break
+        # 1) Явное имя из env/настроек (если задано)
+        explicit = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT")
+        fn = getattr(indexer, explicit, None) if explicit else None
+
+        # 2) Эвристика по известным именам
         if not fn:
-            raise RuntimeError("Не найден entrypoint: " + ", ".join(candidates))
+            for name in ("sync_all","sync_from_yandex","sync","run_sync","full_sync","reindex",
+                         "index_all","ingest_all","ingest","main"):
+                if hasattr(indexer, name) and callable(getattr(indexer, name)):
+                    fn = getattr(indexer, name)
+                    break
 
-        # Пробуем разные сигнатуры
-        result = None
-        errors = []
-        for call in (
-            lambda: fn(SessionLocal, settings),
-            lambda: fn(settings),
-            lambda: fn(SessionLocal),
-            lambda: fn(),
-        ):
-            try:
-                result = await asyncio.to_thread(call)
-                break
-            except TypeError as te:
-                errors.append(str(te))
-                continue
+        # 3) Поиск по паттерну, если выше не нашли
+        if not fn:
+            # любые публичные callables, где в имени есть sync|index|ingest
+            cands = [(n, getattr(indexer, n)) for n in dir(indexer)
+                     if not n.startswith("_") and re.search(r"(sync|index|ingest)", n, re.I)]
+            cands = [(n, f) for n, f in cands if callable(f)]
+            if len(cands) == 1:
+                fn = cands[0][1]
 
-        if result is None:
-            raise RuntimeError("Подходящая сигнатура indexer.* не найдена. Ошибки: " + " | ".join(errors))
+        if not fn:
+            # покажем, что вообще есть в модуле
+            public = [n for n in dir(indexer) if not n.startswith("_")]
+            raise RuntimeError("Не найден entrypoint. Доступные символы: " + ", ".join(public))
 
-        # ожидаем (docs, chunks) или просто сообщение/число
+        # 4) Пробуем несколько сигнатур
+        def _try_call():
+            for call in (
+                lambda: fn(SessionLocal, settings),
+                lambda: fn(settings),
+                lambda: fn(SessionLocal),
+                lambda: fn(),
+            ):
+                try:
+                    return call()
+                except TypeError:
+                    continue
+            raise RuntimeError("Подходящая сигнатура indexer.* не найдена.")
+
+        result = await asyncio.to_thread(_try_call)
+
+        # 5) Ответ пользователю
         if isinstance(result, (tuple, list)) and len(result) >= 2:
             n_docs, n_chunks = result[0], result[1]
             await m.reply_text(f"✅ Готово: документов {n_docs}, чанков {n_chunks}")
         else:
             await m.reply_text("✅ Синхронизация завершена.")
-
     except Exception as e:
         log.exception("kb_sync failed")
         await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
