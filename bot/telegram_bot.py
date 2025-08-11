@@ -1159,9 +1159,137 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
 
 
-import os, re, inspect, asyncio
+KB_PAGE_SIZE = 10
+
+def _kb_build_ui(db, tg_id: int, mode: str, page: int):
+    """Возвращает (text, markup, total_pages, page, linked_ids_set)."""
+    # активный диалог + привязки
+    did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
+    linked = set(x[0] for x in db.execute(sa_text(
+        "SELECT document_id FROM dialog_kb_links WHERE dialog_id=:d"
+    ), {"d": did}).fetchall())
+
+    # список документов
+    docs = db.execute(sa_text("""
+        SELECT id, path, is_active
+        FROM kb_documents
+        ORDER BY path
+    """)).fetchall()
+
+    def is_linked(doc_id): return doc_id in linked
+
+    if mode == "linked":
+        docs = [r for r in docs if is_linked(r[0])]
+    elif mode == "avail":
+        docs = [r for r in docs if not is_linked(r[0])]
+
+    total = len(docs)
+    pages = max(1, (total + KB_PAGE_SIZE - 1) // KB_PAGE_SIZE)
+    page = max(1, min(page, pages))
+    beg = (page - 1) * KB_PAGE_SIZE
+    chunk = docs[beg:beg + KB_PAGE_SIZE]
+
+    rows = []
+    for doc_id, path, is_active in chunk:
+        check = "☑" if doc_id in linked else "☐"
+        title = (path or f"doc #{doc_id}")[:70]
+        rows.append([InlineKeyboardButton(f"{check} {title}", callback_data=f"kb:toggle:{doc_id}")])
+
+    nav = []
+    if page > 1:   nav.append(InlineKeyboardButton("«", callback_data=f"kb:page:{page-1}"))
+    nav.append(InlineKeyboardButton(f"Страница {page}/{pages}", callback_data="kb:nop"))
+    if page < pages: nav.append(InlineKeyboardButton("»", callback_data=f"kb:page:{page+1}"))
+    if nav: rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton("Все", callback_data="kb:mode:all"),
+        InlineKeyboardButton("Подключённые", callback_data="kb:mode:linked"),
+        InlineKeyboardButton("Доступные", callback_data="kb:mode:avail"),
+    ])
+    rows.append([InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")])
+    rows.append([InlineKeyboardButton("📊 Статус БЗ", callback_data="kb:status")])
+
+    text = "Меню БЗ: выберите документы для подключения к активному диалогу."
+    return text, InlineKeyboardMarkup(rows), pages, page, linked
+
+async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    try:
+        mode = context.user_data.get("kb_mode", "all")
+        page = context.user_data.get("kb_page", 1)
+        with SessionLocal() as db:
+            text, markup, pages, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+        context.user_data["kb_page"] = page
+        await m.reply_text(text, reply_markup=markup)
+    except Exception:
+        log.exception("kb failed")
+        await m.reply_text("⚠ Ошибка /kb")
+
+async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()
+    try:
+        mode = context.user_data.get("kb_mode", "all")
+        page = context.user_data.get("kb_page", 1)
+
+        if data == "kb:nop":
+            return
+
+        if data.startswith("kb:page:"):
+            page = int(data.split(":")[-1])
+            context.user_data["kb_page"] = page
+            with SessionLocal() as db:
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data.startswith("kb:mode:"):
+            mode = data.split(":")[-1]
+            context.user_data["kb_mode"] = mode
+            context.user_data["kb_page"] = 1
+            with SessionLocal() as db:
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, 1)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data.startswith("kb:toggle:"):
+            doc_id = int(data.split(":")[-1])
+            with SessionLocal() as db:
+                did = _get_active_dialog_id(db, update.effective_user.id) or _create_new_dialog_for_tg(db, update.effective_user.id)
+                exists = _exec_scalar(db,
+                    "SELECT 1 FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc LIMIT 1",
+                    d=did, doc=doc_id)
+                if exists:
+                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc"),
+                               {"d": did, "doc": doc_id})
+                else:
+                    db.execute(sa_text(
+                        "INSERT INTO dialog_kb_links (dialog_id, document_id, created_at) "
+                        "VALUES (:d,:doc,now()) ON CONFLICT DO NOTHING"),
+                        {"d": did, "doc": doc_id})
+                db.commit()
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data in ("kb:sync", "kb:sync:run"):
+            # один вызов — и ответом отдельное сообщение со статусом
+            return await kb_sync_admin(update, context)
+
+        if data == "kb:status":
+            with SessionLocal() as db:
+                d = _exec_scalar(db, "SELECT count(*) FROM kb_documents") or 0
+                c = _exec_scalar(db, "SELECT count(*) FROM kb_chunks") or 0
+            return await q.message.reply_text(f"БЗ: документов {d}, чанков {c}")
+    except Exception:
+        log.exception("kb_cb failed")
+        try:
+            await q.message.reply_text("⚠ Ошибка меню БЗ.")
+        except Exception:
+            pass
+
+
+import os, re, inspect
 async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ-синк БЗ. Находит entrypoint в indexer.py и корректно подставляет аргументы."""
+    """Админ-синк БЗ. Надёжно вызывает entrypoint из bot.knowledge_base.indexer."""
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Доступ только админам.")
@@ -1178,6 +1306,7 @@ async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if hasattr(indexer, name) and callable(getattr(indexer, name)):
                     fn = getattr(indexer, name); break
         if not fn:
+            # last-chance: любое имя, где встречается sync/index/ingest
             for name in dir(indexer):
                 if name.startswith("_"): continue
                 if re.search(r"(sync|index|ingest)", name, re.I) and callable(getattr(indexer, name)):
@@ -1185,6 +1314,7 @@ async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not fn:
             raise RuntimeError("Не найден entrypoint в indexer.py. Укажите KB_SYNC_ENTRYPOINT или реализуйте sync_kb(session).")
 
+        # Подготовка kwargs по именам параметров
         sig = inspect.signature(fn)
         kwargs, session_to_close = {}, None
         for p in sig.parameters.values():
@@ -1196,17 +1326,20 @@ async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif nm in ("settings","cfg","config","conf"):
                 kwargs[p.name] = settings
             elif p.default is inspect._empty:
-                kwargs[p.name] = None  # на всякий случай
+                kwargs[p.name] = None
 
-        def _call():
-            try: return fn(**kwargs)
-            finally:
-                if session_to_close is not None:
-                    try: session_to_close.close()
-                    except Exception: pass
+        # ВАЖНО: без to_thread. Если корутина — await, иначе синхронно.
+        try:
+            if inspect.iscoroutinefunction(fn):
+                result = await fn(**kwargs)
+            else:
+                result = fn(**kwargs)
+        finally:
+            if session_to_close is not None:
+                try: session_to_close.close()
+                except Exception: pass
 
-        result = await asyncio.to_thread(_call)
-
+        # Унифицированные ответы
         if isinstance(result, dict):
             upd = result.get("updated"); skp = result.get("skipped"); tot = result.get("total")
             msg = "✅ Синхронизация завершена."
@@ -2529,7 +2662,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("web", web_cmd))
     app.add_handler(CommandHandler("kb_chunks", kb_chunks_cmd))   # admin only
     app.add_handler(CommandHandler("kb_reindex", kb_reindex))      # admin only
-    app.add_handler(CommandHandler("kb_sync", kb_sync))            # admin only
     app.add_handler(CommandHandler("kb_sync", kb_sync_admin))   # admin
 
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
