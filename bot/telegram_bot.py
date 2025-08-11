@@ -220,29 +220,32 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bio = BytesIO()
         await fobj.download_to_memory(out=bio)
         bio.seek(0)
-        # ВАЖНО: у BytesIO должно быть имя, иначе OpenAI не распознаёт формат
-        try:
-            bio.name = "voice.ogg"  # type: ignore[attr-defined]
-        except Exception:
-            pass
 
-        client = OpenAI(api_key=settings.openai_api_key)
-        try:
-            tr = client.audio.transcriptions.create(model="whisper-1", file=bio, language="ru")
-            text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or ""
-        except Exception:
-            # запасной вариант
-            bio.seek(0)
-            tr = client.audio.transcriptions.create(model="gpt-4o-mini-transcribe", file=bio, language="ru")
-            text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or ""
+        # наиболее стабильный способ для OpenAI — реальный файл с расширением
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".ogg") as tmp:
+            tmp.write(bio.getbuffer())
+            tmp.flush()
+            client = OpenAI(api_key=settings.openai_api_key)
+            with open(tmp.name, "rb") as fh:
+                try:
+                    tr = client.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe", file=fh, language="ru"
+                    )
+                except Exception:
+                    fh.seek(0)
+                    tr = client.audio.transcriptions.create(
+                        model="whisper-1", file=fh, language="ru"
+                    )
 
+        text = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or ""
         if not text.strip():
             return await m.reply_text("Не удалось распознать речь, попробуйте ещё раз.")
 
         q = text.strip()
-        low = q.lower()
-        if low.startswith("нарисуй") or low.startswith("сгенерируй картинку"):
-            prompt = q.split(":", 1)[1].strip() if ":" in q else q.replace("Нарисуй", "").replace("нарисуй", "").replace("Сгенерируй картинку", "").strip()
+        # быстрый хэндлер на генерацию изображения голосом
+        if q.lower().startswith(("нарисуй", "сгенерируй картинку")):
+            prompt = q.split(":", 1)[1].strip() if ":" in q else q.split(maxsplit=1)[-1]
             if prompt:
                 from bot.openai_helper import generate_image_bytes
                 img_bytes, final_prompt = await generate_image_bytes(prompt)
@@ -259,7 +262,10 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chunks = _retrieve_chunks(db, did, q, k=6)
             ctx_blocks = [c.get("content", "") for c in chunks] if chunks else []
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-        answer = await ai_chat([{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}], model=dia_model, max_tokens=800)
+        answer = await ai_chat(
+            [{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}],
+            model=dia_model, max_tokens=800
+        )
         if chunks:
             answer += _format_citations(chunks)
 
@@ -866,8 +872,6 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await m.reply_text("🔄 Синхронизация запущена...")
 
     try:
-        # ПОДГОН ПОД ТВОЙ ИНДЕКСАТОР:
-        # пробуем sync_all(SessionLocal, settings) → если нет, пробуем sync_from_yandex(...)
         from bot.knowledge_base import indexer
         if hasattr(indexer, "sync_all"):
             n_docs, n_chunks = await asyncio.to_thread(indexer.sync_all, SessionLocal, settings)
@@ -1151,7 +1155,8 @@ async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not uid:
                 uid = _ensure_user(db, tg)
 
-            today = datetime.date.today().isoformat()
+            # БЫЛО: datetime.date.today() — падало, т.к. импортирована только datetime
+            today = datetime.now().date().isoformat()
             cnt = _exec_scalar(db, """
                 SELECT count(*) FROM dialogs d
                 JOIN users u ON u.id = d.user_id
@@ -1733,11 +1738,9 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if data == "kb:sync":
-                if not _is_admin(tg_id):
-                    await q.edit_message_text("Доступ ограничён.")
-                else:
-                    await q.edit_message_text("Синхронизация запланирована (заглушка).")
-                return
+                # сразу запускаем настоящую синхронизацию (без заглушек)
+                await q.message.reply_text("🔄 Стартую синхронизацию БЗ…")
+                return await kb_sync(update, context)
 
             if data == "kb:nop":
                 return
@@ -1753,18 +1756,19 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
         with SessionLocal() as db:
-            uid = _ensure_user(db, update.effective_user.id)
+            tg_id = update.effective_user.id
+            uid = _ensure_user(db, tg_id)
             did = _ensure_dialog(db, uid)
-            # чистим всё, что относится к текущему диалогу
-            db.execute(sa_text("DELETE FROM messages WHERE dialog_id=:d"), {"d": did})
+            db.execute(sa_text("DELETE FROM messages WHERE dialog_id=:d"),   {"d": did})
             db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d"), {"d": did})
-            db.execute(sa_text("DELETE FROM pdf_passwords WHERE dialog_id=:d"), {"d": did})
+            db.execute(sa_text("DELETE FROM pdf_passwords WHERE dialog_id=:d"),   {"d": did})
             db.execute(sa_text("UPDATE dialogs SET last_message_at=NULL WHERE id=:d"), {"d": did})
             db.commit()
-        await m.reply_text("Контекст текущего диалога очищен.")
+        context.user_data.clear()
+        await m.reply_text("♻️ Диалог очищен: история, привязки БЗ и пароли PDF сброшены.")
     except Exception:
         log.exception("reset failed")
-        await m.reply_text("⚠ Ошибка /reset")
+        await m.reply_text("⚠ Не удалось сбросить диалог.")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error", exc_info=context.error)
@@ -2056,7 +2060,7 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("dlg:open:"):
             dlg_id = int(data.split(":")[-1])
-            # отметим активность (упрощённо) — чтобы /_ensure_dialog выбрал его
+            # отметим активность, чтобы _ensure_dialog выбирал его
             with SessionLocal() as db:
                 db.execute(sa_text("UPDATE dialogs SET created_at = now() WHERE id = :d"), {"d": dlg_id})
                 db.commit()
@@ -2081,17 +2085,15 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 who = "Пользователь" if role == "user" else "Бот"
                 lines.append(f"**{who}:**\n{content}\n")
             data_bytes = "\n".join(lines).encode("utf-8")
-            file = BufferedInputFile(data_bytes, filename=f"dialog_{dlg_id}.md") if HAS_BUFFERED else InputFile(data_bytes, filename=f"dialog_{dlg_id}.md")
-            await q.message.reply_document(document=file, caption="Экспорт готов")
-            return
+            file = (BufferedInputFile if HAS_BUFFERED else InputFile)(data_bytes, filename=f"dialog_{dlg_id}.md")  # type: ignore
+            return await q.message.reply_document(document=file, caption="Экспорт готов")
 
         if data.startswith("dlg:delete:"):
             dlg_id = int(data.split(":")[-1])
             with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET is_deleted = TRUE WHERE id = :d"), {"d": dlg_id})
+                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"d": dlg_id})
                 db.commit()
             return await q.edit_message_text(f"Диалог #{dlg_id} удалён")
-
     except Exception:
         log.exception("dialog_cb failed")
         try:
