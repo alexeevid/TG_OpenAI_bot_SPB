@@ -2852,12 +2852,13 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def _get_chunk_params():
+    """Возвращает (size, overlap, embedding_model) из settings."""
     size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
     overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
     emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
     return int(size), int(overlap), str(emb)
 
-"""Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
+    """Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Доступ только админам.")
@@ -2891,11 +2892,6 @@ def _get_chunk_params():
         log.exception("/kb_chunks failed")
         await m.reply_text("⚠ Не удалось применить параметры.")
 
-def _get_chunk_params():
-    size = getattr(settings, "chunk_size", None) or getattr(settings, "CHUNK_SIZE", None) or 1200
-    overlap = getattr(settings, "chunk_overlap", None) or getattr(settings, "CHUNK_OVERLAP", None) or 200
-    emb = getattr(settings, "openai_embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
-    return int(size), int(overlap), str(emb)
 
 async def kb_chunks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Админ: /kb_chunks <size> <overlap> [<kb_top_k>] — меняет параметры в рантайме (до рестарта)."""
