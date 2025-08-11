@@ -1584,19 +1584,37 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg = update.effective_user.id
         with SessionLocal() as db:
+            u = db.execute(sa_text(
+                "SELECT id, is_admin, is_allowed, COALESCE(lang,'ru') "
+                "FROM users WHERE tg_user_id=:tg ORDER BY id LIMIT 1"
+            ), {"tg": tg}).first()
+            if u:
+                uid, is_admin, is_allowed, lang = u
+            else:
+                uid, is_admin, is_allowed, lang = (None, False, True if not getattr(settings, 'allowed_user_ids', '') else False, 'ru')
+            role = "admin" if is_admin else ("allowed" if is_allowed or not getattr(settings, 'allowed_user_ids', '') else "guest")
+
             row = db.execute(sa_text("""
                 SELECT d.id, d.title, d.model, d.style, d.created_at, d.last_message_at
                 FROM dialogs d
                 JOIN users u ON u.id = d.user_id
                 WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
-                ORDER BY d.created_at DESC
+                ORDER BY COALESCE(d.created_at, to_timestamp(0)) DESC, d.id DESC
                 LIMIT 1
             """), {"tg": tg}).first()
 
             if not row:
-                return await m.reply_text("Нет активного диалога. Нажми /dialog_new")
+                return await m.reply_text(
+                    f"whoami: tg={tg}, role={role}, lang={lang}\n\n"
+                    "Активного диалога нет. Создайте /dialog_new."
+                )
 
-            did = row[0]
+            did, title, model, style, created_dt, updated_dt = row
+            if created_dt is None:
+                db.execute(sa_text("UPDATE dialogs SET created_at=now() WHERE id=:d"), {"d": did})
+                db.commit()
+                created_dt = datetime.now()
+
             links = db.execute(sa_text("""
                 SELECT kd.path
                 FROM dialog_kb_links l
@@ -1612,21 +1630,18 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
             """, tg=tg) or 0
 
-        title = row[1] or ""
-        model = row[2] or settings.openai_model
-        style = row[3] or "-"
-        created_dt = row[4]
-        updated_dt = row[5]
         created = created_dt.strftime("%Y-%m-%d %H:%M") if created_dt else "-"
         updated = updated_dt.strftime("%Y-%m-%d %H:%M") if updated_dt else "-"
         docs = [r[0] for r in links] if links else []
 
         await m.reply_text("\n".join([
-            f"Диалог: {did} — {title}",
-            f"Модель: {model} | Стиль: {style}",
+            f"whoami: tg={tg}, role={role}, lang={lang}",
+            "",
+            f"Диалог: {did} — {title or ''}",
+            f"Модель: {model or settings.openai_model} | Стиль: {style or '-'}",
             f"Создан: {created} | Изменён: {updated}",
             f"Подключённые документы ({len(docs)}):",
-            *[f"• {p}" for p in docs],
+            *([f"• {p}" for p in docs] or ["• —"]),
             "",
             f"Всего твоих диалогов: {total_dialogs} | Сообщений в этом диалоге: {msg_count}",
         ]))
