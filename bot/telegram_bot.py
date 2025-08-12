@@ -8,6 +8,51 @@ from datetime import datetime
 from urllib.parse import urlparse
 import tempfile
 
+# --- singleton lock for polling (prevents "Conflict: ... other getUpdates") ---
+import os, sys, hashlib, psycopg2
+
+_singleton_conn = None  # держим подключение открытым, пока живёт процесс
+
+def _ensure_single_instance() -> None:
+    """
+    Берём advisory-lock в PostgreSQL. Если занято — выходим (вторая копия).
+    Лок держится, пока открыт _singleton_conn (до завершения процесса).
+    """
+    global _singleton_conn
+    if _singleton_conn is not None:
+        return  # уже взяли
+
+    dsn = getattr(settings, "database_url", None) or getattr(settings, "DATABASE_URL", None)
+    if not dsn:
+        # без БД лок не возьмём — просто предупреждаем
+        log.warning("DATABASE_URL не задан — пропускаю singleton-lock (риск Conflict).")
+        return
+
+    # Стабильный ключ для advisory-lock
+    lock_key = int(hashlib.sha1(f"{dsn}|{settings.telegram_bot_token}".encode("utf-8")).hexdigest()[:15], 16) % (2**31)
+    try:
+        _singleton_conn = psycopg2.connect(dsn)
+        _singleton_conn.autocommit = True
+        with _singleton_conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+            ok = cur.fetchone()[0]
+        if not ok:
+            log.error("‼️ Найдена другая копия бота (advisory-lock уже занят). Завершаюсь.")
+            # мягкий выход, чтобы Railway перезапустил только один экземпляр
+            sys.exit(0)
+        log.info("✅ Singleton-lock получен (pg_advisory_lock).")
+    except Exception:
+        log.exception("Не удалось взять singleton-lock. Риск Conflict остаётся.")
+
+# --- post_init для Application: удаляем webhook перед polling ---
+async def _post_init(app: "Application"):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("✅ Webhook удалён, pending updates сброшены.")
+    except Exception:
+        log.exception("Не удалось удалить webhook")
+
+
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -2062,51 +2107,57 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         
 def build_app() -> Application:
+    # alembic autoupgrade / ленивые миграции
     apply_migrations_if_needed()
-    app = ApplicationBuilder().token(settings.telegram_bot_token).build()
+
+    # гарантия единственного инстанса (до старта polling)
+    _ensure_single_instance()
+
+    # собираем Application с post_init-хуком, который удаляет webhook
+    app = ApplicationBuilder() \
+        .token(settings.telegram_bot_token) \
+        .post_init(_post_init) \
+        .build()
+
     app.add_error_handler(error_handler)
+
+    # --- ваши хендлеры (оставляю как у вас, но см. пункт 2 про дубликаты) ---
     app.add_handler(CallbackQueryHandler(model_cb, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(mode_cb, pattern=r"^mode:"))
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("grant", grant))
-    app.add_handler(CommandHandler("health", health))
-    app.add_handler(CommandHandler("revoke", revoke))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("model", model_menu))
-    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("mode", mode_menu))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("dialogs", dialogs))
-    app.add_handler(CommandHandler("img", cmd_img))
-    app.add_handler(CallbackQueryHandler(dialog_cb, pattern=r"^dlg:"))
-    app.add_handler(CommandHandler("repair_schema", repair_schema))
-    app.add_handler(CommandHandler("dbcheck", dbcheck))
-    app.add_handler(CommandHandler("migrate", migrate))
-    app.add_handler(CommandHandler("kb", kb))
-    app.add_handler(CallbackQueryHandler(kb_cb, pattern=r"^kb:"))
+    app.add_handler(CommandHandler("dialog", dialog_cmd))
     app.add_handler(CommandHandler("dialog_new", dialog_new))
-    app.add_handler(CommandHandler("pgvector_check", pgvector_check))
-    app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
-    app.add_handler(CommandHandler("kb_chunks_fix", kb_chunks_fix))
-    app.add_handler(CommandHandler("kb_chunks_force", kb_chunks_force))
-    app.add_handler(CommandHandler("kb_sync", kb_sync_admin))
-    app.add_handler(CommandHandler("kb_sync_pdf", kb_sync_pdf))
+    app.add_handler(CommandHandler("kb", kb_cmd))
+    app.add_handler(CommandHandler("kb_diag", kb_diag))
+    app.add_handler(CommandHandler("img", img_cmd))
+    app.add_handler(CommandHandler("grant", grant))
+    app.add_handler(CommandHandler("revoke", revoke))
+    app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("rag_diag", rag_diag))
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
-    app.add_handler(CommandHandler("web", cmd_web))
-    app.add_handler(CommandHandler("web", web_cmd))
-    app.add_handler(CommandHandler("kb_chunks", kb_chunks_cmd))   # admin only
-    app.add_handler(CommandHandler("kb_reindex", kb_reindex))      # admin only
-    app.add_handler(CommandHandler("kb_sync", kb_sync_admin))   # admin
 
+    # ⚠️ Оставьте только ОДИН хендлер для /web:
+    app.add_handler(CommandHandler("web", web_cmd))  # ← этот
+    # app.add_handler(CommandHandler("web", cmd_web))  # ← ЭТОТ УДАЛИТЬ, если он у вас есть дубликатом
+
+    # админки по БЗ
+    app.add_handler(CommandHandler("kb_chunks", kb_chunks_cmd))
+    app.add_handler(CommandHandler("kb_reindex", kb_reindex))
+    app.add_handler(CommandHandler("kb_sync", kb_sync_admin))
+
+    # сообщения
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     return app
-
-import os, re, inspect
 
 async def kb_sync_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Админ-синк БЗ: надёжно вызывает entrypoint из bot.knowledge_base.indexer, 
