@@ -1,16 +1,28 @@
-from sqlalchemy import select
+
+# bot/knowledge_base/indexer.py
+# Синхронизация БЗ: полностью синхронная (без asyncio.run внутри PTB event loop)
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+from openai import OpenAI
+
 from bot.yandex_client import list_files, download_to_bytes
 from bot.db.models import KbDocument, KbChunk
 from bot.settings import load_settings
-from bot.openai_helper import embed
 from bot.utils.parsers import extract_text_from_bytes
 from bot.utils.text import chunk_text
+
 _settings = load_settings()
 
+def _embed_sync(chunks: list[str]) -> list[list[float]]:
+    if not chunks:
+        return []
+    client = OpenAI(api_key=_settings.openai_api_key)
+    resp = client.embeddings.create(model=_settings.embedding_model, input=chunks)
+    return [d.embedding for d in resp.data]
+
 def sync_kb(session: Session):
-    files=list_files(_settings.yandex_root_path)
-    updated=0; skipped=0
+    files = list_files(_settings.yandex_root_path)
+    updated = 0; skipped = 0
     for f in files:
         path=f['path']; etag=f.get('etag'); mime=f.get('mime',''); size=int(f.get('size') or 0)
         doc=session.execute(select(KbDocument).where(KbDocument.path==path)).scalar_one_or_none()
@@ -21,10 +33,7 @@ def sync_kb(session: Session):
         chunks = chunk_text(text, _settings.chunk_size, _settings.chunk_overlap)
         if not chunks:
             continue
-        import asyncio
-        async def _do():
-            return await embed(chunks)
-        embs = asyncio.get_event_loop().run_until_complete(_do())
+        embs = _embed_sync(chunks)
         if doc is None:
             doc=KbDocument(path=path, etag=etag, mime=mime, bytes=size, is_active=True); session.add(doc); session.flush()
         else:
@@ -36,14 +45,11 @@ def sync_kb(session: Session):
 
 # --- совместимость со старым API бота ---
 def sync_all(SessionLocal, settings=None):
-    """Обёртка для telegram_bot.kb_sync — возвращает (updated_docs, total_chunks)."""
-    from sqlalchemy import func, select
     with SessionLocal() as s:
-        info = sync_kb(s)  # твоя основная функция
+        info = sync_kb(s)
         updated = int(info.get("updated", 0))
         total_chunks = int(s.execute(select(func.count()).select_from(KbChunk)).scalar() or 0)
         return updated, total_chunks
 
 def sync_from_yandex(SessionLocal, settings=None):
-    """Алиас для совместимости."""
     return sync_all(SessionLocal, settings)
