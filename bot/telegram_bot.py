@@ -1,10 +1,9 @@
+
 # bot/telegram_bot.py
 from __future__ import annotations
 
-# == БАЗОВЫЕ ИМПОРТЫ ==
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import re
@@ -12,7 +11,7 @@ import sys
 import tempfile
 from datetime import datetime
 from io import BytesIO
-from typing import List, Tuple
+from typing import List
 from urllib.parse import urlparse
 
 import tiktoken
@@ -49,9 +48,7 @@ from bot.db.session import SessionLocal  # engine подтягивается ч�
 
 log = logging.getLogger(__name__)
 settings = load_settings()
-
-# OpenAI клиент
-_OA = OpenAI(api_key=(getattr(settings, "openai_api_key", None) or getattr(settings, "OPENAI_API_KEY", None)))
+_OA = OpenAI(api_key=settings.openai_api_key)
 
 # ---------- SINGLETON LOCK (исключаем два параллельных poller-а) ----------
 import psycopg2
@@ -63,12 +60,12 @@ def _ensure_single_instance() -> None:
     global _singleton_conn
     if _singleton_conn is not None:
         return
-    dsn = getattr(settings, "database_url", None) or getattr(settings, "DATABASE_URL", None)
+    dsn = settings.database_url
     if not dsn:
         log.warning("DATABASE_URL не задан — singleton-lock пропущен (риск Conflict).")
         return
     try:
-        key_src = f"{dsn}|{getattr(settings,'telegram_bot_token',None) or getattr(settings,'TELEGRAM_BOT_TOKEN',None)}"
+        key_src = f"{dsn}|{settings.telegram_bot_token}"
         lock_key = int(hashlib.sha1(key_src.encode("utf-8")).hexdigest()[:15], 16) % (2**31)
         _singleton_conn = psycopg2.connect(dsn)
         _singleton_conn.autocommit = True
@@ -112,8 +109,7 @@ async def _send_long(m, text: str):
 
 def _is_admin(tg_id: int) -> bool:
     try:
-        raw = getattr(settings, "admin_user_ids", None) or getattr(settings, "ADMIN_USER_IDS", "")
-        ids = [int(x.strip()) for x in str(raw).split(",") if x.strip()]
+        ids = [int(x.strip()) for x in (settings.admin_user_ids or "").split(",") if x.strip()]
         return tg_id in ids
     except Exception:
         return False
@@ -139,7 +135,7 @@ def _create_new_dialog_for_tg(db, tg_id: int) -> int:
     did = db.execute(sa_text("""
         INSERT INTO dialogs (user_id, title, style, model, is_deleted, created_at)
         VALUES (:u, :t, 'pro', :m, FALSE, now()) RETURNING id
-    """), {"u": uid, "t": title, "m": (getattr(settings,"openai_model",None) or getattr(settings,"OPENAI_MODEL","gpt-4o-mini"))}).scalar()
+    """), {"u": uid, "t": title, "m": settings.openai_model}).scalar()
     db.commit()
     return int(did)
 
@@ -162,13 +158,12 @@ def _save_message(db, dialog_id: int, role: str, content: str):
         INSERT INTO messages (dialog_id, role, content, tokens)
         VALUES (:d,:r,:c,:t)
     """), {"d": dialog_id, "r": role, "c": content, "t": toks})
-    # Обновим last_message_at
     db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": dialog_id})
     db.commit()
 
 # ---------- OpenAI / RAG ----------
 def _get_embedding_model() -> str:
-    return getattr(settings, "embedding_model", None) or getattr(settings, "OPENAI_EMBEDDING_MODEL", None) or "text-embedding-3-large"
+    return settings.embedding_model
 
 def _embed_query(text: str) -> List[float]:
     resp = _OA.embeddings.create(model=_get_embedding_model(), input=[text])
@@ -195,12 +190,6 @@ def _kb_embedding_column_kind(db) -> str:
     return "none"
 
 def _vec_literal(vec: List[float]) -> tuple[dict, str]:
-    arr = "[" + ","join(f"{x:.6f}" for x in (vec or [])) + "]"  # noqa
-    # ОШИБКА ↑: исправим ниже правильной реализацией
-    return {"q": arr}, "CAST(:q AS vector)"
-
-# Исправленная версия (оставляем обе, но используем правильную)
-def _vec_literal_fixed(vec: List[float]) -> tuple[dict, str]:
     arr = "[" + ",".join(f"{x:.6f}" for x in (vec or [])) + "]"
     return {"q": arr}, "CAST(:q AS vector)"
 
@@ -208,7 +197,7 @@ def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict
     if _kb_embedding_column_kind(db) != "vector":
         return []
     q = _embed_query(question)
-    params, qexpr = _vec_literal_fixed(q)
+    params, qexpr = _vec_literal(q)
     rows = db.execute(sa_text(f"""
         SELECT c.content, c.meta, d.path
         FROM kb_chunks c
@@ -219,13 +208,6 @@ def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict
         LIMIT :k
     """), dict(params, did=dialog_id, k=k)).mappings().all()
     return [dict(r) for r in rows]
-
-_STYLE_EXAMPLES = {
-    "pro":    "Кратко, по шагам, чек-лист. Без воды.",
-    "expert": "Глубоко и обстоятельно: причины/следствия, альтернативы, ссылки.",
-    "user":   "Просто, с примерами из жизни, без жаргона.",
-    "ceo":    "Фокус на ценности, рисках, сроках, ROI и решениях.",
-}
 
 def _build_prompt_with_style(ctx_blocks: List[str], user_q: str, dialog_style: str) -> str:
     style_map = {
@@ -386,7 +368,6 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text(f"✅ Создан диалог #{did}")
         if data.startswith("dlg:open:"):
             did = int(data.split(":")[-1])
-            # активируем диалог в user_data
             context.user_data["active_dialog_id"] = did
             return await q.edit_message_text(f"Открыт диалог #{did}")
         if data.startswith("dlg:rename:"):
@@ -412,7 +393,7 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("dlg:delete:"):
             did = int(data.split(":")[-1])
             with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"d": did})
+                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"id": did})
                 db.commit()
             return await q.edit_message_text(f"Диалог #{did} удалён")
     except Exception:
@@ -431,7 +412,6 @@ async def dialog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         did = int(args[0])
     except Exception:
         return await m.reply_text("Использование: /dialog <id>")
-    # просто сохраняем в user_data
     context.user_data["active_dialog_id"] = did
     await m.reply_text(f"✅ Активный диалог: {did}")
     return await stats(update, context)
@@ -450,7 +430,7 @@ async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def ya_download(path: str) -> bytes:
     import requests
     YA_API = "https://cloud-api.yandex.net/v1/disk"
-    headers = {"Authorization": f"OAuth {getattr(settings,'yandex_disk_token',None) or getattr(settings,'YANDEX_DISK_TOKEN','')}"}
+    headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
     r = requests.get(f"{YA_API}/resources/download", headers=headers, params={"path": path}, timeout=60)
     r.raise_for_status()
     href = (r.json() or {}).get("href")
@@ -463,7 +443,7 @@ def ya_download(path: str) -> bytes:
 def _ya_list_files(root_path: str):
     import requests
     YA_API = "https://cloud-api.yandex.net/v1/disk"
-    headers = {"Authorization": f"OAuth {getattr(settings,'yandex_disk_token',None) or getattr(settings,'YANDEX_DISK_TOKEN','')}"}
+    headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
     out = []
     limit, offset = 200, 0
     while True:
@@ -508,7 +488,6 @@ def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
             except Exception:
                 out.append("")
         txt = "\n".join(out)
-    # fallback pdfminer если пусто
     if not txt.strip():
         try:
             from pdfminer.high_level import extract_text
@@ -535,7 +514,6 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await m.reply_text("⛔ Доступ только админам.")
     await m.reply_text("🔄 Синхронизация запущена...")
     try:
-        # Пробуем найти entrypoint в bot/knowledge_base/indexer.py
         import inspect
         from bot.knowledge_base import indexer
         entry = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT", None)
@@ -566,7 +544,16 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception: pass
 
         res = await asyncio.to_thread(_call)
-        return await m.reply_text("✅ Синхронизация завершена." if res is None else f"✅ Готово: {res}")
+        if isinstance(res, dict):
+            upd = res.get("updated"); skp = res.get("skipped"); tot = res.get("total")
+            msg = "✅ Синхронизация завершена."
+            if any(v is not None for v in (upd, skp, tot)):
+                msg += f" Обновлено: {upd or 0}, пропущено: {skp or 0}, всего: {tot or 0}."
+            return await m.reply_text(msg)
+        elif isinstance(res, (tuple, list)) and len(res) >= 2:
+            return await m.reply_text(f"✅ Готово: документов {res[0]}, чанков {res[1]}")
+        else:
+            return await m.reply_text("✅ Синхронизация завершена.")
     except Exception as e:
         log.exception("kb_sync failed")
         return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
@@ -584,7 +571,6 @@ async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await m.reply_text("⚠ Ошибка kb_diag")
 
 async def kb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Простейшее меню БЗ. (Поддержка расширенного UI может быть в отдельном модуле.)"""
     m = update.effective_message or update.message
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:sync")],
@@ -614,10 +600,22 @@ async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await m.reply_text("Использование: /web <запрос>")
     query = parts[1].strip()
-    await m.reply_text(
-        "🔎 Веб-поиск пока отключён в этой сборке (ключи внешнего поиска не заданы).\n"
-        "Я могу ответить своими знаниями или попробовать найти в БЗ через /kb."
-    )
+
+    # Если есть ключи и модуль web_search — используем реальный поиск
+    try:
+        from bot.web_search import web_search_digest, sources_footer
+        answer, sources = await web_search_digest(query, max_results=6, openai_api_key=settings.openai_api_key)
+        footer = ("\n\nИсточники:\n" + sources_footer(sources)) if sources else ""
+        await _send_long(m, (answer or "Готово.") + footer)
+        if sources:
+            buttons = [[InlineKeyboardButton(f"[{i+1}] {urlparse(s['url']).netloc}", url=s['url'])] for i, s in enumerate(sources)]
+            await m.reply_text("Открыть источники:", reply_markup=InlineKeyboardMarkup(buttons), disable_web_page_preview=True)
+    except Exception as e:
+        await m.reply_text(
+            "🔎 Веб-поиск пока отключён или недоступен (нет ключей Tavily/SerpAPI/Bing).\n"
+            "Я могу ответить своими знаниями или найти в БЗ через /kb.\n"
+            f"Детали: {e}"
+        )
 
 # ---- СТАТИСТИКА ----
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -627,9 +625,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             did = context.user_data.get("active_dialog_id") or _get_active_dialog_id(db, update.effective_user.id)
             if not did:
                 return await m.reply_text("Нет активного диалога. Создайте через /dialog_new или выберите /dialogs.")
+
             row = db.execute(sa_text(
                 "SELECT id, title, model, style, created_at, last_message_at FROM dialogs WHERE id=:d"
             ), {"d": did}).first()
+
             msgs = db.execute(sa_text("SELECT count(*) FROM messages WHERE dialog_id=:d"), {"d": did}).scalar() or 0
             docs = db.execute(sa_text("""
                 SELECT d.path
@@ -644,11 +644,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """), {"tg": update.effective_user.id}).scalar() or 0
 
         title = row[1] if row else "-"
-        model = row[2] if row else (getattr(settings,"openai_model",None) or "gpt-4o-mini")
+        model = row[2] if row else settings.openai_model
         style = row[3] if row else "pro"
         created = row[4] if row else "-"
         changed = row[5] if row else "-"
-
         doc_list = "\n".join(f"• {r[0]}" for r in docs) or "—"
 
         text = (
@@ -672,19 +671,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with SessionLocal() as db:
             tg = update.effective_user.id
-            uid = _ensure_user(db, tg)
+            _ensure_user(db, tg)
             did = context.user_data.get("active_dialog_id") or _get_active_dialog_id(db, tg) or _create_new_dialog_for_tg(db, tg)
 
-            # узнаём модель/стиль из диалога
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
-            model = (row[0] if row and row[0] else (getattr(settings,"openai_model",None) or "gpt-4o-mini"))
+            model = (row[0] if row and row[0] else settings.openai_model)
             style = (row[1] if row and row[1] else "pro")
 
-            # сохраняем сообщение пользователя
             _save_message(db, did, "user", text)
 
-            # RAG: достаём чанки
-            top_k = int(getattr(settings,"kb_top_k",None) or getattr(settings,"KB_TOP_K",5))
+            top_k = int(settings.kb_top_k)
             rows = _retrieve_chunks(db, did, text, k=top_k)
 
         ctx_blocks = [r["content"] for r in rows]
@@ -697,7 +693,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await _send_long(m, final)
 
-        # сохраним ответ ассистента
         with SessionLocal() as db:
             _save_message(db, did, "assistant", final)
 
@@ -717,14 +712,13 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ogg_path = os.path.join(tmpdir, "voice.ogg")  # важно расширение
         await file.download_to_drive(ogg_path)
 
-        transcribe_model = getattr(settings, "openai_transcribe_model", None) or getattr(settings, "OPENAI_TRANSCRIBE_MODEL", "whisper-1")
+        transcribe_model = getattr(settings, "openai_transcribe_model", "whisper-1")
         with open(ogg_path, "rb") as f:
             tr = _OA.audio.transcriptions.create(model=transcribe_model, file=f)
         recognized = (getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or "").strip()
         if not recognized:
             return await m.reply_text("⚠ Не удалось распознать речь. Скажите ещё раз, пожалуйста.")
 
-        # прокинем в on_text
         update.effective_message.text = recognized
         return await on_text(update, context)
 
@@ -761,7 +755,7 @@ async def migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await (update.effective_message or update.message).reply_text("🔧 Запускаю миграции...")
         from alembic.config import Config
         from alembic import command
-        os.environ["DATABASE_URL"] = getattr(settings,"database_url",None) or getattr(settings,"DATABASE_URL","")
+        os.environ["DATABASE_URL"] = settings.database_url
         cfg = Config("alembic.ini")
         command.upgrade(cfg, "head")
         await (update.effective_message or update.message).reply_text("✅ Миграции применены.")
@@ -780,7 +774,6 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
             def has(table: str) -> bool:
                 return bool(db.execute(sa_text("SELECT to_regclass(:t)"), {"t": f"public.{table}"}).scalar())
 
-            # Базовые
             if not has("users"):
                 db.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS users (
@@ -820,7 +813,6 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """))
                 db.commit(); created.append("messages")
 
-            # БЗ
             if not has("kb_documents"):
                 db.execute(sa_text("""
                     CREATE TABLE IF NOT EXISTS kb_documents (
@@ -836,7 +828,6 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """))
                 db.commit(); created.append("kb_documents")
             if not has("kb_chunks"):
-                # если нет vector — всё равно создадим без ivfflat (минимум)
                 try:
                     db.execute(sa_text("CREATE EXTENSION IF NOT EXISTS vector;"))
                     db.commit()
@@ -926,8 +917,7 @@ async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- СБОРКА ПРИЛОЖЕНИЯ ----------
 def build_app() -> Application:
     _ensure_single_instance()
-    token = getattr(settings, "telegram_bot_token", None) or getattr(settings, "TELEGRAM_BOT_TOKEN", None)
-    app = ApplicationBuilder().token(token).post_init(_post_init).build()
+    app = ApplicationBuilder().token(settings.telegram_bot_token).post_init(_post_init).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start))
