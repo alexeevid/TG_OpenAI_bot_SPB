@@ -151,15 +151,67 @@ def _get_active_dialog_id(db, tg_id: int) -> int | None:
     """), {"tg": tg_id}).first()
     return int(row[0]) if row else None
 
-def _save_message(db, dialog_id: int, role: str, content: str):
-    enc = tiktoken.get_encoding("cl100k_base")
-    toks = len(enc.encode(content or ""))
-    db.execute(sa_text("""
-        INSERT INTO messages (dialog_id, role, content, tokens)
-        VALUES (:d,:r,:c,:t)
-    """), {"d": dialog_id, "r": role, "c": content, "t": toks})
-    db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": dialog_id})
+# telegram_bot.py
+from sqlalchemy import text as sa_text
+
+def _save_message(db, dialog_id: int, role: str, body: str) -> None:
+    # определим, какая колонка есть в messages
+    col = db.execute(sa_text("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name='messages' AND column_name IN ('content','text')
+        ORDER BY CASE column_name WHEN 'content' THEN 1 ELSE 2 END
+        LIMIT 1
+    """)).scalar()
+    if not col:
+        col = 'content'  # по умолчанию
+
+    sql = sa_text(f"""
+        INSERT INTO messages (dialog_id, role, {col})
+        VALUES (:d, :r, :c)
+    """)
+    db.execute(sql, {"d": dialog_id, "r": role, "c": body})
+    db.execute(sa_text("UPDATE dialogs SET last_message_at = now() WHERE id = :d"), {"d": dialog_id})
     db.commit()
+
+# telegram_bot.py
+async def _process_user_text(update, context, text: str):
+    m = update.effective_message or update.message
+    text = (text or "").strip()
+    if not text:
+        return await m.reply_text("Сообщение пустое.")
+
+    with SessionLocal() as db:
+        # активный диалог пользователя
+        did = _get_active_dialog_id(db, update.effective_user.id) or _ensure_dialog(db, _ensure_user(db, update.effective_user.id))
+        # сохраняем user-сообщение
+        _save_message(db, did, "user", text)
+
+        # готовим контекст из БЗ
+        k = getattr(settings, "kb_top_k", getattr(settings, "KB_TOP_K", 5))
+        chunks = _retrieve_chunks(db, did, text, k=k)  # безопасно возвращает [] если нет векторной колонки
+        ctx = [c.get("content","") for c in chunks][:k]
+
+        # стиль и модель
+        row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
+        model = (row[0] or settings.openai_model) if row else settings.openai_model
+        style = (row[1] or "pro") if row else "pro"
+
+    # строим промпт и спрашиваем модель (с автопродолжением)
+    prompt = _build_prompt_with_style(ctx, text, style)
+    answer = await asyncio.to_thread(
+        _chat_full,
+        model,
+        [{"role": "system", "content": "RAG assistant"},
+         {"role": "user", "content": prompt}],
+        0.3
+    )
+
+    # отсылаем длинный ответ частями
+    await _send_long(m, answer + _format_citations(chunks))
+
+    # сохраняем ответ ассистента
+    with SessionLocal() as db:
+        _save_message(db, did, "assistant", answer)
 
 # ---------- OpenAI / RAG ----------
 def _get_embedding_model() -> str:
@@ -301,54 +353,38 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---- Диалоги: список/новый/переключение/экспорт/переименование ----
 KB_PAGE_SIZE = 10
 
+# telegram_bot.py
 async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
-    page = int((context.user_data.get("dlg_page") or 1))
     try:
         with SessionLocal() as db:
             uid = _ensure_user(db, update.effective_user.id)
-            total = db.execute(sa_text("SELECT count(*) FROM dialogs WHERE user_id=:u AND is_deleted=FALSE"), {"u": uid}).scalar() or 0
-            if total == 0:
-                kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")]])
-                return await m.reply_text("Диалогов нет.", reply_markup=kb)
-
-            pages = max(1, (total + KB_PAGE_SIZE - 1) // KB_PAGE_SIZE)
-            page = max(1, min(page, pages))
-            offset = (page - 1) * KB_PAGE_SIZE
-
             rows = db.execute(sa_text("""
-                SELECT id, title, model, style, created_at, last_message_at
-                FROM dialogs
-                WHERE user_id=:u AND is_deleted=FALSE
-                ORDER BY COALESCE(last_message_at, created_at) DESC
-                LIMIT :lim OFFSET :off
-            """), {"u": uid, "lim": KB_PAGE_SIZE, "off": offset}).all()
+                SELECT d.id, d.title, d.created_at, d.last_message_at
+                FROM dialogs d
+                WHERE d.user_id = :u AND d.is_deleted = FALSE
+                ORDER BY COALESCE(d.last_message_at, d.created_at) DESC, d.id DESC
+                LIMIT 50
+            """), {"u": uid}).all()
 
-        buttons = []
-        for (did, title, model, style, created_at, last_msg) in rows:
-            label = f"{did} | {title or '(без названия)'}"
-            buttons.append([
-                InlineKeyboardButton(label, callback_data=f"dlg:open:{did}"),
+        kb_rows = []
+        for (did, title, *_rest) in rows:
+            row = [
+                InlineKeyboardButton(title or f"Диалог {did}", callback_data=f"dlg:open:{did}"),
                 InlineKeyboardButton("✏️", callback_data=f"dlg:rename:{did}"),
                 InlineKeyboardButton("📤", callback_data=f"dlg:export:{did}"),
                 InlineKeyboardButton("🗑️", callback_data=f"dlg:delete:{did}"),
-            ])
+            ]
+            kb_rows.append(row)
 
-        nav = []
-        if pages > 1:
-            if page > 1:
-                nav.append(InlineKeyboardButton("« Назад", callback_data=f"dlg:page:{page-1}"))
-            nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="dlg:nop"))
-            if page < pages:
-                nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"dlg:page:{page+1}"))
+        # «создать новый диалог»
+        kb_rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")])
 
-        foot = [InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")]
-        kb = InlineKeyboardMarkup(buttons + ([nav] if nav else []) + [[b] for b in [foot]])
-
-        await m.reply_text("Мои диалоги:", reply_markup=kb)
+        await m.reply_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(kb_rows))
     except Exception:
         log.exception("dialogs failed")
         await m.reply_text("⚠ Ошибка /dialogs")
+
 
 async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -362,10 +398,12 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["dlg_page"] = page
             await q.message.delete()
             return await dialogs(update, context)
+        # внутри dialog_cb
         if data == "dlg:new":
             with SessionLocal() as db:
                 did = _create_new_dialog_for_tg(db, update.effective_user.id)
-            return await q.edit_message_text(f"✅ Создан диалог #{did}")
+            await q.edit_message_text(f"✅ Создан диалог #{did}")
+            return
         if data.startswith("dlg:open:"):
             did = int(data.split(":")[-1])
             context.user_data["active_dialog_id"] = did
@@ -700,31 +738,45 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("on_text failed")
         await m.reply_text("⚠ Не удалось обработать сообщение. Попробуйте ещё раз.")
 
+# telegram_bot.py
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Голос → Whisper → как on_text в активном диалоге."""
+    """Голос → Whisper → как обычный текстовый запрос в активный диалог."""
     m = update.effective_message or update.message
-    voice = m.voice or m.audio
-    if not voice:
+    v = m.voice or m.audio
+    if not v:
         return await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
-    try:
-        file = await context.bot.get_file(voice.file_id)
-        tmpdir = tempfile.mkdtemp(prefix="tg_voice_")
-        ogg_path = os.path.join(tmpdir, "voice.ogg")  # важно расширение
-        await file.download_to_drive(ogg_path)
 
-        transcribe_model = getattr(settings, "openai_transcribe_model", "whisper-1")
-        with open(ogg_path, "rb") as f:
-            tr = _OA.audio.transcriptions.create(model=transcribe_model, file=f)
+    note = await m.reply_text("🎙️ Распознаю голос…")
+    try:
+        # 1) скачать файл в .ogg
+        import tempfile, pathlib
+        f = await context.bot.get_file(v.file_id)
+        tmpdir = tempfile.mkdtemp(prefix="tg_voice_")
+        ogg = str(pathlib.Path(tmpdir) / "voice.ogg")
+        await f.download_to_drive(ogg)
+
+        # 2) отправить в OpenAI Whisper
+        from openai import OpenAI
+        client = OpenAI(api_key=settings.openai_api_key)
+        model_name = getattr(settings, "openai_transcribe_model", None) \
+                     or getattr(settings, "OPENAI_TRANSCRIBE_MODEL", None) \
+                     or "whisper-1"
+        with open(ogg, "rb") as fp:
+            tr = client.audio.transcriptions.create(model=model_name, file=fp)
         recognized = (getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or "").strip()
         if not recognized:
             return await m.reply_text("⚠ Не удалось распознать речь. Скажите ещё раз, пожалуйста.")
 
-        update.effective_message.text = recognized
-        return await on_text(update, context)
-
+        # 3) дальше — как обычный текст
+        return await _process_user_text(update, context, recognized)
     except Exception:
         log.exception("on_voice failed")
         return await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
+    finally:
+        try:
+            await note.delete()
+        except Exception:
+            pass
 
 # ---- СЕРВИСНЫЕ ----
 async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
