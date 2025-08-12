@@ -4,6 +4,8 @@
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from openai import OpenAI
+from sqlalchemy import text as sa_text
+from datetime import datetime
 
 from bot.yandex_client import list_files, download_to_bytes
 from bot.db.models import KbDocument, KbChunk
@@ -53,3 +55,21 @@ def sync_all(SessionLocal, settings=None):
 
 def sync_from_yandex(SessionLocal, settings=None):
     return sync_all(SessionLocal, settings)
+
+def upsert_kb_document(session, *, path: str, mime: str, bytes_: int, etag: str, pages: int | None):
+    """
+    Надёжный upsert в kb_documents. Никогда не передаёт updated_at=None.
+    """
+    sql = sa_text("""
+        INSERT INTO kb_documents (path, etag, mime, pages, bytes, updated_at, is_active)
+        VALUES (:p, :e, :m, :pg, :b, now(), TRUE)
+        ON CONFLICT (path) DO UPDATE
+        SET etag = EXCLUDED.etag,
+            mime = EXCLUDED.mime,
+            pages = EXCLUDED.pages,
+            bytes = EXCLUDED.bytes,
+            updated_at = now(),
+            is_active = TRUE
+        RETURNING id
+    """)
+    return session.execute(sql, {"p": path, "e": etag, "m": mime, "pg": pages, "b": bytes_}).scalar()
