@@ -84,6 +84,11 @@ log = logging.getLogger(__name__)
 settings = load_settings()
 _oa_client = OpenAI(api_key=settings.openai_api_key)
 
+# /kb — командный алиас к уже существующей функции kb()
+async def kb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias для /kb: перенаправляет на основное меню БЗ."""
+    return await kb(update, context)
+
 # --- Авто-миграция при старте (если нет таблиц) ---
 def apply_migrations_if_needed(force: bool = False) -> None:
     """
