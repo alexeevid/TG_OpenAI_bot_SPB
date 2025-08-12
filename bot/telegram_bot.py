@@ -217,6 +217,52 @@ async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+# /dialog <id> — сделать диалог активным
+async def dialog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    args = context.args or []
+
+    # если id не передан — просто покажем список диалогов
+    if not args:
+        return await dialogs(update, context)
+
+    # парсим id
+    try:
+        did = int(args[0])
+    except Exception:
+        return await m.reply_text("Использование: /dialog <id>")
+
+    try:
+        with SessionLocal() as db:
+            # проверяем, что диалог принадлежит пользователю
+            row = db.execute(sa_text("""
+                SELECT d.id
+                FROM dialogs d
+                JOIN users u ON u.id = d.user_id
+                WHERE u.tg_user_id = :tg AND d.id = :did
+                LIMIT 1
+            """), {"tg": update.effective_user.id, "did": did}).fetchone()
+
+            if not row:
+                return await m.reply_text("⚠ Диалог не найден или не принадлежит вам.")
+
+            # если в проекте есть хелпер — используем его
+            try:
+                _set_active_dialog_id  # type: ignore
+                _set_active_dialog_id(db, update.effective_user.id, did)  # noqa
+            except NameError:
+                # запасной путь: держим активный диалог в user_data
+                context.user_data["active_dialog_id"] = did
+
+            await m.reply_text(f"✅ Активный диалог: {did}")
+            # опционально сразу показать /stats
+            return await stats(update, context)
+
+    except Exception:
+        log.exception("dialog_cmd failed")
+        return await m.reply_text("⚠ Не удалось переключить диалог. Попробуйте ещё раз.")
+
+
 async def _send_long(m, text: str):
     """Отправляет текст пачками, если он длиннее лимита Telegram."""
     for chunk in _split_for_tg(text):
@@ -2143,16 +2189,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("rag_diag", rag_diag))
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
-
-    # ⚠️ Оставьте только ОДИН хендлер для /web:
-    app.add_handler(CommandHandler("web", web_cmd))  # ← этот
-    # app.add_handler(CommandHandler("web", cmd_web))  # ← ЭТОТ УДАЛИТЬ, если он у вас есть дубликатом
-
+    app.add_handler(CommandHandler("web", web_cmd))
     # админки по БЗ
     app.add_handler(CommandHandler("kb_chunks", kb_chunks_cmd))
     app.add_handler(CommandHandler("kb_reindex", kb_reindex))
     app.add_handler(CommandHandler("kb_sync", kb_sync_admin))
-
     # сообщения
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
