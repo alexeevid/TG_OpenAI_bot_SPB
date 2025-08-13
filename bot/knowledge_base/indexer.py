@@ -56,6 +56,10 @@ def sync_all(SessionLocal, settings=None):
 def sync_from_yandex(SessionLocal, settings=None):
     return sync_all(SessionLocal, settings)
 
+# indexer.py
+from sqlalchemy import text as sa_text
+from datetime import datetime
+
 def upsert_kb_document(session, *, path: str, mime: str, bytes_: int, etag: str, pages: int | None):
     """
     Надёжный upsert в kb_documents. Никогда не передаёт updated_at=None.
