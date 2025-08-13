@@ -217,45 +217,65 @@ def _save_message(db, dialog_id: int, role: str, text: str | None, content: str 
     db.commit()
 
 
-# telegram_bot.py
+# --- helpers ---
+def _is_nonempty(s: str | None) -> bool:
+    return bool(s and s.strip())
+
+async def _maybe_await(v):
+    # чтобы не падать, если _chat_* вдруг синхронная функция
+    import asyncio
+    if asyncio.iscoroutine(v):
+        return await v
+    return v
+
+# --- main ---
 async def _process_user_text(update, context, text: str):
-    m = update.effective_message or update.message
-    text = (text or "").strip()
-    if not text:
-        return await m.reply_text("Сообщение пустое.")
+    """
+    Единая точка обработки пользовательского текста (вкл. голос -> текст).
+    - сохраняет сообщение в БД
+    - выбирает режим (RAG / обычный)
+    - дожидается генерации (await!)
+    - отправляет длинные ответы частями
+    """
+    m = update.effective_message
+    user = update.effective_user
 
-    with SessionLocal() as db:
-        # активный диалог пользователя
-        did = _get_active_dialog_id(db, update.effective_user.id) or _ensure_dialog(db, _ensure_user(db, update.effective_user.id))
-        # сохраняем user-сообщение
-        _save_message(db, did, "user", text)
+    db = session_factory()  # как у тебя создаётся сессия (Session/ScopedSession) — оставить прежнее имя
+    try:
+        # 1) Гарантируем активный диалог и сохраняем сообщение пользователя
+        did = ensure_active_dialog(db, user.id)           # используем твой существующий helper (имена не менял)
+        _save_message(db, did, "user", text)              # как у тебя уже было
 
-        # готовим контекст из БЗ
-        k = getattr(settings, "kb_top_k", getattr(settings, "KB_TOP_K", 5))
-        chunks = _retrieve_chunks(db, did, text, k=k)  # безопасно возвращает [] если нет векторной колонки
-        ctx = [c.get("content","") for c in chunks][:k]
+        # 2) Достаём состояние диалога: модель/стиль/привязанные документы и kb_top_k
+        state = get_dialog_state(db, did)                 # твой helper: {model, style, kb_docs, kb_top_k}
+        kb_docs   = state.get("kb_docs") or []
+        kb_top_k  = int(state.get("kb_top_k") or getattr(settings, "KB_TOP_K", 5))
 
-        # стиль и модель
-        row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
-        model = (row[0] or settings.openai_model) if row else settings.openai_model
-        style = (row[1] or "pro") if row else "pro"
+        # 3) Генерация ответа
+        if kb_docs:
+            # RAG-ветка: обязательно ждём корутину
+            resp = _chat_rag(db=db, dialog_id=did, user_text=text, kb_doc_ids=kb_docs, top_k=kb_top_k)
+            answer, used_chunks = await _maybe_await(resp)
+            # формируем «Источники: …»
+            tail = _format_citations(used_chunks) if used_chunks else ""
+            full_answer = f"{answer}{tail}"
+        else:
+            # Обычная ветка: тоже ждём
+            resp = _chat_full(db=db, dialog_id=did, user_text=text)
+            answer = await _maybe_await(resp)
+            full_answer = answer
 
-    # строим промпт и спрашиваем модель (с автопродолжением)
-    prompt = _build_prompt_with_style(ctx, text, style)
-    answer = await asyncio.to_thread(
-        _chat_full,
-        model,
-        [{"role": "system", "content": "RAG assistant"},
-         {"role": "user", "content": prompt}],
-        0.3
-    )
+        # 4) Отправляем частями (чтобы ответы не «обрубались»)
+        await _send_long(m, full_answer)
 
-    # отсылаем длинный ответ частями
-    await _send_long(m, answer + _format_citations(chunks))
+        # 5) Логируем ответ ассистента в БД
+        _save_message(db, did, "assistant", full_answer)
 
-    # сохраняем ответ ассистента
-    with SessionLocal() as db:
-        _save_message(db, did, "assistant", answer)
+    except Exception:
+        log.exception("process_user_text failed")
+        await m.reply_text("⚠ Что-то пошло не так при генерации ответа. Попробуйте ещё раз.")
+    finally:
+        db.close()
 
 # ---------- OpenAI / RAG ----------
 def _get_embedding_model() -> str:
@@ -648,13 +668,29 @@ async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("kb_diag failed")
         await m.reply_text("⚠ Ошибка kb_diag")
 
-async def kb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message or update.message
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:sync")],
-        [InlineKeyboardButton("📊 Диагностика", callback_data="kb:diag")],
-    ])
-    await m.reply_text("Меню БЗ:", reply_markup=kb)
+async def kb_cmd(update, context):
+    m = update.effective_message
+    db = session_factory()
+    try:
+        # считаем актуальные цифры
+        doc_cnt   = db.execute(sa_text("SELECT count(*) FROM kb_documents WHERE is_active = true")).scalar_one()
+        chunk_cnt = db.execute(sa_text("SELECT count(*) FROM kb_chunks")).scalar_one()
+        link_cnt  = db.execute(sa_text("SELECT count(*) FROM dialog_kb_links")).scalar_one()
+
+        # отправляем «шапку»
+        await m.reply_text(f"БЗ: документов активных — {doc_cnt}, чанков — {chunk_cnt}, привязок к диалогам — {link_cnt}")
+
+        # клавиатура
+        kb = [
+            [InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")],
+            [InlineKeyboardButton("📊 Диагностика",   callback_data="kb:diag")],
+        ]
+        await m.reply_text("Меню БЗ:", reply_markup=InlineKeyboardMarkup(kb))
+    except Exception:
+        log.exception("kb_cmd failed")
+        await m.reply_text("⚠ Ошибка /kb")
+    finally:
+        db.close()
 
 async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -778,40 +814,44 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("on_text failed")
         await m.reply_text("⚠ Не удалось обработать сообщение. Попробуйте ещё раз.")
 
-# telegram_bot.py
-async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message or update.message
+async def on_voice(update, context):
+    m = update.effective_message
     v = m.voice or m.audio
     if not v:
         return await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
 
-    note = await m.reply_text("🎙️ Распознаю голос…")
     try:
-        import tempfile, pathlib
-        f = await context.bot.get_file(v.file_id)
-        tmpdir = tempfile.mkdtemp(prefix="tg_voice_")
-        ogg = str(pathlib.Path(tmpdir) / "voice.ogg")
-        await f.download_to_drive(ogg)
+        # 1) Скачиваем в .ogg (у телеги голос как правило OGG/OPUS)
+        ogg = await v.get_file()
+        tmp_path = Path(tempfile.mkstemp(suffix=".ogg")[1])
+        await ogg.download_to_drive(str(tmp_path))
 
-        from openai import OpenAI
-        client = OpenAI(api_key=settings.openai_api_key)
-        model_name = getattr(settings, "openai_transcribe_model", None) \
-                     or getattr(settings, "OPENAI_TRANSCRIBE_MODEL", None) \
-                     or "whisper-1"
-        with open(ogg, "rb") as fp:
-            tr = client.audio.transcriptions.create(model=model_name, file=fp)
-
-        text = (getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or "").strip()
-        if not text:
+        # 2) Транскрибируем
+        with open(tmp_path, "rb") as fh:
+            # оставляю твой клиент и модель, только без экзотики:
+            tr = openai.audio.transcriptions.create(
+                model = getattr(settings, "ASR_MODEL", "gpt-4o-transcribe"),
+                file  = fh,
+                # можно добавить language="ru" если хочешь принудительно
+            )
+        text = (tr.text or "").strip()
+        if not _is_nonempty(text):
             return await m.reply_text("⚠ Не удалось распознать речь. Скажите ещё раз, пожалуйста.")
 
+        # 3) Отдаём в общий пайплайн (НЕ переписываем m.text!)
         return await _process_user_text(update, context, text)
+
+    except openai.BadRequestError as e:
+        # типичные 400 — неверный формат/битый файл
+        log.error("ASR BadRequest: %s", e, exc_info=True)
+        return await m.reply_text("⚠ Не удалось обработать голосовое (формат/качество). Попробуйте ещё раз.")
     except Exception:
         log.exception("on_voice failed")
         return await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
     finally:
         try:
-            await note.delete()
+            if tmp_path and Path(tmp_path).exists():
+                Path(tmp_path).unlink(missing_ok=True)
         except Exception:
             pass
 
