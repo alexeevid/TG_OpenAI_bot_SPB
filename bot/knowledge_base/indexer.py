@@ -58,22 +58,18 @@ def sync_from_yandex(SessionLocal, settings=None):
 
 # indexer.py
 from sqlalchemy import text as sa_text
-from datetime import datetime
 
 def upsert_kb_document(session, *, path: str, mime: str, bytes_: int, etag: str, pages: int | None):
-    """
-    Надёжный upsert в kb_documents. Никогда не передаёт updated_at=None.
-    """
     sql = sa_text("""
         INSERT INTO kb_documents (path, etag, mime, pages, bytes, updated_at, is_active)
         VALUES (:p, :e, :m, :pg, :b, now(), TRUE)
         ON CONFLICT (path) DO UPDATE
-        SET etag = EXCLUDED.etag,
-            mime = EXCLUDED.mime,
-            pages = EXCLUDED.pages,
-            bytes = EXCLUDED.bytes,
-            updated_at = now(),
-            is_active = TRUE
+          SET etag = EXCLUDED.etag,
+              mime = EXCLUDED.mime,
+              pages = EXCLUDED.pages,
+              bytes = EXCLUDED.bytes,
+              updated_at = now(),
+              is_active = TRUE
         RETURNING id
     """)
     return session.execute(sql, {"p": path, "e": etag, "m": mime, "pg": pages, "b": bytes_}).scalar()
