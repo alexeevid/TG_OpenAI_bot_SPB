@@ -155,22 +155,18 @@ def _get_active_dialog_id(db, tg_id: int) -> int | None:
 from sqlalchemy import text as sa_text
 
 def _save_message(db, dialog_id: int, role: str, body: str) -> None:
-    # определим, какая колонка есть в messages
+    # выбираем существующую колонку
     col = db.execute(sa_text("""
         SELECT column_name FROM information_schema.columns
         WHERE table_name='messages' AND column_name IN ('content','text')
         ORDER BY CASE column_name WHEN 'content' THEN 1 ELSE 2 END
         LIMIT 1
-    """)).scalar()
-    if not col:
-        col = 'content'  # по умолчанию
+    """)).scalar() or 'content'
 
-    sql = sa_text(f"""
-        INSERT INTO messages (dialog_id, role, {col})
-        VALUES (:d, :r, :c)
-    """)
-    db.execute(sql, {"d": dialog_id, "r": role, "c": body})
-    db.execute(sa_text("UPDATE dialogs SET last_message_at = now() WHERE id = :d"), {"d": dialog_id})
+    db.execute(sa_text(f"INSERT INTO messages (dialog_id, role, {col}) VALUES (:d,:r,:c)"),
+               {"d": dialog_id, "r": role, "c": body})
+    db.execute(sa_text("UPDATE dialogs SET last_message_at = now(), updated_at = now() WHERE id = :d"),
+               {"d": dialog_id})
     db.commit()
 
 # telegram_bot.py
@@ -360,7 +356,7 @@ async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with SessionLocal() as db:
             uid = _ensure_user(db, update.effective_user.id)
             rows = db.execute(sa_text("""
-                SELECT d.id, d.title, d.created_at, d.last_message_at
+                SELECT d.id, COALESCE(NULLIF(d.title,''), CONCAT('Диалог ', d.id)) AS title
                 FROM dialogs d
                 WHERE d.user_id = :u AND d.is_deleted = FALSE
                 ORDER BY COALESCE(d.last_message_at, d.created_at) DESC, d.id DESC
@@ -368,16 +364,13 @@ async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """), {"u": uid}).all()
 
         kb_rows = []
-        for (did, title, *_rest) in rows:
-            row = [
-                InlineKeyboardButton(title or f"Диалог {did}", callback_data=f"dlg:open:{did}"),
-                InlineKeyboardButton("✏️", callback_data=f"dlg:rename:{did}"),
-                InlineKeyboardButton("📤", callback_data=f"dlg:export:{did}"),
-                InlineKeyboardButton("🗑️", callback_data=f"dlg:delete:{did}"),
-            ]
-            kb_rows.append(row)
-
-        # «создать новый диалог»
+        for did, title in rows:
+            kb_rows.append([
+                InlineKeyboardButton(title, callback_data=f"dlg:open:{did}"),
+                InlineKeyboardButton("✏️",  callback_data=f"dlg:rename:{did}"),
+                InlineKeyboardButton("📤",  callback_data=f"dlg:export:{did}"),
+                InlineKeyboardButton("🗑️",  callback_data=f"dlg:delete:{did}"),
+            ])
         kb_rows.append([InlineKeyboardButton("➕ Новый диалог", callback_data="dlg:new")])
 
         await m.reply_text("Мои диалоги:", reply_markup=InlineKeyboardMarkup(kb_rows))
@@ -398,7 +391,6 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["dlg_page"] = page
             await q.message.delete()
             return await dialogs(update, context)
-        # внутри dialog_cb
         if data == "dlg:new":
             with SessionLocal() as db:
                 did = _create_new_dialog_for_tg(db, update.effective_user.id)
@@ -740,7 +732,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # telegram_bot.py
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Голос → Whisper → как обычный текстовый запрос в активный диалог."""
     m = update.effective_message or update.message
     v = m.voice or m.audio
     if not v:
@@ -748,14 +739,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     note = await m.reply_text("🎙️ Распознаю голос…")
     try:
-        # 1) скачать файл в .ogg
         import tempfile, pathlib
         f = await context.bot.get_file(v.file_id)
         tmpdir = tempfile.mkdtemp(prefix="tg_voice_")
         ogg = str(pathlib.Path(tmpdir) / "voice.ogg")
         await f.download_to_drive(ogg)
 
-        # 2) отправить в OpenAI Whisper
         from openai import OpenAI
         client = OpenAI(api_key=settings.openai_api_key)
         model_name = getattr(settings, "openai_transcribe_model", None) \
@@ -763,12 +752,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      or "whisper-1"
         with open(ogg, "rb") as fp:
             tr = client.audio.transcriptions.create(model=model_name, file=fp)
-        recognized = (getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or "").strip()
-        if not recognized:
+
+        text = (getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else None) or "").strip()
+        if not text:
             return await m.reply_text("⚠ Не удалось распознать речь. Скажите ещё раз, пожалуйста.")
 
-        # 3) дальше — как обычный текст
-        return await _process_user_text(update, context, recognized)
+        return await _process_user_text(update, context, text)
     except Exception:
         log.exception("on_voice failed")
         return await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
@@ -815,143 +804,130 @@ async def migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("migrate failed")
         await (update.effective_message or update.message).reply_text("⚠ Ошибка миграции.")
 
+# --- /repair_schema (админ) ---
 async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
+    if not _is_admin(update.effective_user.id):
+        return await m.reply_text("⛔ Только админам.")
+    await m.reply_text("🧱 Ремонт схемы начат...")
+
     try:
-        if not _is_admin(update.effective_user.id):
-            return await m.reply_text("Только для админа.")
-        await m.reply_text("🧰 Ремонт схемы начат...")
-        created = []
         with SessionLocal() as db:
-            def has(table: str) -> bool:
-                return bool(db.execute(sa_text("SELECT to_regclass(:t)"), {"t": f"public.{table}"}).scalar())
+            # users
+            db.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS users(
+                id BIGSERIAL PRIMARY KEY,
+                tg_id BIGINT UNIQUE NOT NULL,
+                role TEXT DEFAULT 'allowed',
+                lang TEXT DEFAULT 'ru',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            )"""))
 
-            if not has("users"):
-                db.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        id           BIGSERIAL PRIMARY KEY,
-                        tg_user_id   BIGINT UNIQUE NOT NULL,
-                        is_admin     BOOLEAN NOT NULL DEFAULT FALSE,
-                        is_allowed   BOOLEAN NOT NULL DEFAULT TRUE,
-                        lang         TEXT,
-                        created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                db.commit(); created.append("users")
-            if not has("dialogs"):
-                db.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS dialogs (
-                        id              BIGSERIAL PRIMARY KEY,
-                        user_id         BIGINT NOT NULL,
-                        title           TEXT,
-                        style           VARCHAR(20) NOT NULL DEFAULT 'pro',
-                        model           TEXT,
-                        is_deleted      BOOLEAN NOT NULL DEFAULT FALSE,
-                        created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        last_message_at TIMESTAMPTZ
-                    );
-                """))
-                db.commit(); created.append("dialogs")
-            if not has("messages"):
-                db.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS messages (
-                        id         BIGSERIAL PRIMARY KEY,
-                        dialog_id  BIGINT NOT NULL,
-                        role       VARCHAR(20) NOT NULL,
-                        content    TEXT NOT NULL,
-                        tokens     INTEGER,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                db.commit(); created.append("messages")
+            # dialogs
+            db.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS dialogs(
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT,
+                model TEXT,
+                style TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                last_message_at TIMESTAMP WITH TIME ZONE,
+                is_deleted BOOLEAN DEFAULT FALSE
+            )"""))
 
-            if not has("kb_documents"):
-                db.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS kb_documents (
-                        id         BIGSERIAL PRIMARY KEY,
-                        path       TEXT UNIQUE NOT NULL,
-                        etag       TEXT,
-                        mime       TEXT,
-                        pages      INTEGER,
-                        bytes      BIGINT,
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        is_active  BOOLEAN NOT NULL DEFAULT TRUE
-                    );
-                """))
-                db.commit(); created.append("kb_documents")
-            if not has("kb_chunks"):
-                try:
-                    db.execute(sa_text("CREATE EXTENSION IF NOT EXISTS vector;"))
-                    db.commit()
-                    has_vector = True
-                except Exception:
-                    db.rollback(); has_vector = False
-                if has_vector:
-                    db.execute(sa_text("""
-                        CREATE TABLE IF NOT EXISTS kb_chunks (
-                            id           BIGSERIAL PRIMARY KEY,
-                            document_id  BIGINT NOT NULL,
-                            chunk_index  INTEGER NOT NULL,
-                            content      TEXT NOT NULL,
-                            meta         JSON,
-                            embedding    vector(3072)
-                        );
-                    """))
-                    db.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
-                    try:
-                        db.execute(sa_text("CREATE INDEX IF NOT EXISTS kb_chunks_embedding_idx ON kb_chunks USING ivfflat (embedding vector_cosine_ops);"))
-                    except Exception:
-                        pass
-                else:
-                    db.execute(sa_text("""
-                        CREATE TABLE IF NOT EXISTS kb_chunks (
-                            id           BIGSERIAL PRIMARY KEY,
-                            document_id  BIGINT NOT NULL,
-                            chunk_index  INTEGER NOT NULL,
-                            content      TEXT NOT NULL,
-                            meta         JSON,
-                            embedding    BYTEA
-                        );
-                    """))
-                    db.execute(sa_text("CREATE INDEX IF NOT EXISTS ix_kb_chunks_document_id ON kb_chunks(document_id);"))
-                db.commit(); created.append("kb_chunks")
-            if not has("dialog_kb_links"):
-                db.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS dialog_kb_links (
-                        id          BIGSERIAL PRIMARY KEY,
-                        dialog_id   BIGINT NOT NULL,
-                        document_id BIGINT NOT NULL,
-                        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                db.commit(); created.append("dialog_kb_links")
-            if not has("pdf_passwords"):
-                db.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS pdf_passwords (
-                        id          BIGSERIAL PRIMARY KEY,
-                        dialog_id   BIGINT NOT NULL,
-                        document_id BIGINT NOT NULL,
-                        pwd_hash    TEXT,
-                        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                db.commit(); created.append("pdf_passwords")
-            if not has("audit_log"):
-                db.execute(sa_text("""
-                    CREATE TABLE IF NOT EXISTS audit_log (
-                        id         BIGSERIAL PRIMARY KEY,
-                        user_id    BIGINT,
-                        action     TEXT,
-                        meta       JSON,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                    );
-                """))
-                db.commit(); created.append("audit_log")
+            # messages (поддержка и content, и text)
+            db.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS messages(
+                id BIGSERIAL PRIMARY KEY,
+                dialog_id BIGINT NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT,
+                text TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            )"""))
 
-        await m.reply_text("✅ Ремонт завершён. Создано: " + (", ".join(created) if created else "ничего — всё уже было."))
+            # kb_documents
+            db.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS kb_documents(
+                id BIGSERIAL PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                etag TEXT,
+                mime TEXT,
+                pages INT,
+                bytes BIGINT,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                is_active BOOLEAN DEFAULT TRUE
+            )"""))
+
+            # pgvector (если нет — команда /pgvector_check поставит)
+            # kb_chunks с vector(3072) под text-embedding-3-large
+            db.execute(sa_text("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'vector') THEN
+                RAISE NOTICE 'pgvector не установлен — колонка embedding будет создана как double precision[]';
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.tables
+                  WHERE table_name='kb_chunks'
+                ) THEN
+                  CREATE TABLE kb_chunks(
+                    id BIGSERIAL PRIMARY KEY,
+                    document_id BIGINT NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+                    chunk_index INT NOT NULL,
+                    content TEXT NOT NULL,
+                    embedding DOUBLE PRECISION[]
+                  );
+                  CREATE INDEX idx_chunks_doc_ix ON kb_chunks(document_id, chunk_index);
+                END IF;
+              ELSE
+                CREATE TABLE IF NOT EXISTS kb_chunks(
+                    id BIGSERIAL PRIMARY KEY,
+                    document_id BIGINT NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+                    chunk_index INT NOT NULL,
+                    content TEXT NOT NULL,
+                    embedding VECTOR(3072)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chunks_doc_ix ON kb_chunks(document_id, chunk_index);
+                CREATE INDEX IF NOT EXISTS kb_chunks_vec_idx ON kb_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists=100);
+              END IF;
+            END$$;"""))
+
+            # связка диалогов и доков
+            db.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS dialog_kb_links(
+                dialog_id BIGINT NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
+                document_id BIGINT NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+                PRIMARY KEY(dialog_id, document_id)
+            )"""))
+
+            # пароли pdf
+            db.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS pdf_passwords(
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                doc_path TEXT NOT NULL,
+                password TEXT NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                PRIMARY KEY(user_id, doc_path)
+            )"""))
+
+            # аудит
+            db.execute(sa_text("""
+            CREATE TABLE IF NOT EXISTS audit_log(
+                id BIGSERIAL PRIMARY KEY,
+                at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                user_id BIGINT,
+                action TEXT,
+                payload JSONB
+            )"""))
+
+            db.commit()
+
+        await m.reply_text("✅ Ремонт завершён. Создано/проверено: users, dialogs, messages, kb_documents, kb_chunks, dialog_kb_links, pdf_passwords, audit_log")
     except Exception:
         log.exception("repair_schema failed")
-        await (update.effective_message or update.message).reply_text("⚠ Ошибка repair_schema")
+        await m.reply_text("⚠ Ошибка /repair_schema")
 
 async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -965,9 +941,32 @@ async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("pgvector_check failed")
         await (update.effective_message or update.message).reply_text("⚠ Ошибка pgvector_check")
+# --- singleton lock на БД (одна копия бота) ---
+from sqlalchemy import text as sa_text
+
+def _singleton_lock_or_exit():
+    try:
+        with SessionLocal() as db:
+            ok = db.execute(sa_text("SELECT pg_try_advisory_lock(:k)"), {"k": 937451}).scalar()
+            if not ok:
+                log.error("❌ Найден другой экземпляр бота (pg_advisory_lock). Завершаю процесс.")
+                import sys
+                sys.exit(0)
+    except Exception:
+        log.exception("singleton lock failed (продолжаю без выхода)")
+
+async def _post_init(app: "Application"):
+    # Сбрасываем webhook и хвосты обновлений перед polling
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("✅ Webhook удалён, pending updates сброшены.")
+    except Exception:
+        log.exception("drop_webhook failed")
 
 # ---------- СБОРКА ПРИЛОЖЕНИЯ ----------
 def build_app() -> Application:
+    _singleton_lock_or_exit()
+    app = Application.builder().token(settings.telegram_bot_token).post_init(_post_init).build()
     _ensure_single_instance()
     app = ApplicationBuilder().token(settings.telegram_bot_token).post_init(_post_init).build()
 
