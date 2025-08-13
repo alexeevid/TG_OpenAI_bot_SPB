@@ -151,23 +151,71 @@ def _get_active_dialog_id(db, tg_id: int) -> int | None:
     """), {"tg": tg_id}).first()
     return int(row[0]) if row else None
 
-# telegram_bot.py
+# --- в telegram_bot.py ---
+
 from sqlalchemy import text as sa_text
 
-def _save_message(db, dialog_id: int, role: str, body: str) -> None:
-    # выбираем существующую колонку
-    col = db.execute(sa_text("""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_name='messages' AND column_name IN ('content','text')
-        ORDER BY CASE column_name WHEN 'content' THEN 1 ELSE 2 END
-        LIMIT 1
-    """)).scalar() or 'content'
+_MSG_COLS_CACHE = None
+def _detect_messages_layout(db):
+    """Кэшируем наличие колонок text/content в таблице messages."""
+    global _MSG_COLS_CACHE
+    if _MSG_COLS_CACHE is not None:
+        return _MSG_COLS_CACHE
+    rows = db.execute(sa_text("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'messages'
+    """)).all()
+    cols = {r[0] for r in rows}
+    _MSG_COLS_CACHE = {
+        "text": "text" in cols,
+        "content": "content" in cols,
+    }
+    return _MSG_COLS_CACHE
 
-    db.execute(sa_text(f"INSERT INTO messages (dialog_id, role, {col}) VALUES (:d,:r,:c)"),
-               {"d": dialog_id, "r": role, "c": body})
-    db.execute(sa_text("UPDATE dialogs SET last_message_at = now(), updated_at = now() WHERE id = :d"),
-               {"d": dialog_id})
+
+def _save_message(db, dialog_id: int, role: str, text: str | None, content: str | None = None):
+    """
+    Безопасная вставка с учётом схемы.
+    Если есть обе колонки — пишем в обе.
+    Если есть только text — пишем в text.
+    Если есть только content — пишем в content.
+    """
+    cols = _detect_messages_layout(db)
+    payload = {"d": dialog_id, "r": role}
+
+    # Нельзя вставлять NULL в text при твоей схеме, поэтому подстрахуемся
+    txt = (text or "")[:65535]  # чтобы точно не упереться в лимиты
+    cnt = content if content is not None else txt
+
+    if cols["text"] and cols["content"]:
+        payload.update({"t": txt, "c": cnt})
+        db.execute(sa_text(
+            "INSERT INTO messages (dialog_id, role, text, content) "
+            "VALUES (:d, :r, :t, :c)"
+        ), payload)
+    elif cols["text"]:
+        payload.update({"t": txt})
+        db.execute(sa_text(
+            "INSERT INTO messages (dialog_id, role, text) "
+            "VALUES (:d, :r, :t)"
+        ), payload)
+    elif cols["content"]:
+        payload.update({"c": cnt})
+        db.execute(sa_text(
+            "INSERT INTO messages (dialog_id, role, content) "
+            "VALUES (:d, :r, :c)"
+        ), payload)
+    else:
+        # На всякий случай — считаем, что есть text.
+        payload.update({"t": txt})
+        db.execute(sa_text(
+            "INSERT INTO messages (dialog_id, role, text) "
+            "VALUES (:d, :r, :t)"
+        ), payload)
+
     db.commit()
+
 
 # telegram_bot.py
 async def _process_user_text(update, context, text: str):
