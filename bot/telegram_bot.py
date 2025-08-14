@@ -1,72 +1,35 @@
 
-# bot/telegram_bot.py
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
 import os
-import re
 import sys
 import tempfile
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from typing import List
 from urllib.parse import urlparse
-from pathlib import Path
-from openai import OpenAI, BadRequestError
 
-import tiktoken
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 from sqlalchemy import text as sa_text
 
-# если клиент ещё не создан где-то выше – создадим
-try:
-    client  # noqa: F401
-except NameError:
-    client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
-
-# безопасная фабрика сессий (fallback)
-try:
-    from bot.session import SessionLocal as _SessionLocal  # ваш модуль
-except Exception:
-    try:
-        from session import SessionLocal as _SessionLocal
-    except Exception:
-        _SessionLocal = None
-
-def session_factory():
-    if _SessionLocal is None:
-        raise RuntimeError("SessionLocal not available – проверьте module bot.session")
-    return _SessionLocal()
-
-
-from telegram.ext import ContextTypes
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error", exc_info=context.error)
-    try:
-        m = getattr(update, "effective_message", None)
-        if m:
-            await m.reply_text("⚠ Внутренняя ошибка обработчика. Уже чиним.")
-    except Exception:
-        pass
-
-
-# PTB 20.x
+# === Telegram (PTB 20+) ===
 try:
     from telegram import (
         Update,
         InlineKeyboardButton,
         InlineKeyboardMarkup,
         BufferedInputFile,
-        InputFile,
     )
     HAS_BUFFERED = True
-except Exception:  # старые сборки PTB
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile  # type: ignore
+except Exception:  # старые сборки PTB без BufferedInputFile
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup  # type: ignore
     HAS_BUFFERED = False
 
+from telegram import InputFile
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -77,105 +40,81 @@ from telegram.ext import (
     filters,
 )
 
-# == НАСТРОЙКИ / БД ==
-from bot.settings import load_settings
-from bot.db.session import SessionLocal  # engine подтягивается через Alembic при необходимости
-
-log = logging.getLogger(__name__)
-settings = load_settings()
-_OA = OpenAI(api_key=settings.openai_api_key)
-
-# ---------- SINGLETON LOCK (исключаем два параллельных poller-а) ----------
-import psycopg2
-
-_singleton_conn = None  # держим подключение живым (держит advisory_lock)
-
-# === Bootstrap: settings, сессии БД, OpenAI client (лениво) ===
-from types import SimpleNamespace
-
-# settings (поддерживаем оба варианта импорта)
+# =========================
+# SETTINGS & DB SESSION
+# =========================
+# Поддерживаем оба пути импорта настроек
 try:
-    from bot.settings import settings as SETTINGS
+    from bot.settings import load_settings as _load_settings
+    settings = _load_settings()
 except Exception:
     try:
-        from settings import settings as SETTINGS
+        from settings import settings  # type: ignore
     except Exception:
-        SETTINGS = SimpleNamespace()
+        class _S:  # минимальный заглушечный объект
+            openai_api_key = os.getenv("OPENAI_API_KEY")
+            telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+            database_url = os.getenv("DATABASE_URL")
+            openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
+            kb_top_k = int(os.getenv("KB_TOP_K", "5"))
+            yandex_disk_token = os.getenv("YANDEX_DISK_TOKEN")
+            admin_user_ids = os.getenv("ADMIN_USER_IDS", "")
+        settings = _S()  # type: ignore
 
-# фабрика сессий (оба варианта импорта)
+# Фабрика сессий (поддерживаем разные размещения файла session.py)
 try:
     from bot.session import SessionLocal as _SessionLocal
 except Exception:
     try:
-        from session import SessionLocal as _SessionLocal
+        from session import SessionLocal as _SessionLocal  # type: ignore
     except Exception:
         _SessionLocal = None
 
 def session_factory():
     if _SessionLocal is None:
-        raise RuntimeError("SessionLocal не найден. Проверьте модуль session.py и путь импорта.")
+        raise RuntimeError("SessionLocal не найден. Проверьте файл session.py и модульный путь импорта.")
     return _SessionLocal()
 
-# OpenAI — ленивый клиент + безопасный импорт типов ошибок
-from openai import OpenAI, BadRequestError
+# Единственный клиент OpenAI для всего процесса
+_OA = OpenAI(api_key=(getattr(settings, "openai_api_key", None) or os.getenv("OPENAI_API_KEY")))
 
-def get_openai_client():
-    """Ленивая инициализация клиента OpenAI с учётом окружения."""
-    global _OPENAI_CLIENT  # noqa: PLW0603
+# =========================
+# LOGGING
+# =========================
+log = logging.getLogger(__name__)
+
+# =========================
+# SINGLETON (один poller)
+# =========================
+def _singleton_lock_or_exit():
+    """Гарантируем один запущенный экземпляр poller-а через advisory_lock."""
     try:
-        return _OPENAI_CLIENT  # уже создан
-    except NameError:
-        api_key = getattr(SETTINGS, "OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
-        _OPENAI_CLIENT = OpenAI(api_key=api_key)
-        return _OPENAI_CLIENT
-
-from telegram.ext import ContextTypes
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error", exc_info=context.error)
-    m = getattr(update, "effective_message", None)
-    if m:
-        try:
-            await m.reply_text("⚠ Внутренняя ошибка обработчика. Уже чиним.")
-        except Exception:
-            pass
-# в build_app():
-app.add_error_handler(error_handler)
-
-
-def _ensure_single_instance() -> None:
-    """Берём pg_advisory_lock на процесс. Если занят — выходим, чтобы не ловить Conflict от Telegram."""
-    global _singleton_conn
-    if _singleton_conn is not None:
-        return
-    dsn = settings.database_url
-    if not dsn:
-        log.warning("DATABASE_URL не задан — singleton-lock пропущен (риск Conflict).")
-        return
-    try:
-        key_src = f"{dsn}|{settings.telegram_bot_token}"
-        lock_key = int(hashlib.sha1(key_src.encode("utf-8")).hexdigest()[:15], 16) % (2**31)
-        _singleton_conn = psycopg2.connect(dsn)
-        _singleton_conn.autocommit = True
-        with _singleton_conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
-            ok = cur.fetchone()[0]
-        if not ok:
-            log.error("‼️ Уже запущен другой экземпляр бота (advisory-lock занят). Завершаюсь.")
-            sys.exit(0)
-        log.info("✅ Получен singleton pg_advisory_lock.")
+        with session_factory() as db:
+            # Ключ на основе строки подключения и токена бота (от конфликтов разных окружений)
+            key_src = f"{getattr(settings, 'database_url', '')}|{getattr(settings, 'telegram_bot_token', '')}"
+            lock_key = int(hashlib.sha1(key_src.encode('utf-8')).hexdigest()[:15], 16) % (2**31)
+            ok = db.execute(sa_text("SELECT pg_try_advisory_lock(:k)"), {"k": lock_key}).scalar()
+            if not ok:
+                log.error("❌ Найден другой экземпляр бота (pg_advisory_lock). Завершаю процесс.")
+                sys.exit(0)
+            log.info("✅ Получен singleton pg_advisory_lock.")
     except Exception:
-        log.exception("Не удалось взять singleton-lock — продолжаю без него (риск Conflict).")
+        log.exception("singleton lock failed (продолжаю без выхода — возможен Conflict от Telegram)")
 
-# ---------- post_init: очищаем webhook перед polling ----------
+# =========================
+# POST INIT (сброс webhook)
+# =========================
 async def _post_init(app: "Application"):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("✅ Webhook удалён и обновления очищены.")
+        log.info("✅ Webhook удалён, pending updates сброшены.")
     except Exception:
-        log.exception("Не удалось удалить webhook")
+        log.exception("drop_webhook failed")
 
-# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+# =========================
+# УТИЛИТЫ
+# =========================
 TELEGRAM_CHUNK = 3500
 
 def _split_for_tg(text: str, limit: int = TELEGRAM_CHUNK) -> List[str]:
@@ -197,7 +136,7 @@ async def _send_long(m, text: str):
 
 def _is_admin(tg_id: int) -> bool:
     try:
-        ids = [int(x.strip()) for x in (settings.admin_user_ids or "").split(",") if x.strip()]
+        ids = [int(x.strip()) for x in (getattr(settings, "admin_user_ids", "") or "").split(",") if x.strip()]
         return tg_id in ids
     except Exception:
         return False
@@ -206,10 +145,9 @@ def _ensure_user(db, tg_id: int) -> int:
     uid = db.execute(sa_text("SELECT id FROM users WHERE tg_user_id=:tg"), {"tg": tg_id}).scalar()
     if uid:
         return int(uid)
-    uid = db.execute(
-        sa_text("INSERT INTO users (tg_user_id, is_admin, is_allowed, lang) VALUES (:tg,FALSE,TRUE,'ru') RETURNING id"),
-        {"tg": tg_id},
-    ).scalar()
+    uid = db.execute(sa_text(
+        "INSERT INTO users (tg_user_id, is_admin, is_allowed, lang) VALUES (:tg,FALSE,TRUE,'ru') RETURNING id"
+    ), {"tg": tg_id}).scalar()
     db.commit()
     return int(uid)
 
@@ -223,7 +161,7 @@ def _create_new_dialog_for_tg(db, tg_id: int) -> int:
     did = db.execute(sa_text("""
         INSERT INTO dialogs (user_id, title, style, model, is_deleted, created_at)
         VALUES (:u, :t, 'pro', :m, FALSE, now()) RETURNING id
-    """), {"u": uid, "t": title, "m": settings.openai_model}).scalar()
+    """), {"u": uid, "t": title, "m": getattr(settings, "openai_model", "gpt-4o-mini")}).scalar()
     db.commit()
     return int(did)
 
@@ -239,118 +177,53 @@ def _get_active_dialog_id(db, tg_id: int) -> int | None:
     """), {"tg": tg_id}).first()
     return int(row[0]) if row else None
 
-# --- в telegram_bot.py ---
-
-from sqlalchemy import text as sa_text
-
+# --- Схема messages может отличаться (text/content). Вставляем безопасно.
 _MSG_COLS_CACHE = None
 def _detect_messages_layout(db):
-    """Кэшируем наличие колонок text/content в таблице messages."""
     global _MSG_COLS_CACHE
     if _MSG_COLS_CACHE is not None:
         return _MSG_COLS_CACHE
     rows = db.execute(sa_text("""
-        SELECT column_name
-        FROM information_schema.columns
+        SELECT column_name FROM information_schema.columns
         WHERE table_name = 'messages'
     """)).all()
     cols = {r[0] for r in rows}
-    _MSG_COLS_CACHE = {
-        "text": "text" in cols,
-        "content": "content" in cols,
-    }
+    _MSG_COLS_CACHE = {"text": "text" in cols, "content": "content" in cols}
     return _MSG_COLS_CACHE
 
-
 def _save_message(db, dialog_id: int, role: str, text: str | None, content: str | None = None):
-    """
-    Безопасная вставка с учётом схемы.
-    Если есть обе колонки — пишем в обе.
-    Если есть только text — пишем в text.
-    Если есть только content — пишем в content.
-    """
     cols = _detect_messages_layout(db)
     payload = {"d": dialog_id, "r": role}
-
-    # Нельзя вставлять NULL в text при твоей схеме, поэтому подстрахуемся
-    txt = (text or "")[:65535]  # чтобы точно не упереться в лимиты
+    txt = (text or "")[:65535]
     cnt = content if content is not None else txt
 
     if cols["text"] and cols["content"]:
         payload.update({"t": txt, "c": cnt})
         db.execute(sa_text(
-            "INSERT INTO messages (dialog_id, role, text, content) "
-            "VALUES (:d, :r, :t, :c)"
+            "INSERT INTO messages (dialog_id, role, text, content) VALUES (:d, :r, :t, :c)"
         ), payload)
     elif cols["text"]:
         payload.update({"t": txt})
         db.execute(sa_text(
-            "INSERT INTO messages (dialog_id, role, text) "
-            "VALUES (:d, :r, :t)"
+            "INSERT INTO messages (dialog_id, role, text) VALUES (:d, :r, :t)"
         ), payload)
     elif cols["content"]:
         payload.update({"c": cnt})
         db.execute(sa_text(
-            "INSERT INTO messages (dialog_id, role, content) "
-            "VALUES (:d, :r, :c)"
+            "INSERT INTO messages (dialog_id, role, content) VALUES (:d, :r, :c)"
         ), payload)
     else:
-        # На всякий случай — считаем, что есть text.
         payload.update({"t": txt})
         db.execute(sa_text(
-            "INSERT INTO messages (dialog_id, role, text) "
-            "VALUES (:d, :r, :t)"
+            "INSERT INTO messages (dialog_id, role, text) VALUES (:d, :r, :t)"
         ), payload)
-
     db.commit()
 
-
-# --- helpers ---
-import asyncio
-
-def _is_nonempty(s: str | None) -> bool:
-    return bool(s and s.strip())
-
-async def _maybe_await(v):
-    return await v if asyncio.iscoroutine(v) else v
-
-async def _process_user_text(update, context, text: str):
-    m = update.effective_message
-    user = update.effective_user
-    db = session_factory()
-    try:
-        did = ensure_active_dialog(db, user.id)
-        _save_message(db, did, "user", text)
-
-        state    = get_dialog_state(db, did)  # {model, style, kb_docs, kb_top_k}
-        kb_docs  = state.get("kb_docs") or []
-        kb_top_k = int(state.get("kb_top_k") or getattr(SETTINGS, "KB_TOP_K", 5))
-
-        if kb_docs:
-            result = _chat_rag(db=db, dialog_id=did, user_text=text, kb_doc_ids=kb_docs, top_k=kb_top_k)
-            answer, used_chunks = await _maybe_await(result)
-            tail = _format_citations(used_chunks) if used_chunks else ""
-            full = f"{answer}{tail}"
-        else:
-            result = _chat_full(db=db, dialog_id=did, user_text=text)
-            full = await _maybe_await(result)
-
-        await _send_long(m, full)
-        _save_message(db, did, "assistant", full)
-    except Exception:
-        log.exception("process_user_text failed")
-        await m.reply_text("⚠ Ошибка генерации ответа. Попробуйте ещё раз.")
-    finally:
-        db.close()
-
-
-# ---------- OpenAI / RAG ----------
+# =========================
+# RAG helpers
+# =========================
 def _get_embedding_model() -> str:
-    return settings.embedding_model
-
-def _embed_query(text: str) -> List[float]:
-    resp = _OA.embeddings.create(model=_get_embedding_model(), input=[text])
-    return resp.data[0].embedding
+    return getattr(settings, "embedding_model", "text-embedding-3-large")
 
 def _kb_embedding_column_kind(db) -> str:
     try:
@@ -371,6 +244,10 @@ def _kb_embedding_column_kind(db) -> str:
     except Exception:
         pass
     return "none"
+
+def _embed_query(text: str) -> List[float]:
+    resp = _OA.embeddings.create(model=_get_embedding_model(), input=[text])
+    return resp.data[0].embedding
 
 def _vec_literal(vec: List[float]) -> tuple[dict, str]:
     arr = "[" + ",".join(f"{x:.6f}" for x in (vec or [])) + "]"
@@ -438,7 +315,21 @@ async def _chat_full(model: str, messages: list, temperature: float = 0.3, max_t
         hist.append({"role": "user", "content": "Продолжай с того места. Не повторяйся."})
     return full
 
-# ---------- КОМАНДЫ ----------
+# =========================
+# ERROR HANDLER
+# =========================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error", exc_info=context.error)
+    m = getattr(update, "effective_message", None)
+    if m:
+        try:
+            await m.reply_text("⚠ Внутренняя ошибка обработчика. Уже чиним.")
+        except Exception:
+            pass
+
+# =========================
+# КОМАНДЫ
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     await m.reply_text(
@@ -469,8 +360,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg = update.effective_user.id
-        with SessionLocal() as db:
-            row = db.execute(sa_text("SELECT is_admin, is_allowed, lang FROM users WHERE tg_user_id=:tg"), {"tg": tg}).first()
+        with session_factory() as db:
+            row = db.execute(sa_text(
+                "SELECT is_admin, is_allowed, lang FROM users WHERE tg_user_id=:tg"
+            ), {"tg": tg}).first()
         is_admin = bool(row[0]) if row else False
         is_allowed = bool(row[1]) if row else True
         lang = (row[2] or "ru") if row else "ru"
@@ -481,14 +374,11 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("whoami failed")
         await (update.message or update.effective_message).reply_text("⚠ Ошибка whoami")
 
-# ---- Диалоги: список/новый/переключение/экспорт/переименование ----
-KB_PAGE_SIZE = 10
-
-# telegram_bot.py
+# ---- Диалоги ----
 async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
-        with SessionLocal() as db:
+        with session_factory() as db:
             uid = _ensure_user(db, update.effective_user.id)
             rows = db.execute(sa_text("""
                 SELECT d.id, COALESCE(NULLIF(d.title,''), CONCAT('Диалог ', d.id)) AS title
@@ -513,24 +403,15 @@ async def dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("dialogs failed")
         await m.reply_text("⚠ Ошибка /dialogs")
 
-
 async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     try:
         data = q.data or ""
-        if data == "dlg:nop":
-            return
-        if data.startswith("dlg:page:"):
-            page = int(data.split(":")[-1])
-            context.user_data["dlg_page"] = page
-            await q.message.delete()
-            return await dialogs(update, context)
         if data == "dlg:new":
-            with SessionLocal() as db:
+            with session_factory() as db:
                 did = _create_new_dialog_for_tg(db, update.effective_user.id)
-            await q.edit_message_text(f"✅ Создан диалог #{did}")
-            return
+            return await q.edit_message_text(f"✅ Создан диалог #{did}")
         if data.startswith("dlg:open:"):
             did = int(data.split(":")[-1])
             context.user_data["active_dialog_id"] = did
@@ -541,24 +422,27 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await q.edit_message_text("Введите новое название диалога:")
         if data.startswith("dlg:export:"):
             did = int(data.split(":")[-1])
-            with SessionLocal() as db:
+            with session_factory() as db:
                 msgs = db.execute(sa_text("""
-                    SELECT role, content, created_at
-                    FROM messages
-                    WHERE dialog_id=:d ORDER BY created_at
+                    SELECT role, COALESCE(content, text) AS body, created_at
+                    FROM messages WHERE dialog_id=:d ORDER BY created_at
                 """), {"d": did}).all()
             lines = ["# Экспорт диалога", ""]
-            for role, content, _ in msgs:
+            for role, body, _ in msgs:
                 who = "Пользователь" if role == "user" else "Бот"
-                lines.append(f"**{who}:**\n{content}\n")
+                lines.append(f"**{who}:**\n{body or ''}\n")
             data_bytes = "\n".join(lines).encode("utf-8")
-            file = BufferedInputFile(data_bytes, filename=f"dialog_{did}.md") if HAS_BUFFERED else InputFile(data_bytes, filename=f"dialog_{did}.md")  # type: ignore
-            await q.message.reply_document(document=file, caption="Экспорт готов")
+            if HAS_BUFFERED:
+                await q.message.reply_document(document=BufferedInputFile(data_bytes, filename=f"dialog_{did}.md"),
+                                               caption="Экспорт готов")
+            else:
+                await q.message.reply_document(document=InputFile(BytesIO(data_bytes), filename=f"dialog_{did}.md"),
+                                               caption="Экспорт готов")
             return
         if data.startswith("dlg:delete:"):
             did = int(data.split(":")[-1])
-            with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"id": did})
+            with session_factory() as db:
+                db.execute(sa_text("UPDATE dialogs SET is_deleted=TRUE WHERE id=:d"), {"d": did})
                 db.commit()
             return await q.edit_message_text(f"Диалог #{did} удалён")
     except Exception:
@@ -584,94 +468,50 @@ async def dialog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
-        with SessionLocal() as db:
+        with session_factory() as db:
             did = _create_new_dialog_for_tg(db, update.effective_user.id)
         await m.reply_text(f"✅ Создан диалог #{did}")
     except Exception:
         log.exception("dialog_new failed")
         await m.reply_text("⚠ Ошибка создания диалога")
 
-# ---- KB / SYNC / DIAG ----
-def ya_download(path: str) -> bytes:
-    import requests
-    YA_API = "https://cloud-api.yandex.net/v1/disk"
-    headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
-    r = requests.get(f"{YA_API}/resources/download", headers=headers, params={"path": path}, timeout=60)
-    r.raise_for_status()
-    href = (r.json() or {}).get("href")
-    if not href:
-        raise RuntimeError("download href not returned by Yandex Disk")
-    f = requests.get(href, timeout=300)
-    f.raise_for_status()
-    return f.content
+# ---- KB ----
+async def kb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    db = session_factory()
+    try:
+        doc_cnt   = db.execute(sa_text("SELECT count(*) FROM kb_documents WHERE is_active = true")).scalar_one()
+        chunk_cnt = db.execute(sa_text("SELECT count(*) FROM kb_chunks")).scalar_one()
+        link_cnt  = db.execute(sa_text("SELECT count(*) FROM dialog_kb_links")).scalar_one()
 
-def _ya_list_files(root_path: str):
-    import requests
-    YA_API = "https://cloud-api.yandex.net/v1/disk"
-    headers = {"Authorization": f"OAuth {settings.yandex_disk_token}"}
-    out = []
-    limit, offset = 200, 0
-    while True:
-        r = requests.get(
-            f"{YA_API}/resources",
-            headers=headers,
-            params={
-                "path": root_path,
-                "limit": limit,
-                "offset": offset,
-                "fields": "_embedded.items.name,_embedded.items.path,_embedded.items.type,_embedded.items.mime_type,_embedded.items.size,_embedded.items.md5",
-            },
-            timeout=30,
+        await m.reply_text(
+            f"БЗ: документов активных — {doc_cnt}, чанков — {chunk_cnt}, привязок к диалогам — {link_cnt}"
         )
-        r.raise_for_status()
-        items = (r.json().get("_embedded") or {}).get("items") or []
-        for it in items:
-            if it.get("type") == "file":
-                out.append(it)
-        if len(items) < limit:
-            break
-        offset += limit
-    return out
+        keyboard = [
+            [InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")],
+            [InlineKeyboardButton("📊 Диагностика",   callback_data="kb:diag")],
+        ]
+        await m.reply_text("Меню БЗ:", reply_markup=InlineKeyboardMarkup(keyboard))
+    except Exception:
+        log.exception("kb_cmd failed")
+        await m.reply_text("⚠ Ошибка /kb")
+    finally:
+        db.close()
 
-def _pdf_extract_text(pdf_bytes: bytes) -> tuple[str, int, bool]:
-    import fitz  # PyMuPDF
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        is_prot = bool(doc.is_encrypted)
-        if is_prot:
-            try:
-                if doc.authenticate(""):
-                    is_prot = False
-            except Exception:
-                pass
-        if is_prot:
-            return ("", 0, True)
-        pages = doc.page_count
-        out = []
-        for i in range(pages):
-            try:
-                out.append(doc.load_page(i).get_text("text") or "")
-            except Exception:
-                out.append("")
-        txt = "\n".join(out)
-    if not txt.strip():
+async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if data == "kb:sync":
+        await q.edit_message_text("🔄 Стартую синхронизацию БЗ…")
+        return await kb_sync(update, context)
+    if data == "kb:diag":
+        await kb_diag(update, context)
         try:
-            from pdfminer.high_level import extract_text
-            txt = extract_text(BytesIO(pdf_bytes)) or ""
+            await q.delete_message()
         except Exception:
             pass
-    return (txt, pages, False)
-
-def _chunk_text(text: str, max_tokens: int = 2000, overlap: int = 0) -> List[str]:
-    enc = tiktoken.get_encoding("cl100k_base")
-    toks = enc.encode(text or "")
-    out = []
-    i = 0
-    while i < len(toks):
-        part = enc.decode(toks[i:i+max_tokens]).strip()
-        if part:
-            out.append(part)
-        i = i + max_tokens if overlap <= 0 else i + max_tokens - overlap
-    return out
+        return
 
 async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -680,7 +520,13 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await m.reply_text("🔄 Синхронизация запущена...")
     try:
         import inspect
-        from bot.knowledge_base import indexer
+        # ожидаем модуль bot.knowledge_base.indexer или knowledge_base/indexer.py
+        try:
+            from bot.knowledge_base import indexer  # type: ignore
+        except Exception:
+            import importlib
+            indexer = importlib.import_module("indexer")  # fallback на корень
+
         entry = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT", None)
         fn = getattr(indexer, entry, None) if entry else None
         if not fn:
@@ -695,14 +541,15 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in sig.parameters.values():
             nm = p.name.lower()
             if nm in ("session","db","dbsession","conn","connection"):
-                sess = SessionLocal(); kwargs[p.name] = sess; to_close = sess
+                sess = session_factory(); kwargs[p.name] = sess; to_close = sess
             elif nm in ("sessionlocal","session_factory","factory","engine"):
-                kwargs[p.name] = SessionLocal
+                kwargs[p.name] = session_factory
             elif nm in ("settings","cfg","config","conf"):
                 kwargs[p.name] = settings
 
         def _call():
-            try: return fn(**kwargs)
+            try:
+                return fn(**kwargs)
             finally:
                 if to_close is not None:
                     try: to_close.close()
@@ -726,7 +573,7 @@ async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
-        with SessionLocal() as db:
+        with session_factory() as db:
             docs = db.execute(sa_text("SELECT count(*) FROM kb_documents WHERE is_active")).scalar() or 0
             chunks = db.execute(sa_text("SELECT count(*) FROM kb_chunks")).scalar() or 0
             links = db.execute(sa_text("SELECT count(*) FROM dialog_kb_links")).scalar() or 0
@@ -735,47 +582,6 @@ async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("kb_diag failed")
         await m.reply_text("⚠ Ошибка kb_diag")
 
-from sqlalchemy import text as sa_text
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
-async def kb_cmd(update, context):
-    m = update.effective_message
-    db = session_factory()
-    try:
-        doc_cnt   = db.execute(sa_text("SELECT count(*) FROM kb_documents WHERE is_active = true")).scalar_one()
-        chunk_cnt = db.execute(sa_text("SELECT count(*) FROM kb_chunks")).scalar_one()
-        link_cnt  = db.execute(sa_text("SELECT count(*) FROM dialog_kb_links")).scalar_one()
-
-        await m.reply_text(
-            f"БЗ: документов активных — {doc_cnt}, чанков — {chunk_cnt}, привязок к диалогам — {link_cnt}"
-        )
-        keyboard = [
-            [InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")],
-            [InlineKeyboardButton("📊 Диагностика",   callback_data="kb:diag")],
-        ]
-        await m.reply_text("Меню БЗ:", reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception:
-        log.exception("kb_cmd failed")
-        await m.reply_text("⚠ Ошибка /kb")
-    finally:
-        db.close()
-
-
-async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-    if data == "kb:sync":
-        await q.edit_message_text("🔄 Стартую синхронизацию БЗ…")
-        return await kb_sync(update, context)
-    if data == "kb:diag":
-        await kb_diag(update, context)
-        try:
-            await q.delete_message()
-        except Exception:
-            pass
-        return
-
 # ---- WEB ----
 async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -783,11 +589,9 @@ async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 2:
         return await m.reply_text("Использование: /web <запрос>")
     query = parts[1].strip()
-
-    # Если есть ключи и модуль web_search — используем реальный поиск
     try:
-        from bot.web_search import web_search_digest, sources_footer
-        answer, sources = await web_search_digest(query, max_results=6, openai_api_key=settings.openai_api_key)
+        from bot.web_search import web_search_digest, sources_footer  # type: ignore
+        answer, sources = await web_search_digest(query, max_results=6, openai_api_key=getattr(settings, "openai_api_key", None))
         footer = ("\n\nИсточники:\n" + sources_footer(sources)) if sources else ""
         await _send_long(m, (answer or "Готово.") + footer)
         if sources:
@@ -800,11 +604,11 @@ async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Детали: {e}"
         )
 
-# ---- СТАТИСТИКА ----
+# ---- STATS ----
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
-        with SessionLocal() as db:
+        with session_factory() as db:
             did = context.user_data.get("active_dialog_id") or _get_active_dialog_id(db, update.effective_user.id)
             if not did:
                 return await m.reply_text("Нет активного диалога. Создайте через /dialog_new или выберите /dialogs.")
@@ -812,7 +616,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             row = db.execute(sa_text(
                 "SELECT id, title, model, style, created_at, last_message_at FROM dialogs WHERE id=:d"
             ), {"d": did}).first()
-
             msgs = db.execute(sa_text("SELECT count(*) FROM messages WHERE dialog_id=:d"), {"d": did}).scalar() or 0
             docs = db.execute(sa_text("""
                 SELECT d.path
@@ -827,7 +630,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """), {"tg": update.effective_user.id}).scalar() or 0
 
         title = row[1] if row else "-"
-        model = row[2] if row else settings.openai_model
+        model = row[2] if row else getattr(settings, "openai_model", "gpt-4o-mini")
         style = row[3] if row else "pro"
         created = row[4] if row else "-"
         changed = row[5] if row else "-"
@@ -845,25 +648,25 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("/stats failed")
         return await m.reply_text("⚠ Ошибка /stats")
 
-# ---- ТЕКСТ / ГОЛОС ----
+# ---- TEXT / VOICE ----
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     text = (m.text or "").strip()
     if not text:
         return
     try:
-        with SessionLocal() as db:
+        with session_factory() as db:
             tg = update.effective_user.id
             _ensure_user(db, tg)
             did = context.user_data.get("active_dialog_id") or _get_active_dialog_id(db, tg) or _create_new_dialog_for_tg(db, tg)
 
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
-            model = (row[0] if row and row[0] else settings.openai_model)
+            model = (row[0] if row and row[0] else getattr(settings, "openai_model", "gpt-4o-mini"))
             style = (row[1] if row and row[1] else "pro")
 
             _save_message(db, did, "user", text)
 
-            top_k = int(settings.kb_top_k)
+            top_k = int(getattr(settings, "kb_top_k", 5))
             rows = _retrieve_chunks(db, did, text, k=top_k)
 
         ctx_blocks = [r["content"] for r in rows]
@@ -876,17 +679,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await _send_long(m, final)
 
-        with SessionLocal() as db:
+        with session_factory() as db:
             _save_message(db, did, "assistant", final)
 
     except Exception:
         log.exception("on_text failed")
         await m.reply_text("⚠ Не удалось обработать сообщение. Попробуйте ещё раз.")
 
-from pathlib import Path
-import tempfile
-
-async def on_voice(update, context):
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     v = m.voice or m.audio
     if not v:
@@ -901,19 +701,43 @@ async def on_voice(update, context):
         await file.download_to_drive(str(tmp_path))
 
         # 2) Транскрибуем
-        client = get_openai_client()
         with open(tmp_path, "rb") as fh:
-            tr = client.audio.transcriptions.create(
-                model=getattr(SETTINGS, "ASR_MODEL", "gpt-4o-transcribe"),
+            tr = _OA.audio.transcriptions.create(
+                model=getattr(settings, "ASR_MODEL", "gpt-4o-transcribe"),
                 file=fh,
                 # language="ru",
             )
         text = (getattr(tr, "text", "") or "").strip()
-        if not _is_nonempty(text):
+        if not text:
             return await m.reply_text("⚠ Не удалось распознать речь. Скажите ещё раз, пожалуйста.")
 
-        # 3) В общий текстовый пайплайн
-        return await _process_user_text(update, context, text)
+        # 3) Тот же пайплайн, что и on_text
+        with session_factory() as db:
+            tg = update.effective_user.id
+            _ensure_user(db, tg)
+            did = context.user_data.get("active_dialog_id") or _get_active_dialog_id(db, tg) or _create_new_dialog_for_tg(db, tg)
+
+            row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
+            model = (row[0] if row and row[0] else getattr(settings, "openai_model", "gpt-4o-mini"))
+            style = (row[1] if row and row[1] else "pro")
+
+            _save_message(db, did, "user", text)
+
+            top_k = int(getattr(settings, "kb_top_k", 5))
+            rows = _retrieve_chunks(db, did, text, k=top_k)
+
+        ctx_blocks = [r["content"] for r in rows]
+        prompt = _build_prompt_with_style(ctx_blocks, text, style)
+        messages = [{"role":"system","content":"RAG assistant"}, {"role":"user","content":prompt}]
+
+        answer = await _chat_full(model, messages, temperature=0.3, max_turns=6)
+        cites = _format_citations(rows)
+        final = answer + (cites if cites else "")
+
+        await _send_long(m, final)
+
+        with session_factory() as db:
+            _save_message(db, did, "assistant", final)
 
     except BadRequestError as e:
         log.error("ASR BadRequest: %s", e, exc_info=True)
@@ -928,11 +752,10 @@ async def on_voice(update, context):
         except Exception:
             pass
 
-
-# ---- СЕРВИСНЫЕ ----
+# ---- SERVICE ----
 async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        with SessionLocal() as db:
+        with session_factory() as db:
             rows = db.execute(sa_text("""
                 select 'users' as t, to_regclass('public.users') is not null
                 union all select 'dialogs',          to_regclass('public.dialogs') is not null
@@ -958,7 +781,7 @@ async def migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await (update.effective_message or update.message).reply_text("🔧 Запускаю миграции...")
         from alembic.config import Config
         from alembic import command
-        os.environ["DATABASE_URL"] = settings.database_url
+        os.environ["DATABASE_URL"] = getattr(settings, "database_url", os.getenv("DATABASE_URL", ""))
         cfg = Config("alembic.ini")
         command.upgrade(cfg, "head")
         await (update.effective_message or update.message).reply_text("✅ Миграции применены.")
@@ -966,21 +789,20 @@ async def migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("migrate failed")
         await (update.effective_message or update.message).reply_text("⚠ Ошибка миграции.")
 
-# --- /repair_schema (админ) ---
 async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     if not _is_admin(update.effective_user.id):
         return await m.reply_text("⛔ Только админам.")
     await m.reply_text("🧱 Ремонт схемы начат...")
-
     try:
-        with SessionLocal() as db:
-            # users
+        with session_factory() as db:
+            # users (с tg_user_id как в существующей схеме)
             db.execute(sa_text("""
             CREATE TABLE IF NOT EXISTS users(
                 id BIGSERIAL PRIMARY KEY,
-                tg_id BIGINT UNIQUE NOT NULL,
-                role TEXT DEFAULT 'allowed',
+                tg_user_id BIGINT UNIQUE NOT NULL,
+                is_admin BOOLEAN DEFAULT FALSE,
+                is_allowed BOOLEAN DEFAULT TRUE,
                 lang TEXT DEFAULT 'ru',
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
             )"""))
@@ -1010,7 +832,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
             )"""))
 
-            # kb_documents
+            # kb_documents (updated_at с DEFAULT now(), чтобы избежать NOT NULL ошибок)
             db.execute(sa_text("""
             CREATE TABLE IF NOT EXISTS kb_documents(
                 id BIGSERIAL PRIMARY KEY,
@@ -1023,16 +845,13 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 is_active BOOLEAN DEFAULT TRUE
             )"""))
 
-            # pgvector (если нет — команда /pgvector_check поставит)
-            # kb_chunks с vector(3072) под text-embedding-3-large
+            # kb_chunks (если pgvector есть — делаем vector, иначе массив)
             db.execute(sa_text("""
             DO $$
             BEGIN
               IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'vector') THEN
-                RAISE NOTICE 'pgvector не установлен — колонка embedding будет создана как double precision[]';
                 IF NOT EXISTS (
-                  SELECT 1 FROM information_schema.tables
-                  WHERE table_name='kb_chunks'
+                  SELECT 1 FROM information_schema.tables WHERE table_name='kb_chunks'
                 ) THEN
                   CREATE TABLE kb_chunks(
                     id BIGSERIAL PRIMARY KEY,
@@ -1064,7 +883,7 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 PRIMARY KEY(dialog_id, document_id)
             )"""))
 
-            # пароли pdf
+            # pdf пароли
             db.execute(sa_text("""
             CREATE TABLE IF NOT EXISTS pdf_passwords(
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1086,14 +905,14 @@ async def repair_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             db.commit()
 
-        await m.reply_text("✅ Ремонт завершён. Создано/проверено: users, dialogs, messages, kb_documents, kb_chunks, dialog_kb_links, pdf_passwords, audit_log")
+        await m.reply_text("✅ Ремонт завершён.")
     except Exception:
         log.exception("repair_schema failed")
         await m.reply_text("⚠ Ошибка /repair_schema")
 
 async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        with SessionLocal() as db:
+        with session_factory() as db:
             avail = db.execute(sa_text("SELECT EXISTS(SELECT 1 FROM pg_available_extensions WHERE name='vector')")).scalar()
             installed = db.execute(sa_text("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname='vector')")).scalar()
         await (update.effective_message or update.message).reply_text(
@@ -1103,34 +922,13 @@ async def pgvector_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("pgvector_check failed")
         await (update.effective_message or update.message).reply_text("⚠ Ошибка pgvector_check")
-# --- singleton lock на БД (одна копия бота) ---
-from sqlalchemy import text as sa_text
 
-def _singleton_lock_or_exit():
-    try:
-        with SessionLocal() as db:
-            ok = db.execute(sa_text("SELECT pg_try_advisory_lock(:k)"), {"k": 937451}).scalar()
-            if not ok:
-                log.error("❌ Найден другой экземпляр бота (pg_advisory_lock). Завершаю процесс.")
-                import sys
-                sys.exit(0)
-    except Exception:
-        log.exception("singleton lock failed (продолжаю без выхода)")
-
-async def _post_init(app: "Application"):
-    # Сбрасываем webhook и хвосты обновлений перед polling
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("✅ Webhook удалён, pending updates сброшены.")
-    except Exception:
-        log.exception("drop_webhook failed")
-
-# ---------- СБОРКА ПРИЛОЖЕНИЯ ----------
+# =========================
+# BUILD APP
+# =========================
 def build_app() -> Application:
     _singleton_lock_or_exit()
-    app = Application.builder().token(settings.telegram_bot_token).post_init(_post_init).build()
-    _ensure_single_instance()
-    app = ApplicationBuilder().token(settings.telegram_bot_token).post_init(_post_init).build()
+    app = ApplicationBuilder().token(getattr(settings, "telegram_bot_token", os.getenv("TELEGRAM_BOT_TOKEN"))).post_init(_post_init).build()
 
     # Команды
     app.add_handler(CommandHandler("start", start))
@@ -1155,11 +953,12 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("dbcheck", dbcheck))
     app.add_handler(CommandHandler("migrate", migrate))
     app.add_handler(CommandHandler("pgvector_check", pgvector_check))
-    app.add_error_handler(error_handler)
-
 
     # Сообщения
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    # Глобальный обработчик ошибок
+    app.add_error_handler(error_handler)
 
     return app
