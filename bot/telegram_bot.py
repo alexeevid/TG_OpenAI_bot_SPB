@@ -62,17 +62,21 @@ except Exception:
             admin_user_ids = os.getenv("ADMIN_USER_IDS", "")
         settings = _S()  # type: ignore
 
-# Фабрика сессий (надёжное, ленивое разрешение SessionLocal из session.py)
+# ===== СЕССИЯ БД (устойчивый импорт + локальный fallback) =====
 _SessionLocal = None
 
 def _resolve_SessionLocal():
-    """Лениво находим SessionLocal из session.py и не замалчиваем первопричину ошибки."""
+    """
+    Лениво ищем SessionLocal в разных местах; если не нашли — собираем локально
+    из DATABASE_URL/settings.database_url (fallback). Так /kb, /dialogs, /stats не падают.
+    """
     global _SessionLocal
     if _SessionLocal is not None:
         return _SessionLocal
 
     errors = []
-    # 1) Относительный импорт (если telegram_bot импортирован как bot.telegram_bot)
+
+    # 1) Относительный импорт (если файл внутри пакета bot)
     try:
         from .session import SessionLocal as SL  # type: ignore
         _SessionLocal = SL
@@ -80,7 +84,7 @@ def _resolve_SessionLocal():
     except Exception as e:
         errors.append(f".session: {e}")
 
-    # 2) Абсолютный импорт как пакет
+    # 2) Пакетный импорт (bot.session)
     try:
         from bot.session import SessionLocal as SL  # type: ignore
         _SessionLocal = SL
@@ -88,7 +92,7 @@ def _resolve_SessionLocal():
     except Exception as e:
         errors.append(f"bot.session: {e}")
 
-    # 3) Импорт как обычный модуль (если модуль не в пакете)
+    # 3) Плоский импорт (session рядом с текущим модулем)
     try:
         from session import SessionLocal as SL  # type: ignore
         _SessionLocal = SL
@@ -96,10 +100,28 @@ def _resolve_SessionLocal():
     except Exception as e:
         errors.append(f"session: {e}")
 
-    # Если сюда дошли — реально проблема в session.py или путях импорта
-    raise RuntimeError(
-        "SessionLocal не найден. Проверьте файл session.py и импорты. Детали: " + " | ".join(errors)
-    )
+    # 4) Fallback: собрать SessionLocal здесь (по settings.database_url / $DATABASE_URL)
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        db_url = getattr(settings, "database_url", None) or os.getenv("DATABASE_URL")
+        if not db_url:
+            raise RuntimeError("DATABASE_URL / settings.database_url пуст.")
+
+        engine = create_engine(db_url, pool_pre_ping=True, future=True)
+        SL = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+        _SessionLocal = SL
+        logging.getLogger(__name__).warning(
+            "⚠ SessionLocal импортировать не удалось (%s). Использую локальный fallback.",
+            " | ".join(errors)
+        )
+        return _SessionLocal
+    except Exception as e:
+        raise RuntimeError(
+            "SessionLocal не найден и fallback не собрался. Проверьте session.py, пакет bot и DATABASE_URL. "
+            f"Детали импорта: {' | '.join(errors)}; fallback: {e}"
+        ) from e
 
 def session_factory():
     SL = _resolve_SessionLocal()
