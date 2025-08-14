@@ -62,19 +62,49 @@ except Exception:
             admin_user_ids = os.getenv("ADMIN_USER_IDS", "")
         settings = _S()  # type: ignore
 
-# Фабрика сессий (поддерживаем разные размещения файла session.py)
-try:
-    from bot.session import SessionLocal as _SessionLocal
-except Exception:
+# Фабрика сессий (надёжное, ленивое разрешение SessionLocal из session.py)
+_SessionLocal = None
+
+def _resolve_SessionLocal():
+    """Лениво находим SessionLocal из session.py и не замалчиваем первопричину ошибки."""
+    global _SessionLocal
+    if _SessionLocal is not None:
+        return _SessionLocal
+
+    errors = []
+    # 1) Относительный импорт (если telegram_bot импортирован как bot.telegram_bot)
     try:
-        from session import SessionLocal as _SessionLocal  # type: ignore
-    except Exception:
-        _SessionLocal = None
+        from .session import SessionLocal as SL  # type: ignore
+        _SessionLocal = SL
+        return _SessionLocal
+    except Exception as e:
+        errors.append(f".session: {e}")
+
+    # 2) Абсолютный импорт как пакет
+    try:
+        from bot.session import SessionLocal as SL  # type: ignore
+        _SessionLocal = SL
+        return _SessionLocal
+    except Exception as e:
+        errors.append(f"bot.session: {e}")
+
+    # 3) Импорт как обычный модуль (если модуль не в пакете)
+    try:
+        from session import SessionLocal as SL  # type: ignore
+        _SessionLocal = SL
+        return _SessionLocal
+    except Exception as e:
+        errors.append(f"session: {e}")
+
+    # Если сюда дошли — реально проблема в session.py или путях импорта
+    raise RuntimeError(
+        "SessionLocal не найден. Проверьте файл session.py и импорты. Детали: " + " | ".join(errors)
+    )
 
 def session_factory():
-    if _SessionLocal is None:
-        raise RuntimeError("SessionLocal не найден. Проверьте файл session.py и модульный путь импорта.")
-    return _SessionLocal()
+    SL = _resolve_SessionLocal()
+    return SL()
+
 
 # Единственный клиент OpenAI для всего процесса
 _OA = OpenAI(api_key=(getattr(settings, "openai_api_key", None) or os.getenv("OPENAI_API_KEY")))
