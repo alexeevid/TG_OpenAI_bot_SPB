@@ -13,10 +13,46 @@ from datetime import datetime
 from io import BytesIO
 from typing import List
 from urllib.parse import urlparse
+from pathlib import Path
+from openai import OpenAI, BadRequestError
 
 import tiktoken
 from openai import OpenAI
 from sqlalchemy import text as sa_text
+
+# если клиент ещё не создан где-то выше – создадим
+try:
+    client  # noqa: F401
+except NameError:
+    client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
+
+# безопасная фабрика сессий (fallback)
+try:
+    from bot.session import SessionLocal as _SessionLocal  # ваш модуль
+except Exception:
+    try:
+        from session import SessionLocal as _SessionLocal
+    except Exception:
+        _SessionLocal = None
+
+def session_factory():
+    if _SessionLocal is None:
+        raise RuntimeError("SessionLocal not available – проверьте module bot.session")
+    return _SessionLocal()
+
+
+from telegram.ext import ContextTypes
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error", exc_info=context.error)
+    try:
+        m = getattr(update, "effective_message", None)
+        if m:
+            await m.reply_text("⚠ Внутренняя ошибка обработчика. Уже чиним.")
+    except Exception:
+        pass
+
+
 
 # PTB 20.x
 try:
@@ -222,60 +258,38 @@ def _is_nonempty(s: str | None) -> bool:
     return bool(s and s.strip())
 
 async def _maybe_await(v):
-    # чтобы не падать, если _chat_* вдруг синхронная функция
     import asyncio
-    if asyncio.iscoroutine(v):
-        return await v
-    return v
+    return await v if asyncio.iscoroutine(v) else v
 
-# --- main ---
 async def _process_user_text(update, context, text: str):
-    """
-    Единая точка обработки пользовательского текста (вкл. голос -> текст).
-    - сохраняет сообщение в БД
-    - выбирает режим (RAG / обычный)
-    - дожидается генерации (await!)
-    - отправляет длинные ответы частями
-    """
     m = update.effective_message
     user = update.effective_user
-
-    db = session_factory()  # как у тебя создаётся сессия (Session/ScopedSession) — оставить прежнее имя
+    db = session_factory()
     try:
-        # 1) Гарантируем активный диалог и сохраняем сообщение пользователя
-        did = ensure_active_dialog(db, user.id)           # используем твой существующий helper (имена не менял)
-        _save_message(db, did, "user", text)              # как у тебя уже было
+        did = ensure_active_dialog(db, user.id)
+        _save_message(db, did, "user", text)
 
-        # 2) Достаём состояние диалога: модель/стиль/привязанные документы и kb_top_k
-        state = get_dialog_state(db, did)                 # твой helper: {model, style, kb_docs, kb_top_k}
-        kb_docs   = state.get("kb_docs") or []
-        kb_top_k  = int(state.get("kb_top_k") or getattr(settings, "KB_TOP_K", 5))
+        state   = get_dialog_state(db, did)  # {model, style, kb_docs, kb_top_k}
+        kb_docs = state.get("kb_docs") or []
+        kb_top_k = int(state.get("kb_top_k") or getattr(settings, "KB_TOP_K", 5))
 
-        # 3) Генерация ответа
         if kb_docs:
-            # RAG-ветка: обязательно ждём корутину
             resp = _chat_rag(db=db, dialog_id=did, user_text=text, kb_doc_ids=kb_docs, top_k=kb_top_k)
             answer, used_chunks = await _maybe_await(resp)
-            # формируем «Источники: …»
             tail = _format_citations(used_chunks) if used_chunks else ""
-            full_answer = f"{answer}{tail}"
+            full = f"{answer}{tail}"
         else:
-            # Обычная ветка: тоже ждём
             resp = _chat_full(db=db, dialog_id=did, user_text=text)
-            answer = await _maybe_await(resp)
-            full_answer = answer
+            full = await _maybe_await(resp)
 
-        # 4) Отправляем частями (чтобы ответы не «обрубались»)
-        await _send_long(m, full_answer)
-
-        # 5) Логируем ответ ассистента в БД
-        _save_message(db, did, "assistant", full_answer)
-
+        await _send_long(m, full)
+        _save_message(db, did, "assistant", full)
     except Exception:
         log.exception("process_user_text failed")
-        await m.reply_text("⚠ Что-то пошло не так при генерации ответа. Попробуйте ещё раз.")
+        await m.reply_text("⚠ Ошибка генерации ответа. Попробуйте ещё раз.")
     finally:
         db.close()
+
 
 # ---------- OpenAI / RAG ----------
 def _get_embedding_model() -> str:
@@ -672,20 +686,19 @@ async def kb_cmd(update, context):
     m = update.effective_message
     db = session_factory()
     try:
-        # считаем актуальные цифры
         doc_cnt   = db.execute(sa_text("SELECT count(*) FROM kb_documents WHERE is_active = true")).scalar_one()
         chunk_cnt = db.execute(sa_text("SELECT count(*) FROM kb_chunks")).scalar_one()
         link_cnt  = db.execute(sa_text("SELECT count(*) FROM dialog_kb_links")).scalar_one()
 
-        # отправляем «шапку»
-        await m.reply_text(f"БЗ: документов активных — {doc_cnt}, чанков — {chunk_cnt}, привязок к диалогам — {link_cnt}")
+        await m.reply_text(
+            f"БЗ: документов активных — {doc_cnt}, чанков — {chunk_cnt}, привязок к диалогам — {link_cnt}"
+        )
 
-        # клавиатура
-        kb = [
+        keyboard = [
             [InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")],
             [InlineKeyboardButton("📊 Диагностика",   callback_data="kb:diag")],
         ]
-        await m.reply_text("Меню БЗ:", reply_markup=InlineKeyboardMarkup(kb))
+        await m.reply_text("Меню БЗ:", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
         log.exception("kb_cmd failed")
         await m.reply_text("⚠ Ошибка /kb")
@@ -820,29 +833,30 @@ async def on_voice(update, context):
     if not v:
         return await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
 
+    tmp_path = None
     try:
-        # 1) Скачиваем в .ogg (у телеги голос как правило OGG/OPUS)
-        ogg = await v.get_file()
-        tmp_path = Path(tempfile.mkstemp(suffix=".ogg")[1])
-        await ogg.download_to_drive(str(tmp_path))
+        # 1) Скачиваем .ogg
+        file = await v.get_file()
+        fd, p = tempfile.mkstemp(suffix=".ogg")
+        tmp_path = Path(p)
+        os.close(fd)
+        await file.download_to_drive(str(tmp_path))
 
-        # 2) Транскрибируем
+        # 2) Транскрибуем
         with open(tmp_path, "rb") as fh:
-            # оставляю твой клиент и модель, только без экзотики:
-            tr = openai.audio.transcriptions.create(
-                model = getattr(settings, "ASR_MODEL", "gpt-4o-transcribe"),
-                file  = fh,
-                # можно добавить language="ru" если хочешь принудительно
+            tr = client.audio.transcriptions.create(
+                model=getattr(settings, "ASR_MODEL", "gpt-4o-transcribe"),
+                file=fh,
+                # language="ru",
             )
-        text = (tr.text or "").strip()
+        text = (getattr(tr, "text", "") or "").strip()
         if not _is_nonempty(text):
             return await m.reply_text("⚠ Не удалось распознать речь. Скажите ещё раз, пожалуйста.")
 
-        # 3) Отдаём в общий пайплайн (НЕ переписываем m.text!)
+        # 3) В общий пайплайн
         return await _process_user_text(update, context, text)
 
-    except openai.BadRequestError as e:
-        # типичные 400 — неверный формат/битый файл
+    except BadRequestError as e:
         log.error("ASR BadRequest: %s", e, exc_info=True)
         return await m.reply_text("⚠ Не удалось обработать голосовое (формат/качество). Попробуйте ещё раз.")
     except Exception:
@@ -850,8 +864,8 @@ async def on_voice(update, context):
         return await m.reply_text("⚠ Не удалось обработать голосовое. Попробуйте ещё раз.")
     finally:
         try:
-            if tmp_path and Path(tmp_path).exists():
-                Path(tmp_path).unlink(missing_ok=True)
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -1081,6 +1095,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("dbcheck", dbcheck))
     app.add_handler(CommandHandler("migrate", migrate))
     app.add_handler(CommandHandler("pgvector_check", pgvector_check))
+    app.add_error_handler(error_handler)
+
 
     # Сообщения
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
