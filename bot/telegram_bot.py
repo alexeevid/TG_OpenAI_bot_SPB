@@ -243,6 +243,29 @@ def _detect_messages_layout(db):
     _MSG_COLS_CACHE = {"text": "text" in cols, "content": "content" in cols}
     return _MSG_COLS_CACHE
 
+KB_PAGE_SIZE = 10
+
+async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Главное меню 'База знаний':
+    - Пагинация
+    - Фильтры: all / linked / avail
+    - Кнопки: toggle, sync, status
+    """
+    m = update.effective_message or update.message
+    try:
+        mode = context.user_data.get("kb_mode", "all")
+        page = int(context.user_data.get("kb_page", 1) or 1)
+
+        with session_factory() as db:
+            text, markup, pages, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+
+        context.user_data["kb_page"] = page
+        await m.reply_text(text, reply_markup=markup)
+    except Exception:
+        log.exception("kb failed")
+        await m.reply_text("⚠ Ошибка /kb")
+
 def _save_message(db, dialog_id: int, role: str, text: str | None, content: str | None = None):
     cols = _detect_messages_layout(db)
     payload = {"d": dialog_id, "r": role}
@@ -552,18 +575,152 @@ async def kb_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     data = q.data or ""
-    if data == "kb:sync":
-        await q.edit_message_text("🔄 Стартую синхронизацию БЗ…")
-        return await kb_sync(update, context)
-    if data == "kb:diag":
-        await kb_diag(update, context)
-        try:
-            await q.delete_message()
-        except Exception:
-            pass
-        return
+    await q.answer()
+    try:
+        mode = context.user_data.get("kb_mode", "all")
+        page = int(context.user_data.get("kb_page", 1) or 1)
+
+        if data == "kb:nop":
+            return
+
+        if data.startswith("kb:page:"):
+            page = int(data.split(":")[-1])
+            context.user_data["kb_page"] = page
+            with session_factory() as db:
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data.startswith("kb:mode:"):
+            mode = data.split(":")[-1]
+            context.user_data["kb_mode"] = mode
+            context.user_data["kb_page"] = 1
+            with session_factory() as db:
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, 1)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data.startswith("kb:toggle:"):
+            doc_id = int(data.split(":")[-1])
+            with session_factory() as db:
+                did = _get_active_dialog_id(db, update.effective_user.id) or _create_new_dialog_for_tg(db, update.effective_user.id)
+                # Проверяем текущую связь
+                exists = db.execute(sa_text("""
+                    SELECT 1 FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc
+                """), {"d": did, "doc": doc_id}).scalar()
+                if exists:
+                    db.execute(sa_text("""
+                        DELETE FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc
+                    """), {"d": did, "doc": doc_id})
+                else:
+                    db.execute(sa_text("""
+                        INSERT INTO dialog_kb_links (dialog_id, document_id) VALUES (:d, :doc)
+                    """), {"d": did, "doc": doc_id})
+                db.commit()
+
+                text, markup, _, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+        if data == "kb:sync":
+            # асинхронный запуск синка с понятным сообщением
+            await q.edit_message_text("🔄 Синхронизация запущена…")
+            return await kb_sync(update, context)
+
+        if data == "kb:status":
+            with session_factory() as db:
+                # Простой статус по таблицам
+                total_docs = db.execute(sa_text("SELECT COUNT(*) FROM kb_documents")).scalar() or 0
+                active_docs = db.execute(sa_text("SELECT COUNT(*) FROM kb_documents WHERE is_active")).scalar() or 0
+                total_chunks = db.execute(sa_text("SELECT COUNT(*) FROM kb_chunks")).scalar() or 0
+            return await q.edit_message_text(
+                f"📁 Статус БЗ:\n"
+                f"• Документов: {total_docs} (активных: {active_docs})\n"
+                f"• Чанков: {total_chunks}\n",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Назад в БЗ", callback_data="kb:back")]])
+            )
+
+        if data == "kb:back":
+            with session_factory() as db:
+                text, markup, pages, page, _ = _kb_build_ui(db, update.effective_user.id, mode, page)
+            return await q.edit_message_text(text, reply_markup=markup)
+
+    except Exception:
+        log.exception("kb_cb failed")
+        await q.edit_message_text("⚠ Ошибка /kb меню")
+
+
+def _kb_build_ui(db, tg_id: int, mode: str, page: int):
+    """
+    Возвращает (text, markup, total_pages, page, linked_ids_set) для меню БЗ.
+    Показываем все активные документы из kb_documents; фильтры:
+      - all: все активные
+      - linked: только подключённые к активному диалогу
+      - avail: активные, ещё не подключённые
+    """
+    # Гарантируем наличие активного диалога
+    did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
+
+    # Все активные документы
+    docs = db.execute(sa_text("""
+        SELECT id, path, is_active, COALESCE(updated_at, NOW()) AS updated_at
+        FROM kb_documents
+        WHERE is_active = TRUE
+        ORDER BY updated_at DESC, path
+    """)).fetchall()
+
+    # Подключённые к текущему диалогу
+    linked_ids = {
+        r[0] for r in db.execute(sa_text(
+            "SELECT document_id FROM dialog_kb_links WHERE dialog_id = :d"
+        ), {"d": did}).fetchall()
+    }
+
+    def is_linked(doc_id: int) -> bool:
+        return doc_id in linked_ids
+
+    if mode == "linked":
+        docs = [r for r in docs if is_linked(r[0])]
+    elif mode == "avail":
+        docs = [r for r in docs if not is_linked(r[0])]
+    else:
+        # "all" — как есть
+        pass
+
+    total = len(docs)
+    pages = max(1, (total + KB_PAGE_SIZE - 1) // KB_PAGE_SIZE)
+    page = max(1, min(int(page or 1), pages))
+    beg = (page - 1) * KB_PAGE_SIZE
+    chunk = docs[beg:beg + KB_PAGE_SIZE]
+
+    # Формируем клавиатуру
+    rows: List[List[InlineKeyboardButton]] = []
+    for doc_id, path, is_active, updated_at in chunk:
+        check = "☑" if doc_id in linked_ids else "☐"
+        # короткий заголовок
+        title = (path or f"doc #{doc_id}").split("/")[-1]
+        title = title[:70]
+        rows.append([InlineKeyboardButton(f"{check} {title}", callback_data=f"kb:toggle:{doc_id}")])
+
+    # Навигация
+    nav: List[InlineKeyboardButton] = []
+    nav.append(InlineKeyboardButton("«", callback_data=f"kb:page:{page-1 if page > 1 else 1}"))
+    nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="kb:nop"))
+    nav.append(InlineKeyboardButton("»", callback_data=f"kb:page:{page+1 if page < pages else pages}"))
+    rows.append(nav)
+
+    # Фильтры
+    rows.append([
+        InlineKeyboardButton("Все", callback_data="kb:mode:all"),
+        InlineKeyboardButton("Подключённые", callback_data="kb:mode:linked"),
+        InlineKeyboardButton("Доступные", callback_data="kb:mode:avail"),
+    ])
+
+    # Служебные
+    rows.append([InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")])
+    rows.append([InlineKeyboardButton("📁 Статус БЗ", callback_data="kb:status")])
+
+    text = "Меню БЗ: выберите документы для подключения к активному диалогу."
+    return text, InlineKeyboardMarkup(rows), pages, page, linked_ids
+
 
 async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
