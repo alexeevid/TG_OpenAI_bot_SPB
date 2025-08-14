@@ -53,7 +53,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-
 # PTB 20.x
 try:
     from telegram import (
@@ -90,6 +89,59 @@ _OA = OpenAI(api_key=settings.openai_api_key)
 import psycopg2
 
 _singleton_conn = None  # держим подключение живым (держит advisory_lock)
+
+# === Bootstrap: settings, сессии БД, OpenAI client (лениво) ===
+from types import SimpleNamespace
+
+# settings (поддерживаем оба варианта импорта)
+try:
+    from bot.settings import settings as SETTINGS
+except Exception:
+    try:
+        from settings import settings as SETTINGS
+    except Exception:
+        SETTINGS = SimpleNamespace()
+
+# фабрика сессий (оба варианта импорта)
+try:
+    from bot.session import SessionLocal as _SessionLocal
+except Exception:
+    try:
+        from session import SessionLocal as _SessionLocal
+    except Exception:
+        _SessionLocal = None
+
+def session_factory():
+    if _SessionLocal is None:
+        raise RuntimeError("SessionLocal не найден. Проверьте модуль session.py и путь импорта.")
+    return _SessionLocal()
+
+# OpenAI — ленивый клиент + безопасный импорт типов ошибок
+from openai import OpenAI, BadRequestError
+
+def get_openai_client():
+    """Ленивая инициализация клиента OpenAI с учётом окружения."""
+    global _OPENAI_CLIENT  # noqa: PLW0603
+    try:
+        return _OPENAI_CLIENT  # уже создан
+    except NameError:
+        api_key = getattr(SETTINGS, "OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
+        _OPENAI_CLIENT = OpenAI(api_key=api_key)
+        return _OPENAI_CLIENT
+
+from telegram.ext import ContextTypes
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error", exc_info=context.error)
+    m = getattr(update, "effective_message", None)
+    if m:
+        try:
+            await m.reply_text("⚠ Внутренняя ошибка обработчика. Уже чиним.")
+        except Exception:
+            pass
+# в build_app():
+app.add_error_handler(error_handler)
+
 
 def _ensure_single_instance() -> None:
     """Берём pg_advisory_lock на процесс. Если занят — выходим, чтобы не ловить Conflict от Telegram."""
@@ -254,11 +306,12 @@ def _save_message(db, dialog_id: int, role: str, text: str | None, content: str 
 
 
 # --- helpers ---
+import asyncio
+
 def _is_nonempty(s: str | None) -> bool:
     return bool(s and s.strip())
 
 async def _maybe_await(v):
-    import asyncio
     return await v if asyncio.iscoroutine(v) else v
 
 async def _process_user_text(update, context, text: str):
@@ -269,18 +322,18 @@ async def _process_user_text(update, context, text: str):
         did = ensure_active_dialog(db, user.id)
         _save_message(db, did, "user", text)
 
-        state   = get_dialog_state(db, did)  # {model, style, kb_docs, kb_top_k}
-        kb_docs = state.get("kb_docs") or []
-        kb_top_k = int(state.get("kb_top_k") or getattr(settings, "KB_TOP_K", 5))
+        state    = get_dialog_state(db, did)  # {model, style, kb_docs, kb_top_k}
+        kb_docs  = state.get("kb_docs") or []
+        kb_top_k = int(state.get("kb_top_k") or getattr(SETTINGS, "KB_TOP_K", 5))
 
         if kb_docs:
-            resp = _chat_rag(db=db, dialog_id=did, user_text=text, kb_doc_ids=kb_docs, top_k=kb_top_k)
-            answer, used_chunks = await _maybe_await(resp)
+            result = _chat_rag(db=db, dialog_id=did, user_text=text, kb_doc_ids=kb_docs, top_k=kb_top_k)
+            answer, used_chunks = await _maybe_await(result)
             tail = _format_citations(used_chunks) if used_chunks else ""
             full = f"{answer}{tail}"
         else:
-            resp = _chat_full(db=db, dialog_id=did, user_text=text)
-            full = await _maybe_await(resp)
+            result = _chat_full(db=db, dialog_id=did, user_text=text)
+            full = await _maybe_await(result)
 
         await _send_long(m, full)
         _save_message(db, did, "assistant", full)
@@ -682,6 +735,9 @@ async def kb_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("kb_diag failed")
         await m.reply_text("⚠ Ошибка kb_diag")
 
+from sqlalchemy import text as sa_text
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 async def kb_cmd(update, context):
     m = update.effective_message
     db = session_factory()
@@ -693,7 +749,6 @@ async def kb_cmd(update, context):
         await m.reply_text(
             f"БЗ: документов активных — {doc_cnt}, чанков — {chunk_cnt}, привязок к диалогам — {link_cnt}"
         )
-
         keyboard = [
             [InlineKeyboardButton("🗘 Синхронизация", callback_data="kb:sync")],
             [InlineKeyboardButton("📊 Диагностика",   callback_data="kb:diag")],
@@ -704,6 +759,7 @@ async def kb_cmd(update, context):
         await m.reply_text("⚠ Ошибка /kb")
     finally:
         db.close()
+
 
 async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -827,6 +883,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("on_text failed")
         await m.reply_text("⚠ Не удалось обработать сообщение. Попробуйте ещё раз.")
 
+from pathlib import Path
+import tempfile
+
 async def on_voice(update, context):
     m = update.effective_message
     v = m.voice or m.audio
@@ -837,15 +896,15 @@ async def on_voice(update, context):
     try:
         # 1) Скачиваем .ogg
         file = await v.get_file()
-        fd, p = tempfile.mkstemp(suffix=".ogg")
+        fd, p = tempfile.mkstemp(suffix=".ogg"); os.close(fd)
         tmp_path = Path(p)
-        os.close(fd)
         await file.download_to_drive(str(tmp_path))
 
         # 2) Транскрибуем
+        client = get_openai_client()
         with open(tmp_path, "rb") as fh:
             tr = client.audio.transcriptions.create(
-                model=getattr(settings, "ASR_MODEL", "gpt-4o-transcribe"),
+                model=getattr(SETTINGS, "ASR_MODEL", "gpt-4o-transcribe"),
                 file=fh,
                 # language="ru",
             )
@@ -853,7 +912,7 @@ async def on_voice(update, context):
         if not _is_nonempty(text):
             return await m.reply_text("⚠ Не удалось распознать речь. Скажите ещё раз, пожалуйста.")
 
-        # 3) В общий пайплайн
+        # 3) В общий текстовый пайплайн
         return await _process_user_text(update, context, text)
 
     except BadRequestError as e:
@@ -868,6 +927,7 @@ async def on_voice(update, context):
                 tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
 
 # ---- СЕРВИСНЫЕ ----
 async def dbcheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
