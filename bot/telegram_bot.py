@@ -7,6 +7,8 @@ import os, re, inspect
 from datetime import datetime
 from urllib.parse import urlparse
 import tempfile
+from collections import deque
+import time
 
 import logging
 from datetime import datetime
@@ -38,6 +40,10 @@ from bot.db.session import SessionLocal  # engine импортируем вну�
 log = logging.getLogger(__name__)
 settings = load_settings()
 _oa_client = OpenAI(api_key=settings.openai_api_key)
+
+# rate limit (простое «ведерко» на пользователя)
+_RATE_WINDOW_SEC = 60
+_rate_buckets: dict[int, deque] = {}
 
 # --- Авто-миграция при старте (если нет таблиц) ---
 def apply_migrations_if_needed(force: bool = False) -> None:
@@ -142,6 +148,86 @@ def _split_for_tg(text: str, limit: int = TELEGRAM_CHUNK):
     if s:
         parts.append(s)
     return parts
+
+def _is_allowed_user(tg_id: int) -> bool:
+    """Белый список + флаг в БД. Админы — всегда True."""
+    if _is_admin(tg_id):
+        return True
+    # 1) если ALLOWED_USER_IDS задан — работаем строго по нему
+    try:
+        allow_ids = [int(x.strip()) for x in (settings.allowed_user_ids or "").split(",") if x.strip()]
+    except Exception:
+        allow_ids = []
+    if allow_ids:
+        return tg_id in allow_ids
+
+    # 2) иначе — проверяем users.is_allowed (по умолчанию True при первом заходе)
+    try:
+        with SessionLocal() as db:
+            row = db.execute(sa_text("SELECT is_allowed FROM users WHERE tg_user_id=:tg"), {"tg": tg_id}).first()
+            return bool(row[0]) if row else True
+    except Exception:
+        # на всякий случай — не блокируем пользователя из-за сбоя БД
+        return True
+
+
+def _rate_check_and_tick(tg_id: int) -> bool:
+    """Возвращает True, если лимит НЕ превышен (можно отвечать)."""
+    limit = int(getattr(settings, "rate_limit_per_min", 0) or 0)
+    if limit <= 0:
+        return True
+    dq = _rate_buckets.get(tg_id)
+    now = time.time()
+    if dq is None:
+        dq = deque()
+        _rate_buckets[tg_id] = dq
+    # очистим старые отметки
+    while dq and (now - dq[0]) > _RATE_WINDOW_SEC:
+        dq.popleft()
+    if len(dq) >= limit:
+        return False
+    dq.append(now)
+    return True
+
+
+def _trim_ctx_by_tokens(ctx_blocks: list[str], max_tokens: int) -> list[str]:
+    """Аккуратно урезает суммарный контекст (по токенам tiktoken)."""
+    if not ctx_blocks or max_tokens <= 0:
+        return ctx_blocks
+    enc = tiktoken.get_encoding("cl100k_base")
+    def toks(s: str) -> int:
+        try:
+            return len(enc.encode(s))
+        except Exception:
+            return len(s) // 3  # грубая оценка, если кодек недоступен
+
+    result, total = [], 0
+    for block in ctx_blocks:
+        text = (block or "").strip()
+        if not text:
+            continue
+        t = toks(text)
+        if total + t <= max_tokens:
+            result.append(text)
+            total += t
+            continue
+        # частично уместим остаток
+        budget = max_tokens - total
+        if budget <= 0:
+            break
+        # бинпоиск по длине
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if toks(text[:mid]) <= budget:
+                lo = mid + 1
+            else:
+                hi = mid
+        cut = max(0, lo - 1)
+        if cut > 0:
+            result.append(text[:cut])
+        break
+    return result
 
 async def web_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -280,6 +366,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
+    web_line = "/web <запрос> — веб-поиск" if settings.enable_web_search else "/web <запрос> — (заглушка) веб-поиск"
     await m.reply_text(
         "/start — приветствие\n"
         "/help — полный список команд\n"
@@ -290,7 +377,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/model — выбрать модель (ТОП-10 + Показать ещё)\n"
         "/mode — стиль ответа (pro/expert/user/ceo)\n"
         "/img <описание> — генерация изображения (покажу итоговый prompt)\n"
-        "/web <запрос> — (заглушка) веб-поиск\n"
+        f"{web_line}\n"
         "/reset — сброс контекста активного диалога\n"
         "/whoami — мои права\n"
     )
@@ -313,6 +400,12 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     3) если команда «Нарисуй…» — генерим изображение, показываем финальный prompt и пишем в историю;
     4) иначе — обычный RAG-ответ с автопродолжением, сохраняем user+assistant в тот же did, отправляем по частям.
     """
+    uid = update.effective_user.id
+    if not _is_allowed_user(uid):
+        return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
+    if not _rate_check_and_tick(uid):
+        return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
+
     m = update.effective_message or update.message
     try:
         voice = getattr(m, "voice", None)
@@ -397,6 +490,8 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dia_style = row[1] if row and row[1] else "pro"
             chunks = _retrieve_chunks(db, did, q, k=6)
             ctx_blocks = [c.get("content", "")[:1000] for c in chunks] if chunks else []
+            ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
+
 
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
 
@@ -537,65 +632,44 @@ def _format_citations(chunks: List[dict]) -> str:
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает текст пользователя:
-    1) берёт/создаёт активный диалог для этого tg-пользователя;
-    2) тянет контекст из БЗ для ИМЕННО ЭТОГО диалога;
-    3) генерирует полный ответ (с автопродолжением);
-    4) сохраняет оба сообщения (user+assistant) в ТОТ ЖЕ did;
-    5) отправляет ответ пачками, если длинный.
-    """
-    m = update.effective_message or update.message
-
-    # --- режим переименования диалога ---
-    if "rename_dialog_id" in context.user_data:
-        dlg_id = context.user_data.pop("rename_dialog_id")
-        new_title = (m.text or "").strip()[:100]
-        if not new_title:
-            return await m.reply_text("Название пустое. Отменено.")
-        try:
-            with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
-                db.commit()
-            return await m.reply_text("Название сохранено.")
-        except Exception:
-            log.exception("rename dialog title failed")
-            return await m.reply_text("⚠ Не удалось сохранить название.")
-
     # --- обычный текстовый запрос ---
     q = (m.text or "").strip()
     if not q:
         return
 
-    try:
-        # 1) Определяем АКТИВНЫЙ диалог (или создаём новый) — ЭТОТ did используем везде дальше
-        with SessionLocal() as db:
-            tg = update.effective_user.id
-            did = _get_active_dialog_id(db, tg)
-            if not did:
-                did = _create_new_dialog_for_tg(db, tg)
+    # Доступ
+    uid = update.effective_user.id
+    if not _is_allowed_user(uid):
+        return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
 
-            # 2) Модель и стиль из карточки диалога
+    # Rate limit
+    if not _rate_check_and_tick(uid):
+        return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
+
+    try:
+        # 1) Определяем АКТИВНЫЙ диалог (или создаём новый)
+        with SessionLocal() as db:
+            did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
 
-            # 3) Ретрив контекста ИЗ ПРИВЯЗАННЫХ К ЭТОМУ DIALOG ДОКУМЕНТОВ
+            # 3) Ретрив контекста по диалогу
             chunks = _retrieve_chunks(db, did, q, k=6)
             ctx_blocks = [c.get("content", "")[:1000] for c in chunks] if chunks else []
+            # Ограничим суммарный токен-бюджет контекста
+            ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
 
         # 4) Строим промпт под стиль
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
 
-        # 5) Жмём модель до полного ответа (автопродолжение / multi-turn)
         system = {"role": "system", "content": "RAG assistant"}
         user = {"role": "user", "content": prompt}
         answer = await _chat_full(dia_model, [system, user], temperature=0.3)
-
-        # 6) Цитаты по найденным чанкам (если были)
         if chunks:
             answer += _format_citations(chunks)
 
+       
         # 7) Сохраняем оба сообщения РОВНО в тот же did + отмечаем активность
         try:
             with SessionLocal() as db:
@@ -2356,26 +2430,22 @@ def build_app() -> Application:
     apply_migrations_if_needed()
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
     app.add_error_handler(error_handler)
+
+    # callbacks
     app.add_handler(CallbackQueryHandler(model_cb, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(mode_cb, pattern=r"^mode:"))
+
+    # commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("grant", grant))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("revoke", revoke))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("model", model_menu))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("mode", mode_menu))
     app.add_handler(CommandHandler("dialogs", dialogs))
-    app.add_handler(CommandHandler("img", cmd_img))
-    app.add_handler(CallbackQueryHandler(dialog_cb, pattern=r"^dlg:"))
-    app.add_handler(CommandHandler("repair_schema", repair_schema))
-    app.add_handler(CommandHandler("dbcheck", dbcheck))
-    app.add_handler(CommandHandler("migrate", migrate))
-    app.add_handler(CommandHandler("kb", kb))
-    app.add_handler(CallbackQueryHandler(kb_cb, pattern=r"^kb:"))
+    app.add_handler(CommandHandler("dialog_export", dialog_export))
+    app.add_handler(CommandHandler("dialog_delete", dialog_delete))
+    app.add_handler(CommandHandler("dialog_rename", dialog_rename))
     app.add_handler(CommandHandler("dialog_new", dialog_new))
     app.add_handler(CommandHandler("pgvector_check", pgvector_check))
     app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
@@ -2386,10 +2456,15 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("rag_diag", rag_diag))
     app.add_handler(CommandHandler("rag_selftest", rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
-    app.add_handler(CommandHandler("web", cmd_web))
-    app.add_handler(CommandHandler("web", web_cmd))
 
+    # Веб-поиск: регистрируем ровно один хендлер
+    if settings.enable_web_search:
+        app.add_handler(CommandHandler("web", web_cmd))
+    else:
+        app.add_handler(CommandHandler("web", cmd_web))  # мягкая заглушка
+
+    # messages
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
     return app
+
