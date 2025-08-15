@@ -14,7 +14,7 @@ from collections import deque
 import time
 
 from openai import BadRequestError, RateLimitError, APITimeoutError, APIConnectionError, AuthenticationError, APIStatusError
-import logging
+
 from datetime import datetime
 from io import BytesIO
 # ==== KB RAG helpers (safe define if missing) ====
@@ -40,6 +40,13 @@ from sqlalchemy import text as sa_text
 
 from bot.settings import load_settings
 from bot.db.session import SessionLocal  # engine импортируем внутри apply_migrations_if_needed
+import logging
+# унифицируем логгер
+try:
+    log
+except NameError:
+    log = logging.getLogger("bot.telegram_bot")
+logger = log  # чтобы и logger, и log были валидны
 
 log = logging.getLogger(__name__)
 settings = load_settings()
@@ -2163,11 +2170,10 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Единый дружелюбный обработчик исключений."""
-    logger.exception("Unhandled exception", exc_info=context.error)
+    log.exception("Unhandled exception", exc_info=context.error)
     user_msg = "⚠️ Что-то пошло не так. Попробуйте ещё раз."
 
     e = context.error
-    # Распознаём типичные ошибки OpenAI SDK
     if isinstance(e, RateLimitError):
         user_msg = "⚠️ Превышен лимит запросов к модели. Подождите немного и повторите."
     elif isinstance(e, APITimeoutError):
@@ -2177,29 +2183,21 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     elif isinstance(e, AuthenticationError):
         user_msg = "🔑 Ошибка авторизации в OpenAI API. Проверьте OPENAI_API_KEY."
     elif isinstance(e, BadRequestError):
-        # Частые кейсы: слишком длинный промпт/контекст или кривой ввод
         msg = str(e).lower()
-        if "maximum" in msg or "max context" in msg or "too many tokens" in msg or "context length" in msg:
+        if any(k in msg for k in ("maximum", "max context", "too many tokens", "context length")):
             user_msg = "📏 Слишком большой запрос/контекст. Уменьшите объём подключённых документов или сократите вопрос."
         else:
             user_msg = "⚠️ Неверный запрос к модели. Скорректируйте формулировку."
     elif isinstance(e, APIStatusError):
         user_msg = "🛠️ Сервис модели временно недоступен. Повторите чуть позже."
 
-    # Отправим пользователю, если это диалоговое событие
     try:
-        if hasattr(context, "bot"):
-            # Попытаемся ответить туда же, откуда прилетело событие
-            if isinstance(update, Update):
-                m = update.effective_message or update.message or update.edited_message
-                if m:
-                    await m.reply_text(user_msg)
-                    return
-            # Fallback (если нет Update с сообщением)
-            # Ничего не делаем — уже залогировано
+        if isinstance(update, Update):
+            m = update.effective_message or update.message or update.edited_message
+            if m:
+                await m.reply_text(user_msg)
     except Exception:
         pass
-
 
 # ---------- build ----------
 
