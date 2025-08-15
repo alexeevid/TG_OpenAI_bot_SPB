@@ -2426,6 +2426,11 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         
+def _add_cmd_if_present(app, cmd_name: str, func_name: str):
+    fn = globals().get(func_name)
+    if callable(fn):
+        app.add_handler(CommandHandler(cmd_name, fn))
+
 def build_app() -> Application:
     apply_migrations_if_needed()
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
@@ -2443,9 +2448,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("revoke", revoke))
     app.add_handler(CommandHandler("dialogs", dialogs))
-    app.add_handler(CommandHandler("dialog_export", dialog_export))
-    app.add_handler(CommandHandler("dialog_delete", dialog_delete))
-    app.add_handler(CommandHandler("dialog_rename", dialog_rename))
+    _add_cmd_if_present(app, "dialog_export", "dialog_export")
+    _add_cmd_if_present(app, "dialog_delete", "dialog_delete")
+    _add_cmd_if_present(app, "dialog_rename", "dialog_rename")
     app.add_handler(CommandHandler("dialog_new", dialog_new))
     app.add_handler(CommandHandler("pgvector_check", pgvector_check))
     app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
