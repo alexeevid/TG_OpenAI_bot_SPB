@@ -1,6 +1,8 @@
 from __future__ import annotations
 import tiktoken
 import asyncio
+from contextlib import suppress
+
 from openai import OpenAI
 from io import BytesIO
 import os, re, inspect
@@ -10,6 +12,7 @@ import tempfile
 from collections import deque
 import time
 
+from openai import BadRequestError, RateLimitError, APITimeoutError, APIConnectionError, AuthenticationError, APIStatusError
 import logging
 from datetime import datetime
 from io import BytesIO
@@ -45,6 +48,8 @@ _oa_client = OpenAI(api_key=settings.openai_api_key)
 _RATE_WINDOW_SEC = 60
 _rate_buckets: dict[int, deque] = {}
 
+_kb_sync_task: asyncio.Task | None = None
+
 # --- Авто-миграция при старте (если нет таблиц) ---
 def apply_migrations_if_needed(force: bool = False) -> None:
     """
@@ -77,6 +82,11 @@ def apply_migrations_if_needed(force: bool = False) -> None:
             log.info("Auto-migrate: tables already present")
     except Exception:
         log.exception("Auto-migrate failed")
+
+def _kb_counts(db) -> tuple[int, int]:
+    docs = db.execute(sa_text("SELECT count(*) FROM kb_documents WHERE is_active=TRUE")).scalar() or 0
+    chunks = db.execute(sa_text("SELECT count(*) FROM kb_chunks")).scalar() or 0
+    return int(docs), int(chunks)
 
 # ---------- helpers ----------
 def _exec_scalar(db, sql: str, **params):
@@ -1107,86 +1117,88 @@ async def kb_sync_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 import os, re, inspect, asyncio
 
 async def kb_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая синхронизация базы знаний с Яндекс.Диском."""
     m = update.effective_message or update.message
-    if not _is_admin(update.effective_user.id):
-        return await m.reply_text("⛔ Доступ только админам.")
+    uid = update.effective_user.id if update.effective_user else None
+    if not _is_admin(uid or 0):
+        return await m.reply_text("⛔ Только администратор может запускать синхронизацию.")
 
-    await m.reply_text("🔄 Синхронизация запущена...")
+    global _kb_sync_task
+    if _kb_sync_task and not _kb_sync_task.done():
+        return await m.reply_text("⏳ Синхронизация уже выполняется. Дождитесь её завершения.")
 
-    try:
-        from bot.knowledge_base import indexer
+    await m.reply_text("🔄 Синхронизация БЗ запущена в фоне. Сообщу по завершении.")
 
-        # 0) Явный entrypoint через settings/ENV (если задали)
-        explicit = getattr(settings, "kb_sync_entrypoint", None) or os.getenv("KB_SYNC_ENTRYPOINT")
-        fn = getattr(indexer, explicit, None) if explicit else None
+    async def _runner(chat_id: int):
+        start_ts = time.time()
+        created = updated = skipped = failed = 0
+        err_texts: list[str] = []
+        before_docs = before_chunks = after_docs = after_chunks = 0
 
-        # 1) Основные имена
-        if not fn:
-            for name in ("sync_kb","sync_all","sync_from_yandex","sync","run_sync","full_sync",
-                         "reindex","index_all","ingest_all","ingest","main"):
-                if hasattr(indexer, name) and callable(getattr(indexer, name)):
-                    fn = getattr(indexer, name)
-                    break
+        try:
+            # считаем до
+            with SessionLocal() as db:
+                before_docs, before_chunks = _kb_counts(db)
 
-        # 2) Любая публичная функция с подстрокой sync/index/ingest
-        if not fn:
-            for name in dir(indexer):
-                if name.startswith("_"):
-                    continue
-                if re.search(r"(sync|index|ingest)", name, re.I) and callable(getattr(indexer, name)):
-                    fn = getattr(indexer, name)
-                    break
+            # выполняем sync в отдельном потоке (чтобы не блокировать event loop)
+            res = await asyncio.to_thread(_do_kb_sync_once)
 
-        if not fn:
-            raise RuntimeError("Не найден entrypoint в indexer.py. Задай KB_SYNC_ENTRYPOINT или добавь функцию sync_kb().")
+            # ожидаемый формат: dict с ключами counts/created/updated/...
+            if isinstance(res, dict):
+                created = int(res.get("created", 0))
+                updated = int(res.get("updated", 0))
+                skipped = int(res.get("skipped", 0))
+                failed  = int(res.get("failed", 0))
+                if res.get("errors"):
+                    for it in res["errors"]:
+                        err_texts.append(str(it))
 
-        # --- Подготовим аргументы по именам параметров (чтобы не перепутать порядок) ---
-        sig = inspect.signature(fn)
-        kwargs = {}
-        session_to_close = None
-        for p in sig.parameters.values():
-            nm = p.name.lower()
-            if nm in ("session", "db", "conn", "dbsession"):
-                sess = SessionLocal()
-                kwargs[p.name] = sess
-                session_to_close = sess
-            elif nm in ("sessionlocal", "session_factory", "factory"):
-                kwargs[p.name] = SessionLocal
-            elif nm in ("settings", "cfg", "config"):
-                kwargs[p.name] = settings
-            elif p.default is not inspect._empty:
-                # опциональные — просто не передаём
-                pass
-            else:
-                # неизвестный позиционный — подставим None
-                kwargs[p.name] = None
+            # считаем после
+            with SessionLocal() as db:
+                after_docs, after_chunks = _kb_counts(db)
 
-        def _call():
-            try:
-                return fn(**kwargs)
-            finally:
-                if session_to_close is not None:
-                    try:
-                        session_to_close.close()
-                    except Exception:
-                        pass
+        except Exception as e:
+            logger.exception("KB sync failed")
+            err_texts.append(str(e))
 
-        result = await asyncio.to_thread(_call)
+        dur = int(time.time() - start_ts)
+        # собираем отчёт
+        ok = (not err_texts)
+        head = "✅ Синхронизация завершена" if ok else "⚠️ Синхронизация завершилась с ошибками"
+        lines = [
+            f"{head} за {dur} сек.",
+            f"Документы: {before_docs} → {after_docs}",
+            f"Фрагменты: {before_chunks} → {after_chunks}",
+            f"Добавлено: {created}, обновлено: {updated}, пропущено: {skipped}, ошибок: {failed}",
+        ]
+        if err_texts:
+            # показываем первые 3 строки ошибок, остальное — в логах
+            lines.append("")
+            lines.append("Ошибки (первые 3):")
+            for t in err_texts[:3]:
+                lines.append(f"• {t}")
 
-        # --- Формируем ответ пользователю ---
-        if isinstance(result, dict):
-            upd = result.get("updated"); skp = result.get("skipped"); tot = result.get("total")
-            msg = "✅ Синхронизация завершена."
-            if upd is not None or skp is not None or tot is not None:
-                msg += f" Обновлено: {upd or 0}, пропущено: {skp or 0}, всего файлов на диске: {tot or 0}."
-            return await m.reply_text(msg)
-        elif isinstance(result, (tuple, list)) and len(result) >= 2:
-            return await m.reply_text(f"✅ Готово: документов {result[0]}, чанков {result[1]}")
-        else:
-            return await m.reply_text("✅ Синхронизация завершена.")
-    except Exception as e:
-        log.exception("kb_sync failed")
-        return await m.reply_text(f"⚠ Ошибка синхронизации: {e}")
+        text = "\n".join(lines)
+        with suppress(Exception):
+            await context.bot.send_message(chat_id=chat_id, text=text)
+
+    _kb_sync_task = context.application.create_task(_runner(m.chat_id))
+
+def _do_kb_sync_once() -> dict:
+    """Одно прохождение sync_kb с возвратом сводки. Выполняется в thread."""
+    from bot.knowledge_base import indexer
+    summary: dict = {"created": 0, "updated": 0, "skipped": 0, "failed": 0, "errors": []}
+    with SessionLocal() as db:
+        try:
+            res = indexer.sync_kb(db)
+            # Нормализуем: indexer.sync_kb может возвращать None или произвольный объект.
+            if isinstance(res, dict):
+                summary.update({k: res.get(k, summary[k]) for k in summary.keys() if k in res})
+        except Exception as e:
+            logger.exception("sync_kb raised")
+            summary["failed"] = summary.get("failed", 0) + 1
+            summary["errors"].append(str(e))
+    return summary
 
 async def kb_chunks_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -2084,15 +2096,45 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("reset failed")
         await m.reply_text("⚠ Не удалось сбросить диалог.")
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error", exc_info=context.error)
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Единый дружелюбный обработчик исключений."""
+    logger.exception("Unhandled exception", exc_info=context.error)
+    user_msg = "⚠️ Что-то пошло не так. Попробуйте ещё раз."
+
+    e = context.error
+    # Распознаём типичные ошибки OpenAI SDK
+    if isinstance(e, RateLimitError):
+        user_msg = "⚠️ Превышен лимит запросов к модели. Подождите немного и повторите."
+    elif isinstance(e, APITimeoutError):
+        user_msg = "⏳ Время ожидания ответа модели истекло. Попробуйте ещё раз."
+    elif isinstance(e, APIConnectionError):
+        user_msg = "🌐 Временная проблема со связью с OpenAI. Повторите попытку."
+    elif isinstance(e, AuthenticationError):
+        user_msg = "🔑 Ошибка авторизации в OpenAI API. Проверьте OPENAI_API_KEY."
+    elif isinstance(e, BadRequestError):
+        # Частые кейсы: слишком длинный промпт/контекст или кривой ввод
+        msg = str(e).lower()
+        if "maximum" in msg or "max context" in msg or "too many tokens" in msg or "context length" in msg:
+            user_msg = "📏 Слишком большой запрос/контекст. Уменьшите объём подключённых документов или сократите вопрос."
+        else:
+            user_msg = "⚠️ Неверный запрос к модели. Скорректируйте формулировку."
+    elif isinstance(e, APIStatusError):
+        user_msg = "🛠️ Сервис модели временно недоступен. Повторите чуть позже."
+
+    # Отправим пользователю, если это диалоговое событие
     try:
-        if hasattr(update, "message") and update.message:
-            await update.message.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
-        elif hasattr(update, "callback_query") and update.callback_query:
-            await update.callback_query.message.reply_text("⚠ Ошибка обработчика. Попробуйте ещё раз.")
+        if hasattr(context, "bot"):
+            # Попытаемся ответить туда же, откуда прилетело событие
+            if isinstance(update, Update):
+                m = update.effective_message or update.message or update.edited_message
+                if m:
+                    await m.reply_text(user_msg)
+                    return
+            # Fallback (если нет Update с сообщением)
+            # Ничего не делаем — уже залогировано
     except Exception:
         pass
+
 
 # ---------- build ----------
 
