@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     rate_limit_per_min: int = Field(20, validation_alias=AliasChoices('RATE_LIMIT_PER_MIN'))
 
     model_config = SettingsConfigDict(env_prefix='', case_sensitive=True)
+        # --- feature flags ---
+    enable_web_search: bool = Field(False, validation_alias=AliasChoices('ENABLE_WEB_SEARCH'))
+    web_search_provider: str = Field('auto', validation_alias=AliasChoices('WEB_SEARCH_PROVIDER'))
+    enable_image_analysis: bool = Field(False, validation_alias=AliasChoices('ENABLE_IMAGE_ANALYSIS'))
+
 
 def load_settings() -> Settings:
     s = Settings()
