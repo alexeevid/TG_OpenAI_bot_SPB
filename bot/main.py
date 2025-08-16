@@ -16,6 +16,10 @@ def main():
     logging.getLogger("bot").setLevel(logging.DEBUG)        # наши модули
 
     app = build_app()
+    # сброс вебхука на всякий случай
+    app.bot.delete_webhook(drop_pending_updates=True)
+    # запуск только polling и с очисткой очереди
+    app.run_polling(drop_pending_updates=True)
     app.run_polling(allowed_updates=None)
 
 if __name__=='__main__':
