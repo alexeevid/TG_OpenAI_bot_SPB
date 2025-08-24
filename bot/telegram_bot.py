@@ -412,27 +412,16 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Голосовое сообщение: STT (whisper-1) → (опц.) генерация изображения → RAG-ответ."""
-    from io import BytesIO
-    import os, tempfile, asyncio, contextlib
-
     m = update.effective_message or update.message
-    if not m:
-        return
-
-    # Доступ и антифлуд
+    if not m: return
     uid = update.effective_user.id
     if not _is_allowed_user(uid):
-        return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
+        return await m.reply_text("⛔ Доступ ограничен. Обратитесь к администратору.")
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
-
-    # Достаём файл (voice/audio/video_note)
     voice = getattr(m, "voice", None) or getattr(m, "audio", None) or getattr(m, "video_note", None)
     if not voice:
         return await m.reply_text("🎙️ Не нашёл голос/аудио в сообщении.")
-
-    # Скачиваем в память
     bio = BytesIO()
     try:
         tg_file = await voice.get_file()
@@ -441,91 +430,60 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("voice download failed")
         return await m.reply_text("🎙️ Не удалось скачать аудио. Повторите ещё раз.")
     bio.seek(0)
-
-    # Временный файл для Whisper
     suffix = ".oga"
     try:
         mt = (getattr(tg_file, "mime_type", "") or getattr(voice, "mime_type", "") or "").lower()
-        if "mp3" in mt:
-            suffix = ".mp3"
-        elif "wav" in mt:
-            suffix = ".wav"
-        elif "m4a" in mt or "mp4" in mt or "aac" in mt:
-            suffix = ".m4a"
-    except Exception:
-        pass
-
+        if "mp3" in mt: suffix = ".mp3"
+        elif "wav" in mt: suffix = ".wav"
+        elif "m4a" in mt or "mp4" in mt or "aac" in mt: suffix = ".m4a"
+    except Exception: pass
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-            tf.write(bio.getbuffer())
-            tf.flush()
-            tmp_path = tf.name
+            tf.write(bio.getbuffer()); tf.flush(); tmp_path = tf.name
     except Exception:
         log.exception("tempfile create failed")
         return await m.reply_text("🎙️ Не удалось обработать аудио-файл.")
-
-    # --- Транскрипция строго whisper-1 (400 логируем) ---
     async def _transcribe_whisper(path: str) -> str:
         def _call():
             with open(path, "rb") as fd:
-                return _oa_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=fd,
-                    language="ru",  # можно убрать, если язык смешанный
-                )
+                return _oa_client.audio.transcriptions.create(model="whisper-1", file=fd, language="ru")
         try:
             r = await asyncio.to_thread(_call)
             return (getattr(r, "text", None) or "").strip()
         except Exception as e:
-            # если это httpx.HTTPStatusError — вытащим тело ответа для диагностики
             try:
                 from httpx import HTTPStatusError
                 if isinstance(e, HTTPStatusError) and getattr(e, "response", None) is not None:
                     log.error("whisper-1 HTTP %s: %s", e.response.status_code, e.response.text)
-            except Exception:
-                pass
+            except Exception: pass
             raise
-
     try:
         text = await _transcribe_whisper(tmp_path)
     except Exception:
-        log.exception("transcribe failed")
-        with contextlib.suppress(Exception):
-            os.unlink(tmp_path)
+        log.exception("transcribe failed"); 
+        with contextlib.suppress(Exception): os.unlink(tmp_path)
         return await m.reply_text("🎙️ Не удалось распознать речь, попробуйте ещё раз.")
     finally:
-        with contextlib.suppress(Exception):
-            os.unlink(tmp_path)
-
+        with contextlib.suppress(Exception): os.unlink(tmp_path)
     if not text:
         return await m.reply_text("🎙️ Пустая расшифровка. Скажите чуть чётче или в более тихом месте.")
-
     q = text
-
-    # --- Голосовая команда на генерацию изображения (ru/en) ---
     low = q.lower().strip()
-    triggers = [
-        "нарисуй", "сгенерируй картинку", "создай изображение", "сделай картинку", "сделай изображение",
-        "draw", "generate image", "create image", "make a picture"
-    ]
+    triggers = ["нарисуй","сгенерируй картинку","создай изображение","сделай картинку","сделай изображение","draw","generate image","create image","make a picture"]
     want_image, prompt_img = False, None
     for t in triggers:
         if low.startswith(t):
             want_image = True
-            prompt_img = q.split(":", 1)[1].strip() if ":" in q else q[len(t):].strip()
+            prompt_img = q.split(":",1)[1].strip() if ":" in q else q[len(t):].strip()
             break
-
     if want_image and prompt_img:
-        # Генерация изображения
         try:
             from bot.openai_helper import generate_image_bytes
             img_bytes = await asyncio.to_thread(generate_image_bytes, prompt_img)
         except Exception:
             log.exception("image generation failed")
             return await m.reply_text("🖼️ Не получилось сгенерировать изображение. Попробуйте переформулировать.")
-
-        # Сохраняем историю
         try:
             with SessionLocal() as db:
                 did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
@@ -535,8 +493,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db.commit()
         except Exception:
             log.exception("save messages failed (image)")
-
-        # Отправляем изображение
         try:
             if HAS_BUFFERED:
                 file = BufferedInputFile(img_bytes, filename="image.png")
@@ -545,17 +501,39 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tpf:
                     tpf.write(img_bytes); tpf.flush()
                     await m.reply_photo(InputFile(tpf.name), caption=f"🖼️ {prompt_img}")
-                    with contextlib.suppress(Exception):
-                        os.unlink(tpf.name)
+                    with contextlib.suppress(Exception): os.unlink(tpf.name)
         except Exception:
             log.exception("send image failed")
             return await m.reply_text("🖼️ Картинка сгенерирована, но не удалось отправить файл.")
         return
+    try:
+        with SessionLocal() as db:
+            did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
+            row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
+            dia_model = row[0] if row and row[0] else settings.openai_model
+            dia_style = row[1] if row and row[1] else "pro"
+            chunks = _retrieve_chunks(db, did, q, k=6)
+            ctx_blocks = [c.get("content","")[:1000] for c in chunks] if chunks else []
+            ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
+        prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
+        system = {"role":"system","content":"RAG assistant"}
+        user = {"role":"user","content":prompt}
+        answer = await _chat_full(dia_model, [system, user], temperature=0.3)
+        if chunks: answer += _format_citations(chunks)
+        try:
+            with SessionLocal() as db:
+                _save_msg(db, did, "user", f"[voice] {q}")
+                _save_msg(db, did, "assistant", answer)
+                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
+                db.commit()
+        except Exception:
+            log.exception("save messages failed (voice)")
+        await _send_long(m, answer)
+    except Exception:
+        log.exception("on_voice failed")
+        await m.reply_text("⚠ Что-то пошло не так при обработке голосового сообщения.")
 
     # --- Обычный RAG-поток
-
-
-
 def ya_download(path: str) -> bytes:
     """
     Скачивает файл с Я.Диска по абсолютному пути (например, 'disk:/База Знаний/file.pdf').
@@ -666,51 +644,30 @@ def _format_citations(chunks: List[dict]) -> str:
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обычное текстовое сообщение: RAG (KB) → ответ модели → сохранение истории."""
     m = update.effective_message or update.message
-    if not m:
-        return
-
+    if not m: return
     q = (m.text or "").strip()
-    if not q:
-        return
-
-    # ⛔ Доступ и ⚡ антифлуд
+    if not q: return
     uid = update.effective_user.id
     if not _is_allowed_user(uid):
         return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
-
     try:
         chunks = []
-        # 1) Активный диалог + настройки модели/стиля
         with SessionLocal() as db:
             did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
-            row = db.execute(sa_text(
-                "SELECT model, style FROM dialogs WHERE id=:d"
-            ), {"d": did}).first()
+            row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
-
-            # 2) Ретрив контекста из БЗ
             chunks = _retrieve_chunks(db, did, q, k=6)
-            ctx_blocks = [c.get("content", "")[:1000] for c in chunks] if chunks else []
-
-            # 3) Подрежем суммарный контекст по токен-бюджету
+            ctx_blocks = [c.get("content","")[:1000] for c in chunks] if chunks else []
             ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
-
-        # 4) Готовим промпт под стиль
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-        system = {"role": "system", "content": "RAG assistant"}
-        user = {"role": "user", "content": prompt}
-
-        # 5) Вызов модели
+        system = {"role":"system","content":"RAG assistant"}
+        user = {"role":"user","content":prompt}
         answer = await _chat_full(dia_model, [system, user], temperature=0.3)
-        if chunks:
-            answer += _format_citations(chunks)
-
-        # 6) Сохраняем историю и помечаем активность диалога
+        if chunks: answer += _format_citations(chunks)
         try:
             with SessionLocal() as db:
                 _save_msg(db, did, "user", q)
@@ -719,13 +676,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db.commit()
         except Exception:
             log.exception("save messages failed")
-
-        # 7) Отправляем пользователю (дробим на части при необходимости)
         await _send_long(m, answer)
-
     except Exception:
         log.exception("on_text failed")
         await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+
 
 # === DIAG: показать статус всех PDF на диске и что с ними при разборе ===
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
