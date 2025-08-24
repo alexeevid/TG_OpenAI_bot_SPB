@@ -59,8 +59,18 @@ _rate_buckets: dict[int, deque] = {}
 
 _kb_sync_task: asyncio.Task | None = None
 
-from telegram.ext import MessageHandler, filters, DispatcherHandlerStop
+from telegram.ext import MessageHandler, filters
 
+# Совместимость PTB v13/v20+
+try:
+    from telegram.ext import ApplicationHandlerStop as HandlerStop  # PTB v20+
+except Exception:
+    try:
+        from telegram.ext import DispatcherHandlerStop as HandlerStop  # PTB v13
+    except Exception:
+        class HandlerStop(Exception):
+            """Fallback, если в PTB нет stop-исключения."""
+            pass
 async def _unknown_cmd(update, context):
     m = update.effective_message
     txt = (m.text or "").strip() if m else ""
