@@ -2489,4 +2489,13 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
-
+    
+for grp, handlers in (app.handlers or {}).items():
+    try:
+        names = []
+        for h in handlers:
+            cb = getattr(h, "callback", None)
+            names.append(getattr(cb, "__name__", repr(h)))
+        log.info("Handlers group %s: %s", grp, names)
+    except Exception:
+        pass
