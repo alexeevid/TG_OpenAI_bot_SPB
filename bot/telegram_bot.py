@@ -61,7 +61,7 @@ _kb_sync_task: asyncio.Task | None = None
 
 from telegram.ext import MessageHandler, filters
 
-# Совместимость PTB v13/v20+
+# (если где-то в коде поднимаешь stop-исключение — оставим кросс-совместимый алиас)
 try:
     from telegram.ext import ApplicationHandlerStop as HandlerStop  # PTB v20+
 except Exception:
@@ -71,14 +71,14 @@ except Exception:
         class HandlerStop(Exception):
             """Fallback, если в PTB нет stop-исключения."""
             pass
+
+
 async def _unknown_cmd(update, context):
     m = update.effective_message
     txt = (m.text or "").strip() if m else ""
     if txt.startswith("/"):
         await m.reply_text(f"🤷 Команда не распознана: {txt}")
     # не кидаем DispatcherHandlerStop, чтобы не блокировать другие хэндлеры
-
-app.add_handler(MessageHandler(filters.COMMAND, _unknown_cmd), group=99)
 
 async def diag(update, context):
     info = await context.bot.get_webhook_info()
@@ -91,7 +91,6 @@ async def diag(update, context):
         f"allowed_updates: {','.join(info.allowed_updates or []) or 'ALL'}",
     ]
     await update.effective_message.reply_text("\n".join(lines))
-app.add_handler(CommandHandler("diag", diag))
 
 # --- Авто-миграция при старте (если нет таблиц) ---
 def apply_migrations_if_needed(force: bool = False) -> None:
@@ -2484,52 +2483,72 @@ def _add_cmd_if_present(app, cmd_name: str, func_name: str):
 
 def build_app() -> Application:
     apply_migrations_if_needed()
+
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
+
+    # Глобальный обработчик ошибок
     app.add_error_handler(error_handler)
 
-    # callbacks
+    # === CALLBACKS (кнопки)
     app.add_handler(CallbackQueryHandler(model_cb, pattern=r"^model:"))
-    app.add_handler(CallbackQueryHandler(mode_cb, pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(mode_cb,  pattern=r"^mode:"))
 
-    # commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("whoami", whoami))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("grant", grant))
-    app.add_handler(CommandHandler("health", health))
-    app.add_handler(CommandHandler("revoke", revoke))
+    # === COMMANDS (сохраняем порядок и состав)
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("whoami",  whoami))
+    app.add_handler(CommandHandler("help",    help_cmd))
+    app.add_handler(CommandHandler("grant",   grant))
+    app.add_handler(CommandHandler("health",  health))
+    app.add_handler(CommandHandler("revoke",  revoke))
     app.add_handler(CommandHandler("dialogs", dialogs))
+
     _add_cmd_if_present(app, "dialog_export", "dialog_export")
     _add_cmd_if_present(app, "dialog_delete", "dialog_delete")
     _add_cmd_if_present(app, "dialog_rename", "dialog_rename")
-    app.add_handler(CommandHandler("dialog_new", dialog_new))
+
+    app.add_handler(CommandHandler("dialog_new",     dialog_new))
+    app.add_handler(CommandHandler("diag",           diag))
     app.add_handler(CommandHandler("pgvector_check", pgvector_check))
     app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
-    app.add_handler(CommandHandler("kb_chunks_fix", kb_chunks_fix))
-    app.add_handler(CommandHandler("kb_chunks_force", kb_chunks_force))
-    app.add_handler(CommandHandler("kb_sync", kb_sync))
-    app.add_handler(CommandHandler("kb_sync_pdf", kb_sync_pdf))
-    app.add_handler(CommandHandler("rag_diag", rag_diag))
-    app.add_handler(CommandHandler("rag_selftest", rag_selftest))
-    app.add_handler(CommandHandler("kb_pdf_diag", kb_pdf_diag))
+    app.add_handler(CommandHandler("kb_chunks_fix",    kb_chunks_fix))
+    app.add_handler(CommandHandler("kb_chunks_force",  kb_chunks_force))
+    app.add_handler(CommandHandler("kb_sync",          kb_sync))
+    app.add_handler(CommandHandler("kb_sync_pdf",      kb_sync_pdf))
+    app.add_handler(CommandHandler("rag_diag",         rag_diag))
+    app.add_handler(CommandHandler("rag_selftest",     rag_selftest))
+    app.add_handler(CommandHandler("kb_pdf_diag",      kb_pdf_diag))
 
-    # Веб-поиск: регистрируем ровно один хендлер
+    # Веб-поиск: одна из реализаций
     if settings.enable_web_search:
         app.add_handler(CommandHandler("web", web_cmd))
     else:
         app.add_handler(CommandHandler("web", cmd_web))  # мягкая заглушка
 
-    # messages
+    # === MESSAGES
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    return app
-    
-for grp, handlers in (app.handlers or {}).items():
+
+    # === Фоллбек неизвестных команд (диагностика)
+    async def _unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        m = update.effective_message or update.message
+        if not m:
+            return
+        txt = (m.text or "").strip()
+        if txt.startswith("/"):
+            await m.reply_text(f"🤷 Команда не распознана: {txt}")
+
+    # Регистрируем САМЫМ ПОСЛЕДНИМ, чтобы не перехватывал валидные команды
+    app.add_handler(MessageHandler(filters.COMMAND, _unknown_cmd), group=99)
+
+    # === Логируем какие хэндлеры реально повешены
     try:
-        names = []
-        for h in handlers:
-            cb = getattr(h, "callback", None)
-            names.append(getattr(cb, "__name__", repr(h)))
-        log.info("Handlers group %s: %s", grp, names)
+        for grp, handlers in (app.handlers or {}).items():
+            names = []
+            for h in handlers:
+                cb = getattr(h, "callback", None)
+                names.append(getattr(cb, "__name__", repr(h)))
+            log.info("Handlers group %s: %s", grp, names)
     except Exception:
         pass
+
+    return app
