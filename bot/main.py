@@ -1,6 +1,16 @@
 import os
 from bot.settings import load_settings
 from bot.telegram_bot import build_app
+from telegram import Update
+# ...
+app.run_webhook(
+    listen="0.0.0.0",
+    port=port,
+    url_path=url_path,           # "/webhook"
+    webhook_url=webhook_url,
+    allowed_updates=Update.ALL_TYPES,  # <—
+    drop_pending_updates=True,
+)
 
 def _normalize_domain(val: str) -> str:
     if not val:
