@@ -59,6 +59,30 @@ _rate_buckets: dict[int, deque] = {}
 
 _kb_sync_task: asyncio.Task | None = None
 
+from telegram.ext import MessageHandler, filters, DispatcherHandlerStop
+
+async def _unknown_cmd(update, context):
+    m = update.effective_message
+    txt = (m.text or "").strip() if m else ""
+    if txt.startswith("/"):
+        await m.reply_text(f"🤷 Команда не распознана: {txt}")
+    # не кидаем DispatcherHandlerStop, чтобы не блокировать другие хэндлеры
+
+app.add_handler(MessageHandler(filters.COMMAND, _unknown_cmd), group=99)
+
+async def diag(update, context):
+    info = await context.bot.get_webhook_info()
+    lines = [
+        "Diag:",
+        f"webhook url: {info.url or '—'}",
+        f"has_custom_certificate: {getattr(info, 'has_custom_certificate', False)}",
+        f"pending_update_count: {info.pending_update_count}",
+        f"max_connections: {getattr(info, 'max_connections', '—')}",
+        f"allowed_updates: {','.join(info.allowed_updates or []) or 'ALL'}",
+    ]
+    await update.effective_message.reply_text("\n".join(lines))
+app.add_handler(CommandHandler("diag", diag))
+
 # --- Авто-миграция при старте (если нет таблиц) ---
 def apply_migrations_if_needed(force: bool = False) -> None:
     """
