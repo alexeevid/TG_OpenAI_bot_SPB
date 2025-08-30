@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Вариант A: обновляем один файл содержимым из inputs
+      # A) Одним файлом
       - name: Apply changes (single file)
         if: ${{ github.event.inputs.change_type == 'single' }}
         shell: bash
@@ -48,12 +48,13 @@ jobs:
           set -euo pipefail
           path="${{ github.event.inputs.file_path }}"
           mkdir -p "$(dirname "$path")"
+          # ВАЖНО: heredoc с одинарными кавычками — никакой подстановки нет
           cat > "$path" <<'EOF_CONTENT'
 ${{ github.event.inputs.file_content }}
 EOF_CONTENT
           echo "Wrote $path"
 
-      # Вариант B: скачиваем ZIP и распаковываем в корень репозитория
+      # Б) ZIP в корень репозитория
       - name: Apply changes from ZIP
         if: ${{ github.event.inputs.change_type == 'zip' }}
         shell: bash
@@ -69,20 +70,24 @@ EOF_CONTENT
           echo "Unzipped:"
           ls -la
 
+      # Есть ли изменения?
       - name: Detect changes
         id: diff
         shell: bash
         run: |
           set -euo pipefail
-          cnt="$(git status --porcelain | wc -l || true)"
-          echo "changed=$cnt" >> "$GITHUB_OUTPUT"
-          echo "Changed files: $cnt"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+          fi
 
+      # Создать PR (если есть изменения)
       - name: Create Pull Request
-        if: ${{ steps.diff.outputs.changed != '0' }}
+        if: ${{ steps.diff.outputs.changed == '1' }}
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ github.token }}            # хватает встроенного GITHUB_TOKEN
+          token: ${{ github.token }}   # встроенного хватает
           commit-message: ${{ github.event.inputs.commit_message }}
           title: ${{ github.event.inputs.pr_title }}
           body: ${{ github.event.inputs.pr_body }}
