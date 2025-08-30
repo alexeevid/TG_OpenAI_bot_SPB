@@ -1,4 +1,5 @@
 import os
+from bot.telegram_bot import app
 from bot.settings import load_settings
 from bot.telegram_bot import build_app
 from telegram import Update
