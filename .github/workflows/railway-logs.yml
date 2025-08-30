@@ -12,11 +12,11 @@ on:
         required: false
         default: ""
       environment_id:
-        description: "Override Railway ENVIRONMENT_ID (опционально)"
+        description: "Override Railway ENV_ID (опционально)"
         required: false
         default: ""
       deployment_id:
-        description: "Опционально: DEPLOYMENT_ID или --build"
+        description: "Опционально: DEPLOYMENT_ID или спец-значение __build для --build"
         required: false
         default: ""
   pull_request:
@@ -26,13 +26,11 @@ jobs:
   logs:
     runs-on: ubuntu-latest
 
-    # ВАЖНО: CLI Railway берёт токен из переменной окружения RAILWAY_TOKEN.
-    # Остальные ID тоже читаем из secrets (либо переопределяем inputs).
     env:
-      RAILWAY_TOKEN:        ${{ secrets.RAILWAY_TOKEN }}
-      RAILWAY_PROJECT_ID:   ${{ secrets.RAILWAY_PROJECT_ID }}
-      RAILWAY_SERVICE_ID:   ${{ secrets.RAILWAY_SERVICE_ID }}
-      RAILWAY_ENV_ID:       ${{ secrets.RAILWAY_ENV_ID }}
+      RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+      RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+      RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
 
     steps:
       - name: Checkout
@@ -43,26 +41,33 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Validate required secrets
+        run: |
+          set -e
+          for v in RAILWAY_TOKEN RAILWAY_PROJECT_ID RAILWAY_SERVICE_ID RAILWAY_ENV_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing required secret/env: $v"
+              exit 1
+            fi
+          done
+
       - name: Install Railway CLI
         run: |
           npm i -g @railway/cli@latest
           railway --version
 
-      # Авторизация: CLI использует env RAILWAY_TOKEN. Отдельный "login" не нужен.
-      - name: Sanity check (whoami)
-        run: |
-          set -e
-          railway whoami || true
+      - name: Who am I
+        run: railway whoami || true
 
-      # Выставляем контекст проекта/окружения/сервиса. Это корректный способ вместо --project в logs.
-      - name: Set Railway context
+      - name: Select Railway context (project/env/service)
         run: |
           set -euo pipefail
-          # если inputs пустые — берём из secrets
-          SERVICE_ID="${{ github.event.inputs.service_id || env.RAILWAY_SERVICE_ID }}"
-          ENV_ID="${{ github.event.inputs.environment_id || env.RAILWAY_ENV_ID }}"
+          IN_SERVICE="${{ github.event.inputs.service_id }}"
+          IN_ENV="${{ github.event.inputs.environment_id }}"
 
-          # --yes, чтобы команда не задавала вопросов
+          SERVICE_ID="${IN_SERVICE:-$RAILWAY_SERVICE_ID}"
+          ENV_ID="${IN_ENV:-$RAILWAY_ENV_ID}"
+
           railway use \
             --project "$RAILWAY_PROJECT_ID" \
             --environment "$ENV_ID" \
@@ -73,27 +78,32 @@ jobs:
         id: fetch
         run: |
           set -euo pipefail
+          # inputs могут отсутствовать (например, при pull_request) — задаём дефолты в bash
+          LINES_IN="${{ github.event.inputs.lines }}"
+          SERVICE_IN="${{ github.event.inputs.service_id }}"
+          ENV_IN="${{ github.event.inputs.environment_id }}"
+          DEPLOYMENT_IN="${{ github.event.inputs.deployment_id }}"
 
-          LINES="${{ github.event.inputs.lines || '400' }}"
-          SERVICE_ID="${{ github.event.inputs.service_id || env.RAILWAY_SERVICE_ID }}"
-          ENV_ID="${{ github.event.inputs.environment_id || env.RAILWAY_ENV_ID }}"
-          DEPLOYMENT_ID="${{ github.event.inputs.deployment_id || '' }}"
+          LINES="${LINES_IN:-400}"
+          SERVICE_ID="${SERVICE_IN:-$RAILWAY_SERVICE_ID}"
+          ENV_ID="${ENV_IN:-$RAILWAY_ENV_ID}"
 
-          if [ -n "$DEPLOYMENT_ID" ]; then
-            DEP_ARG="--deployment $DEPLOYMENT_ID"
-          else
-            DEP_ARG=""
+          DEP_ARG=""
+          if [ -n "${DEPLOYMENT_IN:-}" ]; then
+            if [ "$DEPLOYMENT_IN" = "__build" ]; then
+              DEP_ARG="--build"
+            else
+              DEP_ARG="--deployment $DEPLOYMENT_IN"
+            fi
           fi
 
-          # ВАЖНО: команда logs НЕ принимает --project.
-          # Контекст уже задан через `railway use` выше.
+          # ВАЖНО: logs НЕ принимает --project. Контекст задан через railway use.
           railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
 
-          # tail для Summary/коммента
           tail -n "$LINES" logs.json | tee tail.txt
 
-          # передадим хвост межшагово как output
           {
+            echo "lines=$LINES"
             echo "tail<<'EOF'"
             tail -n "$LINES" logs.json
             echo "EOF"
@@ -101,11 +111,13 @@ jobs:
 
       - name: Summary
         run: |
-          echo "### Railway logs (last ${{ github.event.inputs.lines || '400' }} lines)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```json' >> "$GITHUB_STEP_SUMMARY"
-          cat tail.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Railway logs (last ${{ steps.fetch.outputs.lines }} lines)"
+            echo
+            echo '```json'
+            cat tail.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -123,7 +135,7 @@ jobs:
           token: ${{ github.token }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            ### Railway logs (last ${{ github.event.inputs.lines || '400' }} lines)
+            ### Railway logs (last ${{ steps.fetch.outputs.lines }} lines)
             ```json
             ${{ steps.fetch.outputs.tail }}
             ```
