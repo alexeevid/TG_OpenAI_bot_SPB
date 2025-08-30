@@ -764,7 +764,7 @@ def _format_citations(chunks: List[dict]) -> str:
         return ""
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
-aasync def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # A) защита от дублей + таймер
     if recent_updates.seen(update.update_id):
         return
