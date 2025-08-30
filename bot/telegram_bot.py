@@ -2518,7 +2518,18 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("rag_selftest",     rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag",      kb_pdf_diag))
 
-    # Веб-поиск: одна из реализаций
+    from telegram.ext import CommandHandler
+
+    # Собираем список известных команд из всех зарегистрированных CommandHandler
+    known_commands = set()
+    for grp, handlers in (app.handlers or {}).items():
+        for h in handlers:
+            if isinstance(h, CommandHandler):
+                # h.commands — set[str] команд, добавляем в общий набор
+                for c in h.commands:
+                    known_commands.add(c.lower())
+    
+        # Веб-поиск: одна из реализаций
     if settings.enable_web_search:
         app.add_handler(CommandHandler("web", web_cmd))
     else:
@@ -2528,14 +2539,22 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # === Фоллбек неизвестных команд (диагностика)
+    from telegram import Update
+    from telegram.ext import ContextTypes, MessageHandler, filters
+    
     async def _unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = update.effective_message or update.message
-        if not m:
+        if not m or not (m.text or "").strip().startswith("/"):
             return
-        txt = (m.text or "").strip()
-        if txt.startswith("/"):
-            await m.reply_text(f"🤷 Команда не распознана: {txt}")
+        raw = (m.text or "").strip().split()[0]   # первый токен вида "/diag@bot"
+        cmd = raw[1:]                              # "diag@bot"
+        cmd = cmd.split("@", 1)[0].lower()         # "diag"
+    
+        # Если команда известна и уже зарегистрирована — фоллбек ничего не отвечает
+        if cmd in known_commands:
+            return
+    
+        await m.reply_text(f"🤷 Команда не распознана: {raw}")
 
     # Регистрируем САМЫМ ПОСЛЕДНИМ, чтобы не перехватывал валидные команды
     app.add_handler(MessageHandler(filters.COMMAND, _unknown_cmd), group=99)
