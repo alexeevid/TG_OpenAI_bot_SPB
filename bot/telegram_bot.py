@@ -455,16 +455,37 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # A') защита от дублей + таймер
+    if recent_updates.seen(update.update_id):
+        return
+    t0 = time.perf_counter()
+
     m = update.effective_message or update.message
-    if not m: return
+    if not m:
+        return
+
     uid = update.effective_user.id
     if not _is_allowed_user(uid):
-        return await m.reply_text("⛔ Доступ ограничен. Обратитесь к администратору.")
+        return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
+
+    # Находим голос/аудио
     voice = getattr(m, "voice", None) or getattr(m, "audio", None) or getattr(m, "video_note", None)
     if not voice:
         return await m.reply_text("🎙️ Не нашёл голос/аудио в сообщении.")
+
+    did = None
+    # Рано определим диалог и проставим контекст логов
+    try:
+        with SessionLocal() as db:
+            did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
+        bind_log_context(request_id=update.update_id, user_id=uid, dialog_id=did, event="on_voice")
+    except Exception:
+        # даже если не нашли диалог — продолжим с did=None, но залогируем
+        log.exception("resolve dialog for voice failed")
+
+    # Скачиваем файл
     bio = BytesIO()
     try:
         tg_file = await voice.get_file()
@@ -472,54 +493,87 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("voice download failed")
         return await m.reply_text("🎙️ Не удалось скачать аудио. Повторите ещё раз.")
+
     bio.seek(0)
+    # Определяем расширение
     suffix = ".oga"
     try:
         mt = (getattr(tg_file, "mime_type", "") or getattr(voice, "mime_type", "") or "").lower()
-        if "mp3" in mt: suffix = ".mp3"
-        elif "wav" in mt: suffix = ".wav"
-        elif "m4a" in mt or "mp4" in mt or "aac" in mt: suffix = ".m4a"
-    except Exception: pass
+        if "mp3" in mt:
+            suffix = ".mp3"
+        elif "wav" in mt:
+            suffix = ".wav"
+        elif "m4a" in mt or "mp4" in mt or "aac" in mt:
+            suffix = ".m4a"
+    except Exception:
+        pass
+
+    # Кладём в временный файл
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-            tf.write(bio.getbuffer()); tf.flush(); tmp_path = tf.name
+            tf.write(bio.getbuffer())
+            tf.flush()
+            tmp_path = tf.name
     except Exception:
         log.exception("tempfile create failed")
         return await m.reply_text("🎙️ Не удалось обработать аудио-файл.")
+
+    # Транскрипция (с ретраями)
     async def _transcribe_whisper(path: str) -> str:
         def _call():
             with open(path, "rb") as fd:
-                return _oa_client.audio.transcriptions.create(model="whisper-1", file=fd, language="ru")
+                return _oa_client.audio.transcriptions.create(
+                    model="whisper-1", file=fd, language="ru"
+                )
         try:
             r = await asyncio.to_thread(_call)
             return (getattr(r, "text", None) or "").strip()
         except Exception as e:
+            # аккуратный лог HTTP ошибок
             try:
                 from httpx import HTTPStatusError
                 if isinstance(e, HTTPStatusError) and getattr(e, "response", None) is not None:
                     log.error("whisper-1 HTTP %s: %s", e.response.status_code, e.response.text)
-            except Exception: pass
+            except Exception:
+                pass
             raise
+
     try:
-        text = await _transcribe_whisper(tmp_path)
+        text = await retry_async(lambda: _transcribe_whisper(tmp_path), tries=3)
     except Exception:
-        log.exception("transcribe failed"); 
-        with contextlib.suppress(Exception): os.unlink(tmp_path)
+        log.exception("transcribe failed")
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_path)
+        # Если есть диалог — сохраним системную запись с ошибкой (без NULL)
+        if did is not None:
+            with contextlib.suppress(Exception):
+                with SessionLocal() as db:
+                    _save_msg(db, did, "system", "voice transcription failed")
+                    db.commit()
         return await m.reply_text("🎙️ Не удалось распознать речь, попробуйте ещё раз.")
     finally:
-        with contextlib.suppress(Exception): os.unlink(tmp_path)
+        with contextlib.suppress(Exception):
+            os.unlink(tmp_path)
+
     if not text:
         return await m.reply_text("🎙️ Пустая расшифровка. Скажите чуть чётче или в более тихом месте.")
+
+    # Команда на картинку голосом?
     q = text
     low = q.lower().strip()
-    triggers = ["нарисуй","сгенерируй картинку","создай изображение","сделай картинку","сделай изображение","draw","generate image","create image","make a picture"]
+    triggers = [
+        "нарисуй", "сгенерируй картинку", "создай изображение",
+        "сделай картинку", "сделай изображение",
+        "draw", "generate image", "create image", "make a picture",
+    ]
     want_image, prompt_img = False, None
     for t in triggers:
         if low.startswith(t):
             want_image = True
-            prompt_img = q.split(":",1)[1].strip() if ":" in q else q[len(t):].strip()
+            prompt_img = q.split(":", 1)[1].strip() if ":" in q else q[len(t):].strip()
             break
+
     if want_image and prompt_img:
         try:
             from bot.openai_helper import generate_image_bytes
@@ -527,54 +581,78 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("image generation failed")
             return await m.reply_text("🖼️ Не получилось сгенерировать изображение. Попробуйте переформулировать.")
+
+        # Сохраняем историю
         try:
             with SessionLocal() as db:
-                did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
+                did = did or (_get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid))
                 _save_msg(db, did, "user", f"[voice] {q}")
                 _save_msg(db, did, "assistant", f"[image] {prompt_img}")
                 db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
                 db.commit()
         except Exception:
             log.exception("save messages failed (image)")
+
+        # Отправляем картинку
         try:
-            if HAS_BUFFERED:
+            if 'HAS_BUFFERED' in globals() and HAS_BUFFERED:
                 file = BufferedInputFile(img_bytes, filename="image.png")
                 await m.reply_photo(file, caption=f"🖼️ {prompt_img}")
             else:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tpf:
                     tpf.write(img_bytes); tpf.flush()
                     await m.reply_photo(InputFile(tpf.name), caption=f"🖼️ {prompt_img}")
-                    with contextlib.suppress(Exception): os.unlink(tpf.name)
+                with contextlib.suppress(Exception):
+                    os.unlink(tpf.name)
         except Exception:
             log.exception("send image failed")
             return await m.reply_text("🖼️ Картинка сгенерирована, но не удалось отправить файл.")
+        finally:
+            logging.getLogger("perf").info(
+                "handled",
+                extra={"event": "on_voice", "latency_ms": int((time.perf_counter() - t0) * 1000)},
+            )
         return
+
+    # Обычный голос → текст → RAG → ответ
     try:
         with SessionLocal() as db:
-            did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
+            did = did or (_get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid))
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
-            chunks = _retrieve_chunks(db, did, q, k=6)
-            ctx_blocks = [c.get("content","")[:1000] for c in chunks] if chunks else []
-            ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
-        prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-        system = {"role":"system","content":"RAG assistant"}
-        user = {"role":"user","content":prompt}
-        answer = await _chat_full(dia_model, [system, user], temperature=0.3)
-        if chunks: answer += _format_citations(chunks)
+            chunks = _retrieve_chunks(db, did, text, k=6)
+
+        ctx_blocks = [c.get("content", "")[:1000] for c in (chunks or [])]
+        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
+        prompt = _build_prompt_with_style(ctx_blocks, text, dia_style) if ctx_blocks else text
+
+        system = {"role": "system", "content": "RAG assistant"}
+        user   = {"role": "user",   "content": prompt}
+        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=0.3), tries=3)
+        if chunks:
+            answer += _format_citations(chunks)
+
         try:
             with SessionLocal() as db:
-                _save_msg(db, did, "user", f"[voice] {q}")
+                _save_msg(db, did, "user", f"[voice] {text}")
                 _save_msg(db, did, "assistant", answer)
                 db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
                 db.commit()
         except Exception:
             log.exception("save messages failed (voice)")
+
         await _send_long(m, answer)
+
     except Exception:
         log.exception("on_voice failed")
         await m.reply_text("⚠ Что-то пошло не так при обработке голосового сообщения.")
+    finally:
+        logging.getLogger("perf").info(
+            "handled",
+            extra={"event": "on_voice", "latency_ms": int((time.perf_counter() - t0) * 1000)},
+        )
+
 
     # --- Обычный RAG-поток
 def ya_download(path: str) -> bytes:
@@ -686,31 +764,55 @@ def _format_citations(chunks: List[dict]) -> str:
         return ""
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+aasync def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # A) защита от дублей + таймер
+    if recent_updates.seen(update.update_id):
+        return
+    t0 = time.perf_counter()
+
     m = update.effective_message or update.message
-    if not m: return
+    if not m:
+        return
+
     q = (m.text or "").strip()
-    if not q: return
+    if not q:
+        return
+
     uid = update.effective_user.id
+    # доступ и rate-limit
     if not _is_allowed_user(uid):
         return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
+
+    did = None
     try:
-        chunks = []
+        # 1) Определяем активный диалог и вешаем контекст логов
         with SessionLocal() as db:
             did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
+            bind_log_context(request_id=update.update_id, user_id=uid, dialog_id=did, event="on_text")
+
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
+
+            # 2) Ретрив контекста
             chunks = _retrieve_chunks(db, did, q, k=6)
-            ctx_blocks = [c.get("content","")[:1000] for c in chunks] if chunks else []
-            ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
+
+        # 3) Сборка промпта
+        ctx_blocks = [c.get("content", "")[:1000] for c in (chunks or [])]
+        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-        system = {"role":"system","content":"RAG assistant"}
-        user = {"role":"user","content":prompt}
-        answer = await _chat_full(dia_model, [system, user], temperature=0.3)
-        if chunks: answer += _format_citations(chunks)
+
+        # 4) Вызов LLM с ретраями
+        system = {"role": "system", "content": "RAG assistant"}
+        user   = {"role": "user",   "content": prompt}
+        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=0.3), tries=3)
+
+        if chunks:
+            answer += _format_citations(chunks)
+
+        # 5) Сохраняем переписку
         try:
             with SessionLocal() as db:
                 _save_msg(db, did, "user", q)
@@ -718,12 +820,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
                 db.commit()
         except Exception:
-            log.exception("save messages failed")
+            log.exception("save messages failed (text)")
+
+        # 6) Отправляем ответ
         await _send_long(m, answer)
+
     except Exception:
         log.exception("on_text failed")
         await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
-
+    finally:
+        # C) метрика времени обработки
+        logging.getLogger("perf").info(
+            "handled",
+            extra={"event": "on_text", "latency_ms": int((time.perf_counter() - t0) * 1000)},
+        )
 
 # === DIAG: показать статус всех PDF на диске и что с ними при разборе ===
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2493,6 +2603,8 @@ def _add_cmd_if_present(app, cmd_name: str, func_name: str):
 
 
 def build_app() -> Application:
+    # JSON-логи: уровень берём из settings.log_level, иначе INFO
+    setup_logging(getattr(settings, "log_level", "INFO"))
     """Builds and returns the PTB Application with all handlers registered."""
     try:
         apply_migrations_if_needed()
