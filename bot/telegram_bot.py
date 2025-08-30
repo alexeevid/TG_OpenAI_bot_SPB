@@ -12,7 +12,9 @@ from urllib.parse import urlparse
 import tempfile
 from collections import deque
 import time
-
+from telegram.ext import CommandHandler
+from telegram import Update
+from telegram.ext import ContextTypes, MessageHandler, filters
 
 from openai import BadRequestError, RateLimitError, APITimeoutError, APIConnectionError, AuthenticationError, APIStatusError
 
@@ -71,7 +73,6 @@ except Exception:
         class HandlerStop(Exception):
             """Fallback, если в PTB нет stop-исключения."""
             pass
-
 
 async def _unknown_cmd(update, context):
     m = update.effective_message
@@ -2485,15 +2486,13 @@ def build_app() -> Application:
     apply_migrations_if_needed()
 
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
-
-    # Глобальный обработчик ошибок
     app.add_error_handler(error_handler)
 
     # === CALLBACKS (кнопки)
     app.add_handler(CallbackQueryHandler(model_cb, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(mode_cb,  pattern=r"^mode:"))
 
-    # === COMMANDS (сохраняем порядок и состав)
+    # === COMMANDS
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("whoami",  whoami))
     app.add_handler(CommandHandler("help",    help_cmd))
@@ -2518,18 +2517,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("rag_selftest",     rag_selftest))
     app.add_handler(CommandHandler("kb_pdf_diag",      kb_pdf_diag))
 
-    from telegram.ext import CommandHandler
-
-    # Собираем список известных команд из всех зарегистрированных CommandHandler
-    known_commands = set()
-    for grp, handlers in (app.handlers or {}).items():
-        for h in handlers:
-            if isinstance(h, CommandHandler):
-                # h.commands — set[str] команд, добавляем в общий набор
-                for c in h.commands:
-                    known_commands.add(c.lower())
-    
-        # Веб-поиск: одна из реализаций
+    # === Веб-поиск (ставим ДО known_commands!)
     if settings.enable_web_search:
         app.add_handler(CommandHandler("web", web_cmd))
     else:
@@ -2539,27 +2527,32 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.VOICE, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    from telegram import Update
-    from telegram.ext import ContextTypes, MessageHandler, filters
-    
+    # === Собираем список известных команд (после регистрации всех CommandHandler)
+    known_commands = set()
+    for grp, handlers in (app.handlers or {}).items():
+        for h in handlers:
+            cmds = getattr(h, "commands", None)  # не завязаны на класс, работает шире
+            if cmds:
+                for c in cmds:
+                    known_commands.add(c.lower())
+
+    # === Фоллбек неизвестных команд
     async def _unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = update.effective_message or update.message
-        if not m or not (m.text or "").strip().startswith("/"):
+        if not m:
             return
-        raw = (m.text or "").strip().split()[0]   # первый токен вида "/diag@bot"
-        cmd = raw[1:]                              # "diag@bot"
-        cmd = cmd.split("@", 1)[0].lower()         # "diag"
-    
-        # Если команда известна и уже зарегистрирована — фоллбек ничего не отвечает
+        txt = (m.text or "").strip()
+        if not txt.startswith("/"):
+            return
+        raw = txt.split()[0]                 # "/diag@bot"
+        cmd = raw[1:].split("@", 1)[0].lower()  # "diag"
         if cmd in known_commands:
             return
-    
         await m.reply_text(f"🤷 Команда не распознана: {raw}")
 
-    # Регистрируем САМЫМ ПОСЛЕДНИМ, чтобы не перехватывал валидные команды
     app.add_handler(MessageHandler(filters.COMMAND, _unknown_cmd), group=99)
 
-    # === Логируем какие хэндлеры реально повешены
+    # === Логируем хэндлеры
     try:
         for grp, handlers in (app.handlers or {}).items():
             names = []
