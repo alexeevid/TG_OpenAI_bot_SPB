@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # --- Вариант А: правим один файл, контент берём из input
+      # Вариант A: обновляем один файл содержимым из inputs
       - name: Apply changes (single file)
         if: ${{ github.event.inputs.change_type == 'single' }}
         shell: bash
@@ -53,7 +53,7 @@ ${{ github.event.inputs.file_content }}
 EOF_CONTENT
           echo "Wrote $path"
 
-      # --- Вариант Б: скачиваем ZIP и распаковываем в корень репозитория
+      # Вариант B: скачиваем ZIP и распаковываем в корень репозитория
       - name: Apply changes from ZIP
         if: ${{ github.event.inputs.change_type == 'zip' }}
         shell: bash
@@ -69,7 +69,6 @@ EOF_CONTENT
           echo "Unzipped:"
           ls -la
 
-      # Узнаём, есть ли изменения
       - name: Detect changes
         id: diff
         shell: bash
@@ -79,13 +78,11 @@ EOF_CONTENT
           echo "changed=$cnt" >> "$GITHUB_OUTPUT"
           echo "Changed files: $cnt"
 
-      # Создаём Pull Request (если есть изменения)
       - name: Create Pull Request
         if: ${{ steps.diff.outputs.changed != '0' }}
         uses: peter-evans/create-pull-request@v6
         with:
-          # Если есть секрет GH_TOKEN, используем его; иначе встроенный GITHUB_TOKEN
-          token: ${{ secrets.GH_TOKEN || github.token }}
+          token: ${{ github.token }}            # хватает встроенного GITHUB_TOKEN
           commit-message: ${{ github.event.inputs.commit_message }}
           title: ${{ github.event.inputs.pr_title }}
           body: ${{ github.event.inputs.pr_body }}
@@ -94,8 +91,6 @@ EOF_CONTENT
           author: assistant-bot <assistant-bot@users.noreply.github.com>
           committer: assistant-bot <assistant-bot@users.noreply.github.com>
 
-      # Если правок не было — в Summary короткое сообщение
       - name: No changes summary
         if: ${{ steps.diff.outputs.changed == '0' }}
-        run: |
-          echo "No changes detected. Nothing to commit." >> "$GITHUB_STEP_SUMMARY"
+        run: echo "No changes detected. Nothing to commit." >> "$GITHUB_STEP_SUMMARY"
