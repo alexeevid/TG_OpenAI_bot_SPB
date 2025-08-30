@@ -1,55 +1,31 @@
-
 name: Railway Logs (manual)
 
 on:
   workflow_dispatch:
-    inputs:
-      lines:
-        description: 'Number of log lines to fetch'
-        required: false
-        default: '400'
-      service:
-        description: 'Railway service name or id (optional if single service)'
-        required: false
-        default: ''
-      environment:
-        description: 'Railway environment name or id (optional)'
-        required: false
-        default: ''
 
 jobs:
-  fetch-logs:
+  logs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - name: Install Railway CLI
-        run: npm i -g @railway/cli
+        run: curl -fsSL https://railway.app/install.sh | sh
+
       - name: Fetch logs
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          RAILWAY_ENV_ID: ${{ secrets.RAILWAY_ENV_ID }}  # опционально
         run: |
-          set -euo pipefail
-          LINES="${{ github.event.inputs.lines }}"
-          SERVICE="${{ github.event.inputs.service }}"
-          ENVIRONMENT="${{ github.event.inputs.environment }}"
-          ARGS="--json -n ${LINES}"
-          if [ -n "${SERVICE}" ]; then ARGS="${ARGS} --service \"${SERVICE}\""; fi
-          if [ -n "${ENVIRONMENT}" ]; then ARGS="${ARGS} --environment \"${ENVIRONMENT}\""; fi
-          echo "railway logs ${ARGS}"
-          # shellcheck disable=SC2086
-          railway logs ${ARGS} > railway_logs.json
-          jq -r '.logs[]?.message // empty' railway_logs.json | tail -n "${LINES}" > railway_logs.txt || true
+          ~/.railway/bin/railway login --token "$RAILWAY_TOKEN"
+          ~/.railway/bin/railway logs \
+            --project $RAILWAY_PROJECT_ID \
+            --service $RAILWAY_SERVICE_ID \
+            ${RAILWAY_ENV_ID:+--environment $RAILWAY_ENV_ID} \
+            --lines 200 > railway_logs.txt
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: railway-logs
-          path: |
-            railway_logs.json
-            railway_logs.txt
-      - name: Post summary
-        run: |
-          echo "### Railway logs (last ${{ github.event.inputs.lines }} lines)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -n "${{ github.event.inputs.lines }}" railway_logs.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          path: railway_logs.txt
