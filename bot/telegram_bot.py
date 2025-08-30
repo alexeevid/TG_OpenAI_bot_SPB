@@ -8,6 +8,10 @@ from telegram.ext import (
     Application, ApplicationBuilder, ContextTypes,
     CommandHandler, MessageHandler, CallbackQueryHandler, filters,
 )
+from bot.logging_json import setup_logging, bind_log_context, log_timed
+from bot.retry import retry_async
+from bot.idempotency import recent_updates
+import time, logging
 
 from openai import OpenAI
 from io import BytesIO
