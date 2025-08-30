@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       lines:
-        description: 'Number of lines'
+        description: 'Number of lines to show'
         required: false
         default: '400'
 
@@ -14,55 +14,88 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1) Node, чтобы работал npx
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install Railway CLI + jq
+      # 2) Подготовка инструментов и выбор команды Railway
+      - name: Prepare CLI (railway / jq) and detect command
+        id: prep
+        shell: bash
         run: |
-          npm i -g @railway/cli
-          railway --version
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+          set -euo pipefail
+          echo "PATH=$PATH"
 
+          # jq для парсинга JSON (не критично, но удобно)
+          sudo apt-get update -y
+          sudo apt-get install -y jq >/dev/null
+
+          # Попытка №1: npx CLI
+          if npx -y @railway/cli@latest --version >/dev/null 2>&1; then
+            echo "cmd=npx -y @railway/cli@latest" >> $GITHUB_OUTPUT
+            echo "Using Railway via npx"
+            exit 0
+          fi
+
+          # Попытка №2: curl-инсталлятор
+          curl -fsSL https://railway.app/install.sh | sh
+          if "$HOME/.railway/bin/railway" --version >/dev/null 2>&1; then
+            echo "cmd=$HOME/.railway/bin/railway" >> $GITHUB_OUTPUT
+            echo "Using Railway via ~/.railway/bin/railway"
+            exit 0
+          fi
+
+          echo "::error::Railway CLI not found (npx and curl installer both failed)."
+          exit 127
+
+      # 3) Логин
       - name: Login to Railway
+        shell: bash
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "${RAILWAY_TOKEN:-}" ]; then
-            echo "::error::RAILWAY_TOKEN secret is missing"; exit 1
+            echo "::error::Missing secret RAILWAY_TOKEN in GitHub → Settings → Secrets → Actions"
+            exit 1
           fi
-          railway login --token "$RAILWAY_TOKEN"
+          "${{ steps.prep.outputs.cmd }}" login --token "$RAILWAY_TOKEN"
 
+      # 4) Получение логов (с ID или автоопределением)
       - name: Fetch logs
+        shell: bash
         env:
           RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
           RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
-          RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }} # optional
+          RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
         run: |
+          set -euo pipefail
           LINES="${{ github.event.inputs.lines }}"
-          ARGS="--json --lines ${LINES}"
+          CMD='${{ steps.prep.outputs.cmd }}'
 
-          # Если знаем ID — используем их (рекомендую задать хотя бы PROJECT и SERVICE)
-          if [ -n "${RAILWAY_PROJECT_ID:-}" ]; then ARGS="$ARGS --project $RAILWAY_PROJECT_ID"; fi
-          if [ -n "${RAILWAY_SERVICE_ID:-}" ]; then ARGS="$ARGS --service $RAILWAY_SERVICE_ID"; fi
-          if [ -n "${RAILWAY_ENV_ID:-}"     ]; then ARGS="$ARGS --environment $RAILWAY_ENV_ID"; fi
+          ARGS=( --json --lines "$LINES" )
+          [[ -n "${RAILWAY_PROJECT_ID:-}" ]] && ARGS+=( --project "$RAILWAY_PROJECT_ID" )
+          [[ -n "${RAILWAY_SERVICE_ID:-}" ]] && ARGS+=( --service "$RAILWAY_SERVICE_ID" )
+          [[ -n "${RAILWAY_ENV_ID:-}"     ]] && ARGS+=( --environment "$RAILWAY_ENV_ID" )
 
-          # Если ID не заданы — пробуем автоопределить из связанного проекта
-          if [ -z "${RAILWAY_PROJECT_ID:-}" ] || [ -z "${RAILWAY_SERVICE_ID:-}" ]; then
-            railway status --json > status.json || true
-            PID="$(jq -r '.project.id // empty' status.json)"
-            SID="$(jq -r '.services[0].id // empty' status.json)"
-            if [ -n "$PID" ]; then ARGS="$ARGS --project $PID"; fi
-            if [ -n "$SID" ]; then ARGS="$ARGS --service $SID"; fi
+          # Если ID не заданы, пробуем автоопределить
+          if [[ -z "${RAILWAY_PROJECT_ID:-}" || -z "${RAILWAY_SERVICE_ID:-}" ]]; then
+            $CMD status --json > status.json || true
+            PID=$(jq -r '.project.id // empty' status.json 2>/dev/null || echo "")
+            SID=$(jq -r '.services[0].id // empty' status.json 2>/dev/null || echo "")
+            [[ -n "$PID" ]] && ARGS+=( --project "$PID" )
+            [[ -n "$SID" ]] && ARGS+=( --service "$SID" )
           fi
 
-          echo "railway logs $ARGS"
-          railway logs $ARGS > railway_logs.json
+          echo "$CMD logs ${ARGS[*]}"
+          # shellcheck disable=SC2068
+          $CMD logs ${ARGS[@]} > railway_logs.json
 
-          jq -r '.logs[]?.message // empty' railway_logs.json | tail -n "${LINES}" > railway_logs.txt || true
+          jq -r '.logs[]?.message // empty' railway_logs.json | tail -n "$LINES" > railway_logs.txt || true
 
+      # 5) Артефакты + Summary
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -72,9 +105,10 @@ jobs:
             railway_logs.txt
 
       - name: Summary
+        shell: bash
         run: |
           echo "### Railway logs (last ${{ github.event.inputs.lines }} lines)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          tail -n "${{ github.event.inputs.lines }}" railway_logs.txt >> $GITHUB_STEP_SUMMARY
+          tail -n "${{ github.event.inputs.lines }}" railway_logs.txt >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
