@@ -15,6 +15,7 @@ import time
 from telegram.ext import CommandHandler
 from telegram import Update
 from telegram.ext import ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from openai import BadRequestError, RateLimitError, APITimeoutError, APIConnectionError, AuthenticationError, APIStatusError
 
@@ -73,6 +74,29 @@ except Exception:
         class HandlerStop(Exception):
             """Fallback, если в PTB нет stop-исключения."""
             pass
+rom telegram import BotCommand
+
+async def _post_init(app):
+    cmds = [
+        ("start", "Запуск и справка"),
+        ("help", "Помощь"),
+        ("whoami", "Мои права"),
+        ("dialogs", "Диалоги"),
+        ("dialog_new", "Новый диалог"),
+        ("model", "Выбрать модель"),
+        ("mode", "Стиль ответа"),
+        ("kb", "Меню базы знаний"),
+        ("kb_sync", "Синхронизация БЗ"),
+        ("rag_selftest", "Самотест RAG"),
+        ("rag_diag", "Диагностика RAG"),
+        ("stats", "Статус активного диалога"),
+        ("img", "Генерация изображения"),
+        ("web", "Веб-поиск"),
+        ("health", "Проверка живости"),
+    ]
+    await app.bot.set_my_commands([BotCommand(c, d) for c, d in cmds])
+
+app.post_init = _post_init
 
 async def _unknown_cmd(update, context):
     m = update.effective_message
@@ -1913,22 +1937,44 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "rename_dialog_id" in context.user_data:
-        dlg_id = context.user_data.pop("rename_dialog_id")
-        new_title = (update.message.text or "").strip()[:100]
-        if not new_title:
-            await update.message.reply_text("Название пустое. Отменено.")
-            return
-        try:
-            with SessionLocal() as db:
-                db.execute(sa_text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
-                db.commit()
-            await update.message.reply_text("Название сохранено.")
-        except Exception:
-            log.exception("rename dialog title failed")
-            await update.message.reply_text("⚠ Не удалось сохранить название.")
+    # перехватываем только «режим переименования»,
+    # иначе отдаём управление следующим хэндлерам
+    if "rename_dialog_id" not in context.user_data:
         return
-    await update.message.reply_text("Принято. (Текстовый роутер будет подключён к RAG после стабилизации UI.)")
+
+    m = update.effective_message or update.message
+    new_title = (m.text or "").strip()
+    new_title = " ".join(new_title.split())  # схлопнем лишние пробелы
+    new_title = new_title[:100]
+
+    if not new_title:
+        await m.reply_text("Название пустое. Отменено.")
+        context.user_data.pop("rename_dialog_id", None)
+        return
+
+    dlg_id = context.user_data.pop("rename_dialog_id", None)
+    if not isinstance(dlg_id, int):
+        await m.reply_text("⚠ Некорректный идентификатор диалога.")
+        return
+
+    uid = update.effective_user.id
+    try:
+        with SessionLocal() as db:
+            # Защита: обновляем только диалог текущего пользователя
+            res = db.execute(
+                sa_text("UPDATE dialogs SET title=:t WHERE id=:d AND tg_user_id=:u"),
+                {"t": new_title, "d": dlg_id, "u": uid},
+            )
+            db.commit()
+        if getattr(res, "rowcount", 0) == 1:
+            await m.reply_text("✅ Название сохранено.")
+        else:
+            await m.reply_text("⚠ Диалог не найден или недоступен.")
+    except Exception:
+        log.exception("rename dialog title failed")
+        await m.reply_text("⚠ Не удалось сохранить название.")
+    # важно: не даём этому сообщению уйти в on_text
+    return
 
 # ---------- KB ----------
 PAGE_SIZE = 8
@@ -2491,8 +2537,10 @@ def build_app() -> Application:
     # === CALLBACKS (кнопки)
     app.add_handler(CallbackQueryHandler(model_cb, pattern=r"^model:"))
     app.add_handler(CallbackQueryHandler(mode_cb,  pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(dialog_cb, pattern=r"^dlg:"))   # нужeн для /dialogs
+    app.add_handler(CallbackQueryHandler(kb_cb,     pattern=r"^kb:"))    # нужeн для /kb
 
-    # === COMMANDS
+    # === COMMANDS (сохраняем порядок и состав)
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("whoami",  whoami))
     app.add_handler(CommandHandler("help",    help_cmd))
@@ -2500,6 +2548,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("health",  health))
     app.add_handler(CommandHandler("revoke",  revoke))
     app.add_handler(CommandHandler("dialogs", dialogs))
+    app.add_handler(CommandHandler("model",   model_menu))
+    app.add_handler(CommandHandler("mode",    mode_menu))
+    app.add_handler(CommandHandler("kb",      kb))
+    app.add_handler(CommandHandler("stats",   stats))
+    app.add_handler(CommandHandler("img",     cmd_img))
 
     _add_cmd_if_present(app, "dialog_export", "dialog_export")
     _add_cmd_if_present(app, "dialog_delete", "dialog_delete")
@@ -2524,8 +2577,16 @@ def build_app() -> Application:
         app.add_handler(CommandHandler("web", cmd_web))  # мягкая заглушка
 
     # === MESSAGES
-    app.add_handler(MessageHandler(filters.VOICE, on_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # 1) сначала перехват «режима переименования»
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_router),
+        group=0,
+    )
+    # 2) потом основной обработчик текста (LLM/RAG)
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
+        group=1,
+    )
 
     # === Собираем список известных команд (после регистрации всех CommandHandler)
     known_commands = set()
