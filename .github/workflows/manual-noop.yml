@@ -1,0 +1,8 @@
+name: Manual noop
+on:
+  workflow_dispatch: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "::notice::Manual workflows work"
