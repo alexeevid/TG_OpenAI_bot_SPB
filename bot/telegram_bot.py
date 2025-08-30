@@ -3,6 +3,11 @@ import contextlib
 import tiktoken
 import asyncio
 from contextlib import suppress
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import (
+    Application, ApplicationBuilder, ContextTypes,
+    CommandHandler, MessageHandler, CallbackQueryHandler, filters,
+)
 
 from openai import OpenAI
 from io import BytesIO
@@ -15,7 +20,6 @@ import time
 from telegram.ext import CommandHandler
 from telegram import Update
 from telegram.ext import ContextTypes, MessageHandler, filters
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from openai import BadRequestError, RateLimitError, APITimeoutError, APIConnectionError, AuthenticationError, APIStatusError
 
@@ -74,29 +78,6 @@ except Exception:
         class HandlerStop(Exception):
             """Fallback, если в PTB нет stop-исключения."""
             pass
-from telegram import BotCommand
-
-async def _post_init(app):
-    cmds = [
-        ("start", "Запуск и справка"),
-        ("help", "Помощь"),
-        ("whoami", "Мои права"),
-        ("dialogs", "Диалоги"),
-        ("dialog_new", "Новый диалог"),
-        ("model", "Выбрать модель"),
-        ("mode", "Стиль ответа"),
-        ("kb", "Меню базы знаний"),
-        ("kb_sync", "Синхронизация БЗ"),
-        ("rag_selftest", "Самотест RAG"),
-        ("rag_diag", "Диагностика RAG"),
-        ("stats", "Статус активного диалога"),
-        ("img", "Генерация изображения"),
-        ("web", "Веб-поиск"),
-        ("health", "Проверка живости"),
-    ]
-    await app.bot.set_my_commands([BotCommand(c, d) for c, d in cmds])
-
-app.post_init = _post_init
 
 async def _unknown_cmd(update, context):
     m = update.effective_message
@@ -1937,44 +1918,22 @@ async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # перехватываем только «режим переименования»,
-    # иначе отдаём управление следующим хэндлерам
-    if "rename_dialog_id" not in context.user_data:
+    if "rename_dialog_id" in context.user_data:
+        dlg_id = context.user_data.pop("rename_dialog_id")
+        new_title = (update.message.text or "").strip()[:100]
+        if not new_title:
+            await update.message.reply_text("Название пустое. Отменено.")
+            return
+        try:
+            with SessionLocal() as db:
+                db.execute(sa_text("UPDATE dialogs SET title=:t WHERE id=:d"), {"t": new_title, "d": dlg_id})
+                db.commit()
+            await update.message.reply_text("Название сохранено.")
+        except Exception:
+            log.exception("rename dialog title failed")
+            await update.message.reply_text("⚠ Не удалось сохранить название.")
         return
-
-    m = update.effective_message or update.message
-    new_title = (m.text or "").strip()
-    new_title = " ".join(new_title.split())  # схлопнем лишние пробелы
-    new_title = new_title[:100]
-
-    if not new_title:
-        await m.reply_text("Название пустое. Отменено.")
-        context.user_data.pop("rename_dialog_id", None)
-        return
-
-    dlg_id = context.user_data.pop("rename_dialog_id", None)
-    if not isinstance(dlg_id, int):
-        await m.reply_text("⚠ Некорректный идентификатор диалога.")
-        return
-
-    uid = update.effective_user.id
-    try:
-        with SessionLocal() as db:
-            # Защита: обновляем только диалог текущего пользователя
-            res = db.execute(
-                sa_text("UPDATE dialogs SET title=:t WHERE id=:d AND tg_user_id=:u"),
-                {"t": new_title, "d": dlg_id, "u": uid},
-            )
-            db.commit()
-        if getattr(res, "rowcount", 0) == 1:
-            await m.reply_text("✅ Название сохранено.")
-        else:
-            await m.reply_text("⚠ Диалог не найден или недоступен.")
-    except Exception:
-        log.exception("rename dialog title failed")
-        await m.reply_text("⚠ Не удалось сохранить название.")
-    # важно: не даём этому сообщению уйти в on_text
-    return
+    await update.message.reply_text("Принято. (Текстовый роутер будет подключён к RAG после стабилизации UI.)")
 
 # ---------- KB ----------
 PAGE_SIZE = 8
@@ -2528,76 +2487,112 @@ def _add_cmd_if_present(app, cmd_name: str, func_name: str):
     if callable(fn):
         app.add_handler(CommandHandler(cmd_name, fn))
 
+
 def build_app() -> Application:
-    apply_migrations_if_needed()
+    """Builds and returns the PTB Application with all handlers registered."""
+    try:
+        apply_migrations_if_needed()
+    except Exception:
+        log.exception("Auto-migrate failed")
 
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
+
+    # -- Register bot commands in Telegram client (menu)
+    async def _post_init(app_: Application):
+        try:
+            cmds = [
+                ("start", "Запуск и справка"),
+                ("help", "Помощь"),
+                ("whoami", "Мои права"),
+                ("dialogs", "Диалоги"),
+                ("dialog_new", "Новый диалог"),
+                ("model", "Выбрать модель"),
+                ("mode", "Стиль ответа"),
+                ("kb", "Меню БЗ"),
+                ("kb_sync", "Синхронизация БЗ"),
+                ("rag_selftest", "Самотест RAG"),
+                ("rag_diag", "Диагностика RAG"),
+                ("stats", "Статус диалога"),
+                ("img", "Генерация изображения"),
+                ("web", "Веб-поиск"),
+                ("health", "Проверка живости"),
+            ]
+            await app_.bot.set_my_commands([BotCommand(c, d) for c, d in cmds])
+        except Exception:
+            pass
+
+    app.post_init = _post_init
+
+    # Global error handler
     app.add_error_handler(error_handler)
 
-    # === CALLBACKS (кнопки)
-    app.add_handler(CallbackQueryHandler(model_cb, pattern=r"^model:"))
-    app.add_handler(CallbackQueryHandler(mode_cb,  pattern=r"^mode:"))
-    app.add_handler(CallbackQueryHandler(dialog_cb, pattern=r"^dlg:"))   # нужeн для /dialogs
-    app.add_handler(CallbackQueryHandler(kb_cb,     pattern=r"^kb:"))    # нужeн для /kb
+    # === CALLBACKS (inline buttons)
+    for cb, pattern in (
+        (globals().get("model_cb"),  r"^model:"),
+        (globals().get("mode_cb"),   r"^mode:"),
+        (globals().get("dialog_cb"), r"^dlg:"),
+        (globals().get("kb_cb"),     r"^kb:"),
+    ):
+        if callable(cb):
+            app.add_handler(CallbackQueryHandler(cb, pattern=pattern))
 
-    # === COMMANDS (сохраняем порядок и состав)
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("whoami",  whoami))
-    app.add_handler(CommandHandler("help",    help_cmd))
-    app.add_handler(CommandHandler("grant",   grant))
-    app.add_handler(CommandHandler("health",  health))
-    app.add_handler(CommandHandler("revoke",  revoke))
-    app.add_handler(CommandHandler("dialogs", dialogs))
-    app.add_handler(CommandHandler("model",   model_menu))
-    app.add_handler(CommandHandler("mode",    mode_menu))
-    app.add_handler(CommandHandler("kb",      kb))
-    app.add_handler(CommandHandler("stats",   stats))
-    app.add_handler(CommandHandler("img",     cmd_img))
+    # === COMMANDS
+    handlers = [
+        ("start",   "start"),
+        ("whoami",  "whoami"),
+        ("help",    "help_cmd"),
+        ("grant",   "grant"),
+        ("health",  "health"),
+        ("revoke",  "revoke"),
+        ("dialogs", "dialogs"),
+        ("model",   "model_menu"),
+        ("mode",    "mode_menu"),
+        ("kb",      "kb"),
+        ("stats",   "stats"),
+        ("img",     "cmd_img"),
+        ("dialog_new", "dialog_new"),
+        ("diag",       "diag"),
+        ("pgvector_check", "pgvector_check"),
+        ("kb_chunks_create", "kb_chunks_create"),
+        ("kb_chunks_fix",    "kb_chunks_fix"),
+        ("kb_chunks_force",  "kb_chunks_force"),
+        ("kb_sync",          "kb_sync"),
+        ("kb_sync_pdf",      "kb_sync_pdf"),
+        ("rag_diag",         "rag_diag"),
+        ("rag_selftest",     "rag_selftest"),
+        ("kb_pdf_diag",      "kb_pdf_diag"),
+    ]
+    for cmd, fn in handlers:
+        _add_cmd_if_present(app, cmd, fn)
 
+    # Optional legacy commands
     _add_cmd_if_present(app, "dialog_export", "dialog_export")
     _add_cmd_if_present(app, "dialog_delete", "dialog_delete")
     _add_cmd_if_present(app, "dialog_rename", "dialog_rename")
 
-    app.add_handler(CommandHandler("dialog_new",     dialog_new))
-    app.add_handler(CommandHandler("diag",           diag))
-    app.add_handler(CommandHandler("pgvector_check", pgvector_check))
-    app.add_handler(CommandHandler("kb_chunks_create", kb_chunks_create))
-    app.add_handler(CommandHandler("kb_chunks_fix",    kb_chunks_fix))
-    app.add_handler(CommandHandler("kb_chunks_force",  kb_chunks_force))
-    app.add_handler(CommandHandler("kb_sync",          kb_sync))
-    app.add_handler(CommandHandler("kb_sync_pdf",      kb_sync_pdf))
-    app.add_handler(CommandHandler("rag_diag",         rag_diag))
-    app.add_handler(CommandHandler("rag_selftest",     rag_selftest))
-    app.add_handler(CommandHandler("kb_pdf_diag",      kb_pdf_diag))
-
-    # === Веб-поиск (ставим ДО known_commands!)
-    if settings.enable_web_search:
-        app.add_handler(CommandHandler("web", web_cmd))
-    else:
-        app.add_handler(CommandHandler("web", cmd_web))  # мягкая заглушка
+    # === Web search (/web)
+    if globals().get("web_cmd") or globals().get("cmd_web"):
+        if getattr(settings, "enable_web_search", False) and callable(globals().get("web_cmd")):
+            app.add_handler(CommandHandler("web", globals()["web_cmd"]))
+        elif callable(globals().get("cmd_web")):
+            app.add_handler(CommandHandler("web", globals()["cmd_web"]))
 
     # === MESSAGES
-    # 1) сначала перехват «режима переименования»
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_router),
-        group=0,
-    )
-    # 2) потом основной обработчик текста (LLM/RAG)
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
-        group=1,
-    )
+    # 1) rename router BEFORE main text handler
+    if callable(globals().get("text_router")):
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, globals()["text_router"]), group=0)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=1)
+    app.add_handler(MessageHandler(filters.VOICE, on_voice))
 
-    # === Собираем список известных команд (после регистрации всех CommandHandler)
+    # === Unknown command fallback (registered last)
     known_commands = set()
-    for grp, handlers in (app.handlers or {}).items():
-        for h in handlers:
-            cmds = getattr(h, "commands", None)  # не завязаны на класс, работает шире
+    for grp, hs in (app.handlers or {}).items():
+        for h in hs:
+            cmds = getattr(h, "commands", None)
             if cmds:
                 for c in cmds:
                     known_commands.add(c.lower())
 
-    # === Фоллбек неизвестных команд
     async def _unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m = update.effective_message or update.message
         if not m:
@@ -2605,19 +2600,19 @@ def build_app() -> Application:
         txt = (m.text or "").strip()
         if not txt.startswith("/"):
             return
-        raw = txt.split()[0]                 # "/diag@bot"
-        cmd = raw[1:].split("@", 1)[0].lower()  # "diag"
+        raw = txt.split()[0]
+        cmd = raw[1:].split("@", 1)[0].lower()
         if cmd in known_commands:
             return
         await m.reply_text(f"🤷 Команда не распознана: {raw}")
 
     app.add_handler(MessageHandler(filters.COMMAND, _unknown_cmd), group=99)
 
-    # === Логируем хэндлеры
+    # === Log installed handlers (debug)
     try:
-        for grp, handlers in (app.handlers or {}).items():
+        for grp, hs in (app.handlers or {}).items():
             names = []
-            for h in handlers:
+            for h in hs:
                 cb = getattr(h, "callback", None)
                 names.append(getattr(cb, "__name__", repr(h)))
             log.info("Handlers group %s: %s", grp, names)
@@ -2625,3 +2620,4 @@ def build_app() -> Application:
         pass
 
     return app
+
