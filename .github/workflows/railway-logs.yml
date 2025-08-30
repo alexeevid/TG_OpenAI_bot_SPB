@@ -26,38 +26,41 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Login to Railway
-        env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${RAILWAY_TOKEN:-}" ]; then
-            echo "::error::Missing secret RAILWAY_TOKEN in GitHub → Settings → Secrets → Actions"; exit 1
-          fi
-          railway login --token "$RAILWAY_TOKEN"
-
+      # НИКАКОГО login тут не делаем — токен отдаём шагу с логами
       - name: Fetch logs
         env:
-          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
-          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
-          RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
+          RAILWAY_TOKEN:    ${{ secrets.RAILWAY_TOKEN }}      # обязателен
+          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }} # желательно
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }} # желательно
+          RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}     # опционально
         run: |
           set -euo pipefail
           LINES="${{ github.event.inputs.lines }}"
+
+          # Если токена нет — сразу подсказка
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "::error::Missing secret RAILWAY_TOKEN in GitHub → Settings → Secrets → Actions"; exit 1
+          fi
+
+          # Сбор аргументов
           ARGS=( --json --lines "$LINES" )
           [[ -n "${RAILWAY_PROJECT_ID:-}" ]] && ARGS+=( --project "$RAILWAY_PROJECT_ID" )
           [[ -n "${RAILWAY_SERVICE_ID:-}" ]] && ARGS+=( --service "$RAILWAY_SERVICE_ID" )
           [[ -n "${RAILWAY_ENV_ID:-}"     ]] && ARGS+=( --environment "$RAILWAY_ENV_ID" )
+
+          # Если ID не задали — автоопределим
           if [[ -z "${RAILWAY_PROJECT_ID:-}" || -z "${RAILWAY_SERVICE_ID:-}" ]]; then
             railway status --json > status.json || true
-            PID=$(jq -r '.project.id // empty' status.json)
-            SID=$(jq -r '.services[0].id // empty' status.json)
+            PID=$(jq -r '.project.id // empty' status.json 2>/dev/null || echo "")
+            SID=$(jq -r '.services[0].id // empty' status.json 2>/dev/null || echo "")
             [[ -n "$PID" ]] && ARGS+=( --project "$PID" )
             [[ -n "$SID" ]] && ARGS+=( --service "$SID" )
           fi
+
           echo "railway logs ${ARGS[*]}"
           # shellcheck disable=SC2068
           railway logs ${ARGS[@]} > railway_logs.json
+
           jq -r '.logs[]?.message // empty' railway_logs.json | tail -n "$LINES" > railway_logs.txt || true
 
       - uses: actions/upload-artifact@v4
