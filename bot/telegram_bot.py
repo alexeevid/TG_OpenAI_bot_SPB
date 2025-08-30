@@ -74,7 +74,7 @@ except Exception:
         class HandlerStop(Exception):
             """Fallback, если в PTB нет stop-исключения."""
             pass
-rom telegram import BotCommand
+from telegram import BotCommand
 
 async def _post_init(app):
     cmds = [
