@@ -15,7 +15,7 @@ on:
         description: 'New file content (paste here, multiline OK)'
         required: false
       zip_url:
-        description: 'Public URL to a ZIP with files to apply at repo root (for change_type=zip)'
+        description: 'Public URL to a ZIP (unpacked into repo root) for change_type=zip'
         required: false
       pr_title:
         description: 'PR title'
@@ -40,80 +40,62 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare changes (single file)
+      # --- Вариант А: правим один файл, контент берём из input
+      - name: Apply changes (single file)
         if: ${{ github.event.inputs.change_type == 'single' }}
         shell: bash
         run: |
           set -euo pipefail
-          PATH_TO_EDIT="${{ github.event.inputs.file_path }}"
-          mkdir -p "$(dirname "$PATH_TO_EDIT")"
-          # Пишем контент как есть, без интерполяции переменных
-          cat > "$PATH_TO_EDIT" <<'__CONTENT__'
+          path="${{ github.event.inputs.file_path }}"
+          mkdir -p "$(dirname "$path")"
+          cat > "$path" <<'EOF_CONTENT'
 ${{ github.event.inputs.file_content }}
-__CONTENT__
-          echo "Wrote $PATH_TO_EDIT"
+EOF_CONTENT
+          echo "Wrote $path"
 
-      - name: Apply ZIP from URL
+      # --- Вариант Б: скачиваем ZIP и распаковываем в корень репозитория
+      - name: Apply changes from ZIP
         if: ${{ github.event.inputs.change_type == 'zip' }}
         shell: bash
         run: |
           set -euo pipefail
-          URL="${{ github.event.inputs.zip_url }}"
-          if [ -z "$URL" ]; then
+          url="${{ github.event.inputs.zip_url }}"
+          if [ -z "$url" ]; then
             echo "::error::zip_url is empty"; exit 1
           fi
-          echo "Downloading $URL"
-          curl -fsSL "$URL" -o /tmp/patch.zip
+          echo "Downloading $url"
+          curl -fsSL "$url" -o /tmp/patch.zip
           unzip -o /tmp/patch.zip -d .
-          echo "Unzipped contents:"
+          echo "Unzipped:"
           ls -la
 
-      - name: Check diff
-        shell: bash
-        run: |
-          git status --porcelain
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "::notice::No changes detected. Nothing to commit."
-            echo "no_changes=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create PR branch
-        if: steps.open-pr.outputs.no_changes != 'true'
-        id: branch
+      # Узнаём, есть ли изменения
+      - name: Detect changes
+        id: diff
         shell: bash
         run: |
           set -euo pipefail
-          BR="bot-pr/$(date +%Y%m%d-%H%M%S)"
-          git config user.name  "assistant-bot"
-          git config user.email "assistant-bot@users.noreply.github.com"
-          git checkout -b "$BR"
-          git add -A
-          git commit -m "${{ github.event.inputs.commit_message }}"
-          echo "name=$BR" >> $GITHUB_OUTPUT
+          cnt="$(git status --porcelain | wc -l || true)"
+          echo "changed=$cnt" >> "$GITHUB_OUTPUT"
+          echo "Changed files: $cnt"
 
-      - name: Push branch
-        if: steps.branch.outputs.name
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ steps.branch.outputs.name }}"
+      # Создаём Pull Request (если есть изменения)
+      - name: Create Pull Request
+        if: ${{ steps.diff.outputs.changed != '0' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          # Если есть секрет GH_TOKEN, используем его; иначе встроенный GITHUB_TOKEN
+          token: ${{ secrets.GH_TOKEN || github.token }}
+          commit-message: ${{ github.event.inputs.commit_message }}
+          title: ${{ github.event.inputs.pr_title }}
+          body: ${{ github.event.inputs.pr_body }}
+          branch: bot-pr/${{ github.run_id }}-${{ github.run_number }}
+          delete-branch: true
+          author: assistant-bot <assistant-bot@users.noreply.github.com>
+          committer: assistant-bot <assistant-bot@users.noreply.github.com>
 
-      - name: Open PR
-        if: steps.branch.outputs.name
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      # Если правок не было — в Summary короткое сообщение
+      - name: No changes summary
+        if: ${{ steps.diff.outputs.changed == '0' }}
         run: |
-          set -euo pipefail
-          API="https://api.github.com/repos/${{ github.repository }}/pulls"
-          TITLE="${{ github.event.inputs.pr_title }}"
-          BODY="${{ github.event.inputs.pr_body }}"
-          HEAD="${{ steps.branch.outputs.name }}"
-          BASE="${{ github.ref_name }}"
-          jq -n --arg title "$TITLE" --arg body "$BODY" --arg head "$HEAD" --arg base "$BASE" \
-            '{title:$title, body:$body, head:$head, base:$base}' > pr.json
-          echo "Opening PR: $TITLE"
-          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-               -d @pr.json "$API" | tee pr_response.json
-          echo "PR URL:"
-          jq -r '.html_url // "N/A"' pr_response.json
+          echo "No changes detected. Nothing to commit." >> "$GITHUB_STEP_SUMMARY"
