@@ -1,0 +1,119 @@
+name: Open PR (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      change_type:
+        description: 'Type of change: single or zip'
+        required: true
+        default: 'single'
+      file_path:
+        description: 'Path to file (for change_type=single)'
+        required: false
+        default: 'README.md'
+      file_content:
+        description: 'New file content (paste here, multiline OK)'
+        required: false
+      zip_url:
+        description: 'Public URL to a ZIP with files to apply at repo root (for change_type=zip)'
+        required: false
+      pr_title:
+        description: 'PR title'
+        required: false
+        default: 'Automated update'
+      pr_body:
+        description: 'PR body'
+        required: false
+        default: 'Proposed changes from assistant workflow'
+      commit_message:
+        description: 'Commit message'
+        required: false
+        default: 'chore: automated update'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare changes (single file)
+        if: ${{ github.event.inputs.change_type == 'single' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATH_TO_EDIT="${{ github.event.inputs.file_path }}"
+          mkdir -p "$(dirname "$PATH_TO_EDIT")"
+          # Пишем контент как есть, без интерполяции переменных
+          cat > "$PATH_TO_EDIT" <<'__CONTENT__'
+${{ github.event.inputs.file_content }}
+__CONTENT__
+          echo "Wrote $PATH_TO_EDIT"
+
+      - name: Apply ZIP from URL
+        if: ${{ github.event.inputs.change_type == 'zip' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.zip_url }}"
+          if [ -z "$URL" ]; then
+            echo "::error::zip_url is empty"; exit 1
+          fi
+          echo "Downloading $URL"
+          curl -fsSL "$URL" -o /tmp/patch.zip
+          unzip -o /tmp/patch.zip -d .
+          echo "Unzipped contents:"
+          ls -la
+
+      - name: Check diff
+        shell: bash
+        run: |
+          git status --porcelain
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::notice::No changes detected. Nothing to commit."
+            echo "no_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create PR branch
+        if: steps.open-pr.outputs.no_changes != 'true'
+        id: branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          BR="bot-pr/$(date +%Y%m%d-%H%M%S)"
+          git config user.name  "assistant-bot"
+          git config user.email "assistant-bot@users.noreply.github.com"
+          git checkout -b "$BR"
+          git add -A
+          git commit -m "${{ github.event.inputs.commit_message }}"
+          echo "name=$BR" >> $GITHUB_OUTPUT
+
+      - name: Push branch
+        if: steps.branch.outputs.name
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ steps.branch.outputs.name }}"
+
+      - name: Open PR
+        if: steps.branch.outputs.name
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${{ github.repository }}/pulls"
+          TITLE="${{ github.event.inputs.pr_title }}"
+          BODY="${{ github.event.inputs.pr_body }}"
+          HEAD="${{ steps.branch.outputs.name }}"
+          BASE="${{ github.ref_name }}"
+          jq -n --arg title "$TITLE" --arg body "$BODY" --arg head "$HEAD" --arg base "$BASE" \
+            '{title:$title, body:$body, head:$head, base:$base}' > pr.json
+          echo "Opening PR: $TITLE"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+               -d @pr.json "$API" | tee pr_response.json
+          echo "PR URL:"
+          jq -r '.html_url // "N/A"' pr_response.json
