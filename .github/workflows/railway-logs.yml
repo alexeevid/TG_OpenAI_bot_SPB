@@ -45,8 +45,8 @@ jobs:
           npm i -g @railway/cli@latest
           railway --version
 
-      # Валидация обязательных секретов
-      - name: Validate secrets
+      # Просто проверяем, что секреты присутствуют (без доп. логики)
+      - name: Validate secrets present
         env:
           RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
           RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
@@ -57,7 +57,7 @@ jobs:
           [ -n "${RAILWAY_SERVICE_ID}" ] || { echo "❌ Missing RAILWAY_SERVICE_ID"; exit 1; }
           [ -n "${RAILWAY_ENV_ID}" ]     || { echo "❌ Missing RAILWAY_ENV_ID"; exit 1; }
 
-      # whoami для Project Token почти всегда пишет Unauthorized — это нормально.
+      # whoami для Project Token обычно пишет Unauthorized — это нормально.
       - name: Who am I (informational)
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
@@ -76,12 +76,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          SERVICE_ID="${INPUT_SERVICE_ID:-}"
-          [ -n "$SERVICE_ID" ] || SERVICE_ID="$DEFAULT_SERVICE_ID"
-
-          ENV_ID="${INPUT_ENV_ID:-}"
-          [ -n "$ENV_ID" ] || ENV_ID="$DEFAULT_ENV_ID"
-
+          SERVICE_ID="${INPUT_SERVICE_ID:-}"; [ -n "$SERVICE_ID" ] || SERVICE_ID="$DEFAULT_SERVICE_ID"
+          ENV_ID="${INPUT_ENV_ID:-}";       [ -n "$ENV_ID" ]       || ENV_ID="$DEFAULT_ENV_ID"
           LINES="${INPUT_LINES:-400}"
 
           DEP_ARG=""
@@ -89,7 +85,7 @@ jobs:
             DEP_ARG="--deployment ${INPUT_DEPLOYMENT}"
           fi
 
-          # Важно: 'logs' НЕ принимает --project. Токен уже привязан к проекту.
+          # ВАЖНО: logs НЕ принимает --project. Токен уже «привязан» к проекту.
           railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
 
           tail -n "$LINES" logs.json | tee tail.txt
