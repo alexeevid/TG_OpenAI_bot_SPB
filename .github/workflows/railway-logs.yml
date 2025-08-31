@@ -12,11 +12,11 @@ on:
         required: false
         default: ""
       environment_id:
-        description: "Override ENV_ID (опционально)"
+        description: "Override ENVIRONMENT_ID (опционально)"
         required: false
         default: ""
       deployment_id:
-        description: "DEPLOYMENT_ID или __build для --build (опционально)"
+        description: "Опционально: DEPLOYMENT_ID (или оставьте пустым)"
         required: false
         default: ""
   pull_request:
@@ -27,68 +27,59 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # обязательные
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-      SERVICE_ID:    ${{ secrets.RAILWAY_SERVICE_ID }}
-      ENV_ID:        ${{ secrets.RAILWAY_ENV_ID }}
-      # опционально (для справки, в logs не требуется)
-      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+      # Ключевое: CLI возьмёт токен из этой переменной
+      RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+      RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node (для Railway CLI)
+      - name: Setup Node (for Railway CLI)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-
-      - name: Validate required secrets
-        run: |
-          set -e
-          for v in RAILWAY_TOKEN SERVICE_ID ENV_ID; do
-            if [ -z "${!v}" ]; then
-              echo "::error ::Missing required secret/env: $v"
-              exit 1
-            fi
-          done
 
       - name: Install Railway CLI
         run: |
           npm i -g @railway/cli@latest
           railway --version
 
-      # Никаких login/use — CLI возьмет токен из RAILWAY_TOKEN
+      # Безопасная самопроверка: секрет на месте?
+      - name: Validate required secrets
+        run: |
+          set -e
+          test -n "${RAILWAY_TOKEN:-}" || (echo "❌ RAILWAY_TOKEN is empty" && exit 1)
+          echo "RAILWAY_TOKEN length: ${#RAILWAY_TOKEN} (значение замаскировано в логах)"
+
+      # Проверка авторизации — должна показать пользователя, иначе токен неверный
+      - name: Who am I
+        run: |
+          set -e
+          railway whoami
+
+      # Забираем логи напрямую флагами (без railway use / без --project)
       - name: Fetch logs (JSON)
         id: fetch
-        env:
-          IN_LINES:   ${{ github.event.inputs.lines }}
-          IN_SERVICE: ${{ github.event.inputs.service_id }}
-          IN_ENV:     ${{ github.event.inputs.environment_id }}
-          IN_DEP:     ${{ github.event.inputs.deployment_id }}
         run: |
           set -euo pipefail
-          LINES="${IN_LINES:-400}"
-          SID="${IN_SERVICE:-$SERVICE_ID}"
-          EID="${IN_ENV:-$ENV_ID}"
-          DEP="${IN_DEP:-}"
+
+          LINES="${{ github.event.inputs.lines || '400' }}"
+          SERVICE_ID="${{ github.event.inputs.service_id || env.RAILWAY_SERVICE_ID }}"
+          ENV_ID="${{ github.event.inputs.environment_id || env.RAILWAY_ENV_ID }}"
+          DEPLOYMENT_ID="${{ github.event.inputs.deployment_id || '' }}"
 
           DEP_ARG=""
-          if [ -n "$DEP" ]; then
-            if [ "$DEP" = "__build" ]; then
-              DEP_ARG="--build"
-            else
-              DEP_ARG="--deployment $DEP"
-            fi
+          if [ -n "$DEPLOYMENT_ID" ]; then
+            DEP_ARG="--deployment $DEPLOYMENT_ID"
           fi
 
-          # Контекст проекта не нужен, достаточно service+environment (+deployment/--build)
-          railway logs --service "$SID" --environment "$EID" $DEP_ARG --json > logs.json
+          railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
 
           tail -n "$LINES" logs.json | tee tail.txt
 
           {
-            echo "lines=$LINES"
             echo "tail<<'EOF'"
             tail -n "$LINES" logs.json
             echo "EOF"
@@ -96,13 +87,11 @@ jobs:
 
       - name: Summary
         run: |
-          {
-            echo "### Railway logs (last ${{ steps.fetch.outputs.lines }} lines)"
-            echo
-            echo '```json'
-            cat tail.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "### Railway logs (last ${{ github.event.inputs.lines || '400' }} lines)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat tail.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -120,7 +109,7 @@ jobs:
           token: ${{ github.token }}
           issue-number: ${{ github.event.pull_request.number }}
           body: |
-            ### Railway logs (last ${{ steps.fetch.outputs.lines }} lines)
+            ### Railway logs (last ${{ github.event.inputs.lines || '400' }} lines)
             ```json
             ${{ steps.fetch.outputs.tail }}
             ```
