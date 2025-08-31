@@ -8,15 +8,15 @@ on:
         required: false
         default: "400"
       service_id:
-        description: "Override Railway SERVICE_ID (опционально)"
+        description: "Override SERVICE_ID (опционально)"
         required: false
         default: ""
       environment_id:
-        description: "Override Railway ENV_ID (опционально)"
+        description: "Override ENV_ID (опционально)"
         required: false
         default: ""
       deployment_id:
-        description: "DEPLOYMENT_ID или спец-значение __build для --build"
+        description: "DEPLOYMENT_ID или __build для --build (опционально)"
         required: false
         default: ""
   pull_request:
@@ -26,11 +26,12 @@ jobs:
   logs:
     runs-on: ubuntu-latest
 
+    # берём чувствительные данные из Secrets
     env:
       RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }} # не используем в командах, но пусть будет
-      RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
-      RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
+      SERVICE_ID:         ${{ secrets.RAILWAY_SERVICE_ID }}
+      ENV_ID:             ${{ secrets.RAILWAY_ENV_ID }}
+      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }} # не обязателен для logs
 
     steps:
       - name: Checkout
@@ -41,12 +42,12 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Validate secrets
+      - name: Validate required secrets
         run: |
           set -e
-          for v in RAILWAY_TOKEN RAILWAY_SERVICE_ID RAILWAY_ENV_ID; do
+          for v in RAILWAY_TOKEN SERVICE_ID ENV_ID; do
             if [ -z "${!v}" ]; then
-              echo "::error::Missing required secret/env: $v"
+              echo "::error ::Missing required secret/env: $v"
               exit 1
             fi
           done
@@ -55,6 +56,11 @@ jobs:
         run: |
           npm i -g @railway/cli@latest
           railway --version
+
+      - name: Login with token
+        run: |
+          # Явный логин, чтобы не смущал Unauthorized в whoami
+          railway login --token "${RAILWAY_TOKEN}"
           railway whoami || true
 
       - name: Fetch logs (JSON)
@@ -62,21 +68,21 @@ jobs:
         run: |
           set -euo pipefail
           LINES="${{ github.event.inputs.lines || '400' }}"
-          SERVICE_ID="${{ github.event.inputs.service_id || env.RAILWAY_SERVICE_ID }}"
-          ENV_ID="${{ github.event.inputs.environment_id || env.RAILWAY_ENV_ID }}"
-          DEPLOYMENT_IN="${{ github.event.inputs.deployment_id || '' }}"
+          SID="${{ github.event.inputs.service_id || env.SERVICE_ID }}"
+          EID="${{ github.event.inputs.environment_id || env.ENV_ID }}"
+          DEP="${{ github.event.inputs.deployment_id || '' }}"
 
           DEP_ARG=""
-          if [ -n "$DEPLOYMENT_IN" ]; then
-            if [ "$DEPLOYMENT_IN" = "__build" ]; then
+          if [ -n "$DEP" ]; then
+            if [ "$DEP" = "__build" ]; then
               DEP_ARG="--build"
             else
-              DEP_ARG="--deployment $DEPLOYMENT_IN"
+              DEP_ARG="--deployment $DEP"
             fi
           fi
 
-          # ВАЖНО: никаких --project и никаких `railway use`
-          railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
+          # Никаких --project и никаких `railway use` — они не нужны
+          railway logs --service "$SID" --environment "$EID" $DEP_ARG --json > logs.json
 
           tail -n "$LINES" logs.json | tee tail.txt
 
