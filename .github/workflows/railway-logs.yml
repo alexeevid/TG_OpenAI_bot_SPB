@@ -8,16 +8,28 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - run: npm i -g @railway/cli@latest
-      - name: Test token + try logs
+      - name: Test project token against logs
         env:
           RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
           RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
           RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
         run: |
-          set -e
-          echo "Has token? $([ -n "$RAILWAY_TOKEN" ] && echo YES || echo NO)"
-          # whoami для project token'а часто пишет Unauthorized — это нормально;
-          # главное, чтобы logs сработал.
-          railway whoami || echo "whoami unauthorized (OK for project token)"
-          railway logs --service "$RAILWAY_SERVICE_ID" --environment "$RAILWAY_ENV_ID" --json | head -n 5
-          echo "✅ Token works"
+          set -Eeuo pipefail
+      
+          echo "Has token? $([ -n "${RAILWAY_TOKEN:-}" ] && echo YES || echo NO)"
+          echo -n "Token length: " && printf "%s" "${RAILWAY_TOKEN:-}" | wc -c
+      
+          echo "whoami (может быть Unauthorized для project token — это нормально):"
+          railway whoami || true
+      
+          echo "Try logs (без пайпа, чтобы не скрыть ошибку):"
+          railway logs \
+            --service "$RAILWAY_SERVICE_ID" \
+            --environment "$RAILWAY_ENV_ID" \
+            --json \
+            > logs.json
+      
+          echo "✅ got logs.json, first lines:"
+          head -n 10 logs.json
+      
