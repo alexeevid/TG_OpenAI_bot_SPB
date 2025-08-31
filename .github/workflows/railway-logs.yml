@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       lines:
-        description: "Сколько строк показать в выводе (tail)"
+        description: "Сколько строк показать (tail)"
         required: false
         default: "400"
       service_id:
@@ -16,7 +16,7 @@ on:
         required: false
         default: ""
       deployment_id:
-        description: "Опционально: DEPLOYMENT_ID или спец-значение __build для --build"
+        description: "DEPLOYMENT_ID или спец-значение __build для --build"
         required: false
         default: ""
   pull_request:
@@ -28,7 +28,7 @@ jobs:
 
     env:
       RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }} # не используем в командах, но пусть будет
       RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
       RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
 
@@ -41,10 +41,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Validate required secrets
+      - name: Validate secrets
         run: |
           set -e
-          for v in RAILWAY_TOKEN RAILWAY_PROJECT_ID RAILWAY_SERVICE_ID RAILWAY_ENV_ID; do
+          for v in RAILWAY_TOKEN RAILWAY_SERVICE_ID RAILWAY_ENV_ID; do
             if [ -z "${!v}" ]; then
               echo "::error::Missing required secret/env: $v"
               exit 1
@@ -55,41 +55,19 @@ jobs:
         run: |
           npm i -g @railway/cli@latest
           railway --version
-
-      - name: Who am I
-        run: railway whoami || true
-
-      - name: Select Railway context (project/env/service)
-        run: |
-          set -euo pipefail
-          IN_SERVICE="${{ github.event.inputs.service_id }}"
-          IN_ENV="${{ github.event.inputs.environment_id }}"
-
-          SERVICE_ID="${IN_SERVICE:-$RAILWAY_SERVICE_ID}"
-          ENV_ID="${IN_ENV:-$RAILWAY_ENV_ID}"
-
-          railway use \
-            --project "$RAILWAY_PROJECT_ID" \
-            --environment "$ENV_ID" \
-            --service "$SERVICE_ID" \
-            --yes
+          railway whoami || true
 
       - name: Fetch logs (JSON)
         id: fetch
         run: |
           set -euo pipefail
-          # inputs могут отсутствовать (например, при pull_request) — задаём дефолты в bash
-          LINES_IN="${{ github.event.inputs.lines }}"
-          SERVICE_IN="${{ github.event.inputs.service_id }}"
-          ENV_IN="${{ github.event.inputs.environment_id }}"
-          DEPLOYMENT_IN="${{ github.event.inputs.deployment_id }}"
-
-          LINES="${LINES_IN:-400}"
-          SERVICE_ID="${SERVICE_IN:-$RAILWAY_SERVICE_ID}"
-          ENV_ID="${ENV_IN:-$RAILWAY_ENV_ID}"
+          LINES="${{ github.event.inputs.lines || '400' }}"
+          SERVICE_ID="${{ github.event.inputs.service_id || env.RAILWAY_SERVICE_ID }}"
+          ENV_ID="${{ github.event.inputs.environment_id || env.RAILWAY_ENV_ID }}"
+          DEPLOYMENT_IN="${{ github.event.inputs.deployment_id || '' }}"
 
           DEP_ARG=""
-          if [ -n "${DEPLOYMENT_IN:-}" ]; then
+          if [ -n "$DEPLOYMENT_IN" ]; then
             if [ "$DEPLOYMENT_IN" = "__build" ]; then
               DEP_ARG="--build"
             else
@@ -97,7 +75,7 @@ jobs:
             fi
           fi
 
-          # ВАЖНО: logs НЕ принимает --project. Контекст задан через railway use.
+          # ВАЖНО: никаких --project и никаких `railway use`
           railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
 
           tail -n "$LINES" logs.json | tee tail.txt
