@@ -7,29 +7,57 @@ jobs:
     steps:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
+
       - run: npm i -g @railway/cli@latest
-      - name: Test project token against logs
+
+      # 1) Проверяем, что в секретах лежит ИМЕННО API-токен воркспейса (а не проектный UUID)
+      - name: Validate RAILWAY_TOKEN looks like API token
+        shell: bash
         env:
-          RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -z "${RAILWAY_TOKEN:-}" ]]; then
+            echo "❌ RAILWAY_TOKEN is empty"; exit 1
+          fi
+          # Простая эвристика: проектные токены обычно ~36 символов (UUID).
+          if [[ "${#RAILWAY_TOKEN}" -le 40 ]]; then
+            echo "❌ Похоже, это project token (короткий UUID). Нужен API-токен из Workspace → Tokens (API Tokens)."
+            exit 1
+          fi
+          echo "✅ Token format OK (len=${#RAILWAY_TOKEN})"
+
+      # 2) Проверяем, что заданы ID сервиса и окружения (из Project → Variables / Copy ID)
+      - name: Validate IDs present
+        shell: bash
+        env:
           RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
           RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
         run: |
           set -Eeuo pipefail
-      
-          echo "Has token? $([ -n "${RAILWAY_TOKEN:-}" ] && echo YES || echo NO)"
-          echo -n "Token length: " && printf "%s" "${RAILWAY_TOKEN:-}" | wc -c
-      
-          echo "whoami (может быть Unauthorized для project token — это нормально):"
-          railway whoami || true
-      
-          echo "Try logs (без пайпа, чтобы не скрыть ошибку):"
+          [[ -n "${RAILWAY_SERVICE_ID:-}" ]] || { echo "❌ Missing RAILWAY_SERVICE_ID"; exit 1; }
+          [[ -n "${RAILWAY_ENV_ID:-}"     ]] || { echo "❌ Missing RAILWAY_ENV_ID"; exit 1; }
+          echo "✅ SERVICE_ID/ENV_ID present"
+
+      # 3) Тестируем whoami и логи (без пайпов, чтобы не съесть ошибку)
+      - name: Test project token against logs
+        shell: bash
+        env:
+          RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "whoami (для API-токена воркспейса должен показать пользователя):"
+          railway whoami
+
+          echo "Try logs (получаем JSON):"
           railway logs \
             --service "$RAILWAY_SERVICE_ID" \
             --environment "$RAILWAY_ENV_ID" \
             --json \
             > logs.json
-      
+
           echo "✅ got logs.json, first lines:"
           head -n 10 logs.json
-      
