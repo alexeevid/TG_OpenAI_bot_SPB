@@ -8,15 +8,15 @@ on:
         required: false
         default: "400"
       service_id:
-        description: "Override SERVICE_ID (опционально)"
+        description: "Override Railway SERVICE_ID (опционально)"
         required: false
         default: ""
       environment_id:
-        description: "Override ENVIRONMENT_ID (опционально)"
+        description: "Override Railway ENVIRONMENT_ID (опционально)"
         required: false
         default: ""
       deployment_id:
-        description: "Опционально: DEPLOYMENT_ID (или оставьте пустым)"
+        description: "DEPLOYMENT_ID (или оставьте пустым)"
         required: false
         default: ""
   pull_request:
@@ -26,55 +26,63 @@ jobs:
   logs:
     runs-on: ubuntu-latest
 
+    # Важно: CLI читает токен из RAILWAY_TOKEN (env).
     env:
-      # Ключевое: CLI возьмёт токен из этой переменной
       RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-      RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
-      RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
+      R_SERVICE_ID_DEF:   ${{ secrets.RAILWAY_SERVICE_ID }}
+      R_ENV_ID_DEF:       ${{ secrets.RAILWAY_ENV_ID }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node (for Railway CLI)
+      - name: Setup Node (для Railway CLI)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      - name: Validate required secrets
+        run: |
+          set -e
+          test -n "${RAILWAY_TOKEN}" || (echo "❌ Missing secret: RAILWAY_TOKEN" && exit 1)
+          echo "✅ RAILWAY_TOKEN present"
+          # SERVICE/ENV можно задавать либо secrets, либо inputs.
+          if [ -z "${{ github.event.inputs.service_id }}" ] && [ -z "${R_SERVICE_ID_DEF}" ]; then
+            echo "❌ Need SERVICE_ID via inputs.service_id or secret RAILWAY_SERVICE_ID"; exit 1; fi
+          if [ -z "${{ github.event.inputs.environment_id }}" ] && [ -z "${R_ENV_ID_DEF}" ]; then
+            echo "❌ Need ENVIRONMENT_ID via inputs.environment_id or secret RAILWAY_ENV_ID"; exit 1; fi
 
       - name: Install Railway CLI
         run: |
           npm i -g @railway/cli@latest
           railway --version
 
-      # Безопасная самопроверка: секрет на месте?
-      - name: Validate required secrets
+      # Для токена проекта whoami может вернуть Unauthorized — это нормально.
+      - name: Who am I (optional)
         run: |
-          set -e
-          test -n "${RAILWAY_TOKEN:-}" || (echo "❌ RAILWAY_TOKEN is empty" && exit 1)
-          echo "RAILWAY_TOKEN length: ${#RAILWAY_TOKEN} (значение замаскировано в логах)"
+          railway whoami || echo "ℹ️ whoami unauthorized (OK for project tokens)"
 
-      # Проверка авторизации — должна показать пользователя, иначе токен неверный
-      - name: Who am I
-        run: |
-          set -e
-          railway whoami
-
-      # Забираем логи напрямую флагами (без railway use / без --project)
       - name: Fetch logs (JSON)
         id: fetch
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           LINES="${{ github.event.inputs.lines || '400' }}"
-          SERVICE_ID="${{ github.event.inputs.service_id || env.RAILWAY_SERVICE_ID }}"
-          ENV_ID="${{ github.event.inputs.environment_id || env.RAILWAY_ENV_ID }}"
-          DEPLOYMENT_ID="${{ github.event.inputs.deployment_id || '' }}"
+          SERVICE_ID="${{ github.event.inputs.service_id }}"
+          ENV_ID="${{ github.event.inputs.environment_id }}"
+          DEPLOYMENT_ID="${{ github.event.inputs.deployment_id }}"
 
-          DEP_ARG=""
+          # Фолбэк к secrets, если inputs пустые
+          if [ -z "$SERVICE_ID" ]; then SERVICE_ID="$R_SERVICE_ID_DEF"; fi
+          if [ -z "$ENV_ID" ];    then ENV_ID="$R_ENV_ID_DEF"; fi
+
           if [ -n "$DEPLOYMENT_ID" ]; then
             DEP_ARG="--deployment $DEPLOYMENT_ID"
+          else
+            DEP_ARG=""
           fi
 
+          # В CLI v4 нет --project у `railway logs`. Достаточно токена + ID.
           railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
 
           tail -n "$LINES" logs.json | tee tail.txt
