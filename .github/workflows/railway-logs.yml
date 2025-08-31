@@ -7,12 +7,12 @@ on:
         description: "Сколько строк показать (tail)"
         required: false
         default: "400"
-      service_id:
-        description: "Override SERVICE_ID (опционально)"
+      service:
+        description: "Service (ID или NAME) — переопределяет секреты"
         required: false
         default: ""
-      environment_id:
-        description: "Override ENVIRONMENT_ID (опционально)"
+      environment:
+        description: "Environment (ID или NAME) — переопределяет секреты"
         required: false
         default: ""
       deployment_id:
@@ -27,10 +27,14 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ОБЯЗАТЕЛЬНО: сюда положи ИМЕННО ПРОЕКТНЫЙ токен (Project → Settings → Tokens → Create)
-      RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-      RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
-      RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
+      # ОБЯЗАТЕЛЬНО: проектный токен из Project → Settings → Tokens
+      RAILWAY_TOKEN:         ${{ secrets.RAILWAY_TOKEN }}
+
+      # МОЖНО задать ID ИЛИ NAME (любое из пары)
+      RAILWAY_SERVICE_ID:    ${{ secrets.RAILWAY_SERVICE_ID }}
+      RAILWAY_SERVICE_NAME:  ${{ secrets.RAILWAY_SERVICE_NAME }}
+      RAILWAY_ENV_ID:        ${{ secrets.RAILWAY_ENV_ID }}
+      RAILWAY_ENV_NAME:      ${{ secrets.RAILWAY_ENV_NAME }}
 
     steps:
       - name: Checkout
@@ -46,66 +50,96 @@ jobs:
           npm i -g @railway/cli@latest
           railway --version
 
-      - name: Validate secrets
+      - name: Validate token
         run: |
-          set -e
           if [ -z "${RAILWAY_TOKEN:-}" ]; then
-            echo "::error::Missing secret RAILWAY_TOKEN. Создай токен в Railway Project → Settings → Tokens (именно ПРОЕКТНЫЙ) и добавь в GitHub Secrets."
-            exit 1
+            echo "::error::Missing RAILWAY_TOKEN. Создай ПРОЕКТНЫЙ токен и добавь в GitHub Secrets."; exit 1;
           fi
-          # Простая эвристика: проектный токен обычно UUID-подобный и >= 30 символов
-          echo "RAILWAY_TOKEN length: ${#RAILWAY_TOKEN} (значение скрыто)"
-          if [ ${#RAILWAY_TOKEN} -lt 30 ]; then
-            echo "::warning::RAILWAY_TOKEN выглядит слишком коротким. Убедись, что вставлен ПОЛНЫЙ токен (не маска ****-xxxx)."
-          fi
+          echo "RAILWAY_TOKEN length = ${#RAILWAY_TOKEN} (значение скрыто)"
 
-          # SERVICE/ENV можно задать через inputs либо secrets
-          if [ -z "${{ github.event.inputs.service_id }}" ] && [ -z "${RAILWAY_SERVICE_ID:-}" ]; then
-            echo "::error::Нужен SERVICE_ID через inputs.service_id или secret RAILWAY_SERVICE_ID"; exit 1; fi
-          if [ -z "${{ github.event.inputs.environment_id }}" ] && [ -z "${RAILWAY_ENV_ID:-}" ]; then
-            echo "::error::Нужен ENVIRONMENT_ID через inputs.environment_id или secret RAILWAY_ENV_ID"; exit 1; fi
-
-      # whoami для проектного токена часто даёт Unauthorized — не фейлимся
+      # whoami для проектного токена может быть Unauthorized — это ок
       - name: whoami (optional)
         continue-on-error: true
-        run: |
-          railway whoami || echo "ℹ️ whoami: Unauthorized — это нормально для ПРОЕКТНЫХ токенов."
+        run: railway whoami || echo "ℹ️ whoami: Unauthorized — нормально для проектных токенов"
 
-      - name: Fetch logs (JSON) with friendly diagnostics
-        id: fetch
-        env:
-          IN_LINES:   ${{ github.event.inputs.lines }}
-          IN_SERVICE: ${{ github.event.inputs.service_id }}
-          IN_ENV:     ${{ github.event.inputs.environment_id }}
-          IN_DEP:     ${{ github.event.inputs.deployment_id }}
+      - name: Resolve service/environment (ID/NAME + inputs)
+        id: resolve
         run: |
-          set -Eeuo pipefail
-          LINES="${IN_LINES:-400}"
-          SID="${IN_SERVICE:-${RAILWAY_SERVICE_ID:-}}"
-          EID="${IN_ENV:-${RAILWAY_ENV_ID:-}}"
-          DEP="${IN_DEP:-}"
+          set -euo pipefail
+          # Inputs приоритетнее секретов
+          IN_S="${{ github.event.inputs.service }}"
+          IN_E="${{ github.event.inputs.environment }}"
+          DEP="${{ github.event.inputs.deployment_id }}"
 
-          if [ -z "$SID" ] || [ -z "$EID" ]; then
-            echo "::error::Не заданы SERVICE_ID/ENV_ID. Заполни inputs при запуске или добавь secrets RAILWAY_SERVICE_ID / RAILWAY_ENV_ID."
+          # Собираем кандидаты: сначала inputs, затем secrets
+          SVC="${IN_S:-}"
+          ENV="${IN_E:-}"
+
+          if [ -z "$SVC" ]; then
+            if [ -n "${RAILWAY_SERVICE_ID:-}" ]; then SVC="$RAILWAY_SERVICE_ID"; fi
+            if [ -z "$SVC" ] && [ -n "${RAILWAY_SERVICE_NAME:-}" ]; then SVC="$RAILWAY_SERVICE_NAME"; fi
+          fi
+
+          if [ -z "$ENV" ]; then
+            if [ -n "${RAILWAY_ENV_ID:-}" ]; then ENV="$RAILWAY_ENV_ID"; fi
+            if [ -z "$ENV" ] && [ -n "${RAILWAY_ENV_NAME:-}" ]; then ENV="$RAILWAY_ENV_NAME"; fi
+          fi
+
+          # Простая эвристика: UUID содержит дефисы — считаем это ID; иначе — NAME
+          classify() {
+            if echo "$1" | grep -qE '^[0-9a-fA-F-]{8,}$'; then echo "id"; else echo "name"; fi
+          }
+
+          if [ -z "$SVC" ] || [ -z "$ENV" ]; then
+            echo "::error::Нужны service и environment. Задай через inputs (service/environment) или secrets (RAILWAY_SERVICE_ID/NAME, RAILWAY_ENV_ID/NAME)."
             exit 1
           fi
 
-          DEP_ARG=""
-          if [ -n "$DEP" ]; then
-            DEP_ARG="--deployment $DEP"
-          fi
+          S_KIND=$(classify "$SVC")
+          E_KIND=$(classify "$ENV")
 
-          # Пытаемся получить логи, ловим вывод и код
-          set +e
+          echo "service_kind=$S_KIND" >> "$GITHUB_OUTPUT"
+          echo "service_value=$SVC"    >> "$GITHUB_OUTPUT"
+          echo "env_kind=$E_KIND"      >> "$GITHUB_OUTPUT"
+          echo "env_value=$ENV"        >> "$GITHUB_OUTPUT"
+          echo "deployment_id=$DEP"    >> "$GITHUB_OUTPUT"
+
+          echo "🔎 Using service ($S_KIND): $SVC"
+          echo "🔎 Using environment ($E_KIND): $ENV"
+          if [ -n "$DEP" ]; then echo "🔎 Deployment: $DEP"; fi
+
+      - name: Fetch logs (JSON) with fallbacks
+        id: fetch
+        run: |
+          set -Eeuo pipefail
+
+          LINES="${{ github.event.inputs.lines || '400' }}"
+          DEP="${{ steps.resolve.outputs.deployment_id }}"
+          S_KIND="${{ steps.resolve.outputs.service_kind }}"
+          S_VAL="${{ steps.resolve.outputs.service_value }}"
+          E_KIND="${{ steps.resolve.outputs.env_kind }}"
+          E_VAL="${{ steps.resolve.outputs.env_value }}"
+
+          svc_flag="--service"
+          env_flag="--environment"
+          [ "$S_KIND" = "name" ] && svc_flag="--service-name"
+          [ "$E_KIND" = "name" ] && env_flag="--environment-name"
+
+          dep_arg=""
+          [ -n "$DEP" ] && dep_arg="--deployment $DEP"
+
           OUT_JSON=$(mktemp)
           ERR_TXT=$(mktemp)
-          railway logs --service "$SID" --environment "$EID" $DEP_ARG --json > "$OUT_JSON" 2> "$ERR_TXT"
-          RC=$?
+
+          echo "▶ railway logs $svc_flag '$S_VAL' $env_flag '$E_VAL' $dep_arg --json"
+          set +e
+          railway logs $svc_flag "$S_VAL" $env_flag "$E_VAL" $dep_arg --json > "$OUT_JSON" 2> "$ERR_TXT"
+          rc=$?
           set -e
 
-          if [ $RC -ne 0 ]; then
+          if [ $rc -ne 0 ]; then
             echo "::group::Diagnostics"
-            echo "Command exit code: $RC"
+            echo "Exit code: $rc"
             echo "---- STDERR ----"
             cat "$ERR_TXT" || true
             echo "---- STDOUT (head) ----"
@@ -113,17 +147,17 @@ jobs:
             echo "::endgroup::"
 
             if grep -qi "Project Token not found" "$ERR_TXT"; then
-              echo "::error::CLI сообщает: Project Token not found. Для команды 'railway logs' в этой версии CLI нужен ИМЕННО ПРОЕКТНЫЙ токен.
-Совет: Railway → Project → Settings → Tokens → Create token (We will only show this token once) → добавь в GitHub Secrets как RAILWAY_TOKEN."
+              echo "::error::Project Token not found — нужен ПРОЕКТНЫЙ токен (Project → Settings → Tokens)."
             elif grep -qi "Unauthorized" "$ERR_TXT"; then
-              echo "::error::Unauthorized. Либо токен неверный/истёк, либо это аккаунтный токен без контекста проекта. Рекомендуется использовать ПРОЕКТНЫЙ токен."
+              echo "::error::Unauthorized — токен неверный/истёк или не проектный."
+            elif grep -qi "not found" "$ERR_TXT"; then
+              echo "::error::Проверь имена/ID service/environment. Они чувствительны к написанию."
             else
-              echo "::error::Не удалось получить логи. См. Diagnostics выше."
+              echo "::error::Не удалось получить логи. См. Diagnostics."
             fi
             exit 1
           fi
 
-          # Успех: сохраняем файлы и tail
           cp "$OUT_JSON" logs.json
           tail -n "$LINES" logs.json | tee tail.txt
 
