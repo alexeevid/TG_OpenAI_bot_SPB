@@ -1,10 +1,135 @@
 name: Railway Logs (manual)
 run-name: Railway Logs (manual)
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      lines:
+        description: "Сколько строк вывести (tail)"
+        required: false
+        default: "400"
+      service_id:
+        description: "Override SERVICE_ID (опционально)"
+        required: false
+        default: ""
+      environment_id:
+        description: "Override ENV_ID (опционально)"
+        required: false
+        default: ""
+      deployment_id:
+        description: "DEPLOYMENT_ID (опционально)"
+        required: false
+        default: ""
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
-  ping:
+  logs:
     runs-on: ubuntu-latest
+
     steps:
-      - run: echo "ok"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (для Railway CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Railway CLI
+        run: |
+          npm i -g @railway/cli@latest
+          railway --version
+
+      # Валидация обязательных секретов
+      - name: Validate secrets
+        env:
+          RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
+        run: |
+          set -e
+          [ -n "${RAILWAY_TOKEN}" ]      || { echo "❌ Missing RAILWAY_TOKEN"; exit 1; }
+          [ -n "${RAILWAY_SERVICE_ID}" ] || { echo "❌ Missing RAILWAY_SERVICE_ID"; exit 1; }
+          [ -n "${RAILWAY_ENV_ID}" ]     || { echo "❌ Missing RAILWAY_ENV_ID"; exit 1; }
+
+      # whoami для Project Token почти всегда пишет Unauthorized — это нормально.
+      - name: Who am I (informational)
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway whoami || echo "ℹ️ whoami unauthorized (OK for project tokens)"
+
+      - name: Fetch logs (JSON)
+        id: fetch
+        env:
+          RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
+          DEFAULT_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          DEFAULT_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
+          INPUT_SERVICE_ID:   ${{ github.event.inputs.service_id }}
+          INPUT_ENV_ID:       ${{ github.event.inputs.environment_id }}
+          INPUT_DEPLOYMENT:   ${{ github.event.inputs.deployment_id }}
+          INPUT_LINES:        ${{ github.event.inputs.lines }}
+        run: |
+          set -euo pipefail
+
+          SERVICE_ID="${INPUT_SERVICE_ID:-}"
+          [ -n "$SERVICE_ID" ] || SERVICE_ID="$DEFAULT_SERVICE_ID"
+
+          ENV_ID="${INPUT_ENV_ID:-}"
+          [ -n "$ENV_ID" ] || ENV_ID="$DEFAULT_ENV_ID"
+
+          LINES="${INPUT_LINES:-400}"
+
+          DEP_ARG=""
+          if [ -n "${INPUT_DEPLOYMENT:-}" ]; then
+            DEP_ARG="--deployment ${INPUT_DEPLOYMENT}"
+          fi
+
+          # Важно: 'logs' НЕ принимает --project. Токен уже привязан к проекту.
+          railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
+
+          tail -n "$LINES" logs.json | tee tail.txt
+
+          {
+            echo "tail<<'EOF'"
+            tail -n "$LINES" logs.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          INPUT_LINES: ${{ github.event.inputs.lines }}
+        run: |
+          LINES="${INPUT_LINES:-400}"
+          {
+            echo "### Railway logs (last ${LINES} lines)"
+            echo
+            echo '```json'
+            cat tail.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: railway-logs
+          path: |
+            logs.json
+            tail.txt
+          retention-days: 7
+
+      - name: Comment logs to PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ github.token }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ### Railway logs (tail)
+            ```json
+            ${{ steps.fetch.outputs.tail }}
+            ```
