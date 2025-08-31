@@ -1,4 +1,5 @@
 name: Railway Logs (manual)
+run-name: Railway Logs (manual)
 
 on:
   workflow_dispatch:
