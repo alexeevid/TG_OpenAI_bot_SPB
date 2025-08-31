@@ -26,12 +26,13 @@ jobs:
   logs:
     runs-on: ubuntu-latest
 
-    # берём чувствительные данные из Secrets
     env:
-      RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-      SERVICE_ID:         ${{ secrets.RAILWAY_SERVICE_ID }}
-      ENV_ID:             ${{ secrets.RAILWAY_ENV_ID }}
-      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }} # не обязателен для logs
+      # обязательные
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      SERVICE_ID:    ${{ secrets.RAILWAY_SERVICE_ID }}
+      ENV_ID:        ${{ secrets.RAILWAY_ENV_ID }}
+      # опционально (для справки, в logs не требуется)
+      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
 
     steps:
       - name: Checkout
@@ -57,20 +58,20 @@ jobs:
           npm i -g @railway/cli@latest
           railway --version
 
-      - name: Login with token
-        run: |
-          # Явный логин, чтобы не смущал Unauthorized в whoami
-          railway login --token "${RAILWAY_TOKEN}"
-          railway whoami || true
-
+      # Никаких login/use — CLI возьмет токен из RAILWAY_TOKEN
       - name: Fetch logs (JSON)
         id: fetch
+        env:
+          IN_LINES:   ${{ github.event.inputs.lines }}
+          IN_SERVICE: ${{ github.event.inputs.service_id }}
+          IN_ENV:     ${{ github.event.inputs.environment_id }}
+          IN_DEP:     ${{ github.event.inputs.deployment_id }}
         run: |
           set -euo pipefail
-          LINES="${{ github.event.inputs.lines || '400' }}"
-          SID="${{ github.event.inputs.service_id || env.SERVICE_ID }}"
-          EID="${{ github.event.inputs.environment_id || env.ENV_ID }}"
-          DEP="${{ github.event.inputs.deployment_id || '' }}"
+          LINES="${IN_LINES:-400}"
+          SID="${IN_SERVICE:-$SERVICE_ID}"
+          EID="${IN_ENV:-$ENV_ID}"
+          DEP="${IN_DEP:-}"
 
           DEP_ARG=""
           if [ -n "$DEP" ]; then
@@ -81,7 +82,7 @@ jobs:
             fi
           fi
 
-          # Никаких --project и никаких `railway use` — они не нужны
+          # Контекст проекта не нужен, достаточно service+environment (+deployment/--build)
           railway logs --service "$SID" --environment "$EID" $DEP_ARG --json > logs.json
 
           tail -n "$LINES" logs.json | tee tail.txt
