@@ -8,15 +8,15 @@ on:
         required: false
         default: "400"
       service_id:
-        description: "Override Railway SERVICE_ID (опционально)"
+        description: "Override SERVICE_ID (опционально)"
         required: false
         default: ""
       environment_id:
-        description: "Override Railway ENVIRONMENT_ID (опционально)"
+        description: "Override ENVIRONMENT_ID (опционально)"
         required: false
         default: ""
       deployment_id:
-        description: "DEPLOYMENT_ID (или оставьте пустым)"
+        description: "DEPLOYMENT_ID (опционально)"
         required: false
         default: ""
   pull_request:
@@ -26,11 +26,11 @@ jobs:
   logs:
     runs-on: ubuntu-latest
 
-    # Важно: CLI читает токен из RAILWAY_TOKEN (env).
     env:
+      # ОБЯЗАТЕЛЬНО: сюда положи ИМЕННО ПРОЕКТНЫЙ токен (Project → Settings → Tokens → Create)
       RAILWAY_TOKEN:      ${{ secrets.RAILWAY_TOKEN }}
-      R_SERVICE_ID_DEF:   ${{ secrets.RAILWAY_SERVICE_ID }}
-      R_ENV_ID_DEF:       ${{ secrets.RAILWAY_ENV_ID }}
+      RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+      RAILWAY_ENV_ID:     ${{ secrets.RAILWAY_ENV_ID }}
 
     steps:
       - name: Checkout
@@ -41,50 +41,90 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Validate required secrets
-        run: |
-          set -e
-          test -n "${RAILWAY_TOKEN}" || (echo "❌ Missing secret: RAILWAY_TOKEN" && exit 1)
-          echo "✅ RAILWAY_TOKEN present"
-          # SERVICE/ENV можно задавать либо secrets, либо inputs.
-          if [ -z "${{ github.event.inputs.service_id }}" ] && [ -z "${R_SERVICE_ID_DEF}" ]; then
-            echo "❌ Need SERVICE_ID via inputs.service_id or secret RAILWAY_SERVICE_ID"; exit 1; fi
-          if [ -z "${{ github.event.inputs.environment_id }}" ] && [ -z "${R_ENV_ID_DEF}" ]; then
-            echo "❌ Need ENVIRONMENT_ID via inputs.environment_id or secret RAILWAY_ENV_ID"; exit 1; fi
-
       - name: Install Railway CLI
         run: |
           npm i -g @railway/cli@latest
           railway --version
 
-      # Для токена проекта whoami может вернуть Unauthorized — это нормально.
-      - name: Who am I (optional)
+      - name: Validate secrets
         run: |
-          railway whoami || echo "ℹ️ whoami unauthorized (OK for project tokens)"
-
-      - name: Fetch logs (JSON)
-        id: fetch
-        run: |
-          set -Eeuo pipefail
-
-          LINES="${{ github.event.inputs.lines || '400' }}"
-          SERVICE_ID="${{ github.event.inputs.service_id }}"
-          ENV_ID="${{ github.event.inputs.environment_id }}"
-          DEPLOYMENT_ID="${{ github.event.inputs.deployment_id }}"
-
-          # Фолбэк к secrets, если inputs пустые
-          if [ -z "$SERVICE_ID" ]; then SERVICE_ID="$R_SERVICE_ID_DEF"; fi
-          if [ -z "$ENV_ID" ];    then ENV_ID="$R_ENV_ID_DEF"; fi
-
-          if [ -n "$DEPLOYMENT_ID" ]; then
-            DEP_ARG="--deployment $DEPLOYMENT_ID"
-          else
-            DEP_ARG=""
+          set -e
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "::error::Missing secret RAILWAY_TOKEN. Создай токен в Railway Project → Settings → Tokens (именно ПРОЕКТНЫЙ) и добавь в GitHub Secrets."
+            exit 1
+          fi
+          # Простая эвристика: проектный токен обычно UUID-подобный и >= 30 символов
+          echo "RAILWAY_TOKEN length: ${#RAILWAY_TOKEN} (значение скрыто)"
+          if [ ${#RAILWAY_TOKEN} -lt 30 ]; then
+            echo "::warning::RAILWAY_TOKEN выглядит слишком коротким. Убедись, что вставлен ПОЛНЫЙ токен (не маска ****-xxxx)."
           fi
 
-          # В CLI v4 нет --project у `railway logs`. Достаточно токена + ID.
-          railway logs --service "$SERVICE_ID" --environment "$ENV_ID" $DEP_ARG --json > logs.json
+          # SERVICE/ENV можно задать через inputs либо secrets
+          if [ -z "${{ github.event.inputs.service_id }}" ] && [ -z "${RAILWAY_SERVICE_ID:-}" ]; then
+            echo "::error::Нужен SERVICE_ID через inputs.service_id или secret RAILWAY_SERVICE_ID"; exit 1; fi
+          if [ -z "${{ github.event.inputs.environment_id }}" ] && [ -z "${RAILWAY_ENV_ID:-}" ]; then
+            echo "::error::Нужен ENVIRONMENT_ID через inputs.environment_id или secret RAILWAY_ENV_ID"; exit 1; fi
 
+      # whoami для проектного токена часто даёт Unauthorized — не фейлимся
+      - name: whoami (optional)
+        continue-on-error: true
+        run: |
+          railway whoami || echo "ℹ️ whoami: Unauthorized — это нормально для ПРОЕКТНЫХ токенов."
+
+      - name: Fetch logs (JSON) with friendly diagnostics
+        id: fetch
+        env:
+          IN_LINES:   ${{ github.event.inputs.lines }}
+          IN_SERVICE: ${{ github.event.inputs.service_id }}
+          IN_ENV:     ${{ github.event.inputs.environment_id }}
+          IN_DEP:     ${{ github.event.inputs.deployment_id }}
+        run: |
+          set -Eeuo pipefail
+          LINES="${IN_LINES:-400}"
+          SID="${IN_SERVICE:-${RAILWAY_SERVICE_ID:-}}"
+          EID="${IN_ENV:-${RAILWAY_ENV_ID:-}}"
+          DEP="${IN_DEP:-}"
+
+          if [ -z "$SID" ] || [ -z "$EID" ]; then
+            echo "::error::Не заданы SERVICE_ID/ENV_ID. Заполни inputs при запуске или добавь secrets RAILWAY_SERVICE_ID / RAILWAY_ENV_ID."
+            exit 1
+          fi
+
+          DEP_ARG=""
+          if [ -n "$DEP" ]; then
+            DEP_ARG="--deployment $DEP"
+          fi
+
+          # Пытаемся получить логи, ловим вывод и код
+          set +e
+          OUT_JSON=$(mktemp)
+          ERR_TXT=$(mktemp)
+          railway logs --service "$SID" --environment "$EID" $DEP_ARG --json > "$OUT_JSON" 2> "$ERR_TXT"
+          RC=$?
+          set -e
+
+          if [ $RC -ne 0 ]; then
+            echo "::group::Diagnostics"
+            echo "Command exit code: $RC"
+            echo "---- STDERR ----"
+            cat "$ERR_TXT" || true
+            echo "---- STDOUT (head) ----"
+            head -n 30 "$OUT_JSON" || true
+            echo "::endgroup::"
+
+            if grep -qi "Project Token not found" "$ERR_TXT"; then
+              echo "::error::CLI сообщает: Project Token not found. Для команды 'railway logs' в этой версии CLI нужен ИМЕННО ПРОЕКТНЫЙ токен.
+Совет: Railway → Project → Settings → Tokens → Create token (We will only show this token once) → добавь в GitHub Secrets как RAILWAY_TOKEN."
+            elif grep -qi "Unauthorized" "$ERR_TXT"; then
+              echo "::error::Unauthorized. Либо токен неверный/истёк, либо это аккаунтный токен без контекста проекта. Рекомендуется использовать ПРОЕКТНЫЙ токен."
+            else
+              echo "::error::Не удалось получить логи. См. Diagnostics выше."
+            fi
+            exit 1
+          fi
+
+          # Успех: сохраняем файлы и tail
+          cp "$OUT_JSON" logs.json
           tail -n "$LINES" logs.json | tee tail.txt
 
           {
