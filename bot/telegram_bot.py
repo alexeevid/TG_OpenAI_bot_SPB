@@ -2102,7 +2102,7 @@ def _kb_keyboard(rows, page, pages, filter_name, admin: bool):
     keyboard.append(filter_row)
     
     keyboard.append([InlineKeyboardButton("📎 Сбросить все документы", callback_data="kb:reset_all")])
-if admin:
+    if admin:
         keyboard.append([InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:sync")])
     keyboard.append([InlineKeyboardButton("📁 Статус БЗ", callback_data="kb:status")])
     return InlineKeyboardMarkup(keyboard)
