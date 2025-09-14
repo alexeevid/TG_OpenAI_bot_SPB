@@ -624,12 +624,20 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chunks = _retrieve_chunks(db, did, text, k=6)
 
         ctx_blocks = [c.get("content", "")[:1000] for c in (chunks or [])]
-        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
+        # adapt max context by model
+        max_ctx = settings.max_context_tokens
+        model_id = dia_model or settings.openai_model
+        model_low = (model_id or "").lower()
+        if "3.5" in model_low or "gpt-3" in model_low or "turbo" in model_low:
+            max_ctx = min(max_ctx, 3500)
+        elif "4o" in model_low or "o4" in model_low:
+            max_ctx = min(max_ctx, 128000)
+        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, max_ctx)
         prompt = _build_prompt_with_style(ctx_blocks, text, dia_style) if ctx_blocks else text
 
         system = {"role": "system", "content": "RAG assistant"}
         user   = {"role": "user",   "content": prompt}
-        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=0.3), tries=3)
+        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=settings.temperature), tries=3)
         if chunks:
             answer += _format_citations(chunks)
 
@@ -716,7 +724,7 @@ def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict
     params, qexpr = _vec_literal(q)
     
     sql = f"""
-        SELECT c.content, c.meta, d.path
+        SELECT c.content, c.meta, d.path, (1 - (c.embedding <=> {qexpr})) AS cos_sim
         FROM kb_chunks c
         JOIN kb_documents d    ON d.id = c.document_id AND d.is_active = TRUE
         JOIN dialog_kb_links l ON l.document_id = c.document_id
@@ -726,8 +734,18 @@ def _retrieve_chunks(db, dialog_id: int, question: str, k: int = 6) -> List[dict
     """
     p = {"did": dialog_id, "k": k}
     p.update(params)
-    rows = db.execute(sa_text(sql), p).mappings().all()
-    return [dict(r) for r in rows]
+    rows = db.execute(sa_text(sql), params).mappings().all()
+    # Add threshold filtering
+    RELEVANCE_THRESHOLD = 0.7
+    filtered = []
+    for r in rows:
+        sim = r.get("cos_sim")
+        if sim is None:
+            # If cos_sim wasn't returned (older DB), accept all (backward-compat)
+            filtered.append(dict(r))
+        elif float(sim) >= RELEVANCE_THRESHOLD:
+            filtered.append(dict(r))
+    return filtered
 
 _STYLE_EXAMPLES = {
     "pro":    "Кратко, по шагам, чек-лист. Без воды. Пример: «Шаги 1–5, риски, KPI, дедлайны».",
@@ -801,13 +819,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3) Сборка промпта
         ctx_blocks = [c.get("content", "")[:1000] for c in (chunks or [])]
-        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, settings.max_context_tokens)
+        # adapt max context by model
+        max_ctx = settings.max_context_tokens
+        model_id = dia_model or settings.openai_model
+        model_low = (model_id or "").lower()
+        if "3.5" in model_low or "gpt-3" in model_low or "turbo" in model_low:
+            max_ctx = min(max_ctx, 3500)
+        elif "4o" in model_low or "o4" in model_low:
+            max_ctx = min(max_ctx, 128000)
+        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, max_ctx)
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
 
         # 4) Вызов LLM с ретраями
         system = {"role": "system", "content": "RAG assistant"}
         user   = {"role": "user",   "content": prompt}
-        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=0.3), tries=3)
+        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=settings.temperature), tries=3)
 
         if chunks:
             answer += _format_citations(chunks)
@@ -2047,7 +2073,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("rename dialog title failed")
             await update.message.reply_text("⚠ Не удалось сохранить название.")
         return
-    await update.message.reply_text("Принято. (Текстовый роутер будет подключён к RAG после стабилизации UI.)")
+    return
 
 # ---------- KB ----------
 PAGE_SIZE = 8
@@ -2074,7 +2100,9 @@ def _kb_keyboard(rows, page, pages, filter_name, admin: bool):
     if nav:
         keyboard.append(nav)
     keyboard.append(filter_row)
-    if admin:
+    
+    keyboard.append([InlineKeyboardButton("📎 Сбросить все документы", callback_data="kb:reset_all")])
+if admin:
         keyboard.append([InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:sync")])
     keyboard.append([InlineKeyboardButton("📁 Статус БЗ", callback_data="kb:status")])
     return InlineKeyboardMarkup(keyboard)
@@ -2200,6 +2228,16 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 docs = _exec_scalar(db, "SELECT COUNT(*) FROM kb_documents WHERE is_active") or 0
                 chunks = _exec_scalar(db, "SELECT COUNT(*) FROM kb_chunks") or 0
                 await q.edit_message_text(f"Документов: {docs}\nЧанков: {chunks}")
+            if data == "kb:reset_all":
+                with SessionLocal() as db:
+                    uid = _ensure_user(db, tg_id)
+                    did = _get_active_dialog_id(db, uid)
+                    if did:
+                        db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d"), {"d": did})
+                        db.commit()
+                await q.edit_message_text("📎 Все документы отключены.")
+                return
+
                 return
 
             if data in ("kb:sync", "kb:sync:run"):
@@ -2622,6 +2660,7 @@ def build_app() -> Application:
                 ("whoami", "Мои права"),
                 ("dialogs", "Диалоги"),
                 ("dialog_new", "Новый диалог"),
+                ("reset", "Сброс диалога"),
                 ("model", "Выбрать модель"),
                 ("mode", "Стиль ответа"),
                 ("kb", "Меню БЗ"),
@@ -2685,6 +2724,8 @@ def build_app() -> Application:
     _add_cmd_if_present(app, "dialog_export", "dialog_export")
     _add_cmd_if_present(app, "dialog_delete", "dialog_delete")
     _add_cmd_if_present(app, "dialog_rename", "dialog_rename")
+
+    _add_cmd_if_present(app, "reset", "reset")
 
     # === Web search (/web)
     if globals().get("web_cmd") or globals().get("cmd_web"):
