@@ -458,7 +458,6 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if recent_updates.seen(update.update_id):
         return
-    t0 = time.perf_counter()
 
     m = update.effective_message or update.message
     if not m:
@@ -470,7 +469,6 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
 
-    did = None
     try:
         voice = getattr(m, "voice", None) or getattr(m, "audio", None)
         if not voice:
@@ -495,6 +493,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             return await m.reply_text("🤷 Не удалось распознать речь. Попробуйте ещё раз.")
 
+        # Далее — та же логика, что и в on_text
         with SessionLocal() as db:
             did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
@@ -542,7 +541,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_long(m, answer)
 
     except Exception:
-        log.exception("on_voice failed", extra={"event": "on_voice", "latency_ms": int((time.perf_counter() - t0) * 1000)})
+        log.exception("on_voice failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
 
 async def rag_selftest(update, context):
@@ -656,7 +655,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
 
-    did = None
     try:
         with SessionLocal() as db:
             did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
@@ -664,6 +662,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
 
+            # RAG
             try:
                 k = int(getattr(settings, "max_kb_chunks", 6) or 6)
             except Exception:
@@ -676,6 +675,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         ctx_blocks = [c.get("content", "")[:1000] for c in (chunks or [])]
 
+        # Обрезка контекста по модели
         max_ctx = getattr(settings, "max_context_tokens", 4000) or 4000
         model_id = (dia_model or settings.openai_model or "").lower()
         if "3.5" in model_id or "gpt-3" in model_id or "turbo" in model_id:
@@ -690,9 +690,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user   = {"role": "user",   "content": prompt}
         temperature = float(getattr(settings, "temperature", 0.2) or 0.2)
 
+        # Надёжный вызов модели
         answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=temperature), tries=3)
         answer = answer or "—"
 
+        # Сохранение истории
         try:
             with SessionLocal() as db:
                 _save_msg(db, did, "user", q)
@@ -705,7 +707,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_long(m, answer)
 
     except Exception:
-        log.exception("on_text failed", extra={"event": "on_text", "latency_ms": int((time.perf_counter() - t0) * 1000)})
+        log.exception("on_text failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
 
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -735,10 +737,14 @@ async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("kb_pdf_diag failed")
         await m.reply_text("⚠ kb_pdf_diag: ошибка. Смотри логи.")
 
-def _save_msg(db, dialog_id: int, role: str, text: str):
+def _save_msg(db, dialog_id: int, role: str, text: str) -> None:
+    # Колонка в БД называется "content", не "text"
     db.execute(
-        sa_text("INSERT INTO messages (dialog_id, role, content), created_at) VALUES (:d, :r, :t, now())"),
-        {"d": dialog_id, "r": role, "t": cext},
+        sa_text("""
+            INSERT INTO messages (dialog_id, role, content, created_at)
+            VALUES (:d, :r, :c, now())
+        """),
+        {"d": dialog_id, "r": role, "c": text},
     )
 
 async def rag_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1785,62 +1791,44 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
+    tg_id = update.effective_user.id
     try:
-        tg = update.effective_user.id
         with SessionLocal() as db:
-            # whoami
-            u = db.execute(sa_text(
-                "SELECT id, is_admin, is_allowed, COALESCE(lang,'ru') "
-                "FROM users WHERE tg_user_id=:tg ORDER BY id LIMIT 1"
-            ), {"tg": cg}).first()
-            if u:
-                uid, is_admin, is_allowed, lang = u
-            else:
-                uid, is_admin, is_allowed, lang = (None, False, True if not getattr(settings,'allowed_user_ids','') else False, 'ru')
-            role = "admin" if is_admin else ("allowed" if is_allowed or not getattr(settings,'allowed_user_ids','') else "guest")
-
-            did = _get_active_dialog_id(db, tg)
+            uid = _ensure_user(db, tg_id)
+            did = _get_active_dialog_id(db, tg_id)  # активный по last_message_at
             if not did:
-                return await m.reply_text(
-                    f"whoami: cg={tg}, role={role}, lang={lang}\n\n"
-                    "Активного диалога нет. Создайте /dialog_new."
-                )
+                await m.reply_text("Нет активного диалога. Создайте новый /dialog_new")
+                return
 
-            row = db.execute(sa_text(
-                "SELECT title, model, style, created_at, last_message_at FROM dialogs WHERE id=:d"
-            ), {"d": did}).first()
+            d = db.execute(sa_text("""
+                SELECT d.id, d.title, d.model, d.style,
+                       d.created_at, d.last_message_at
+                FROM dialogs d
+                WHERE d.id=:d
+            """), {"d": did}).mappings().first()
 
-            links = db.execute(sa_text("""
+            doc_rows = db.execute(sa_text("""
                 SELECT kd.path
                 FROM dialog_kb_links l
                 JOIN kb_documents kd ON kd.id = l.document_id
-                WHERE l.dialog_id = :d
+                WHERE l.dialog_id=:d
                 ORDER BY kd.path
-            """), {"d": did}).fetchall()
+            """), {"d": did}).all()
+            doc_lines = [f"• {r[0]}" for r in doc_rows] or ["• —"]
 
-            msg_count = _exec_scalar(db, "SELECT count(*) FROM messages WHERE dialog_id = :d", d=did) or 0
-            total_dialogs = _exec_scalar(db, """
-                SELECT count(*) FROM dialogs d
-                JOIN users u ON u.id = d.user_id
-                WHERE u.tg_user_id = :tg AND d.is_deleted = FALSE
-            """, tg=tg) or 0
+            msgs_cnt = db.execute(sa_text("SELECT COUNT(*) FROM messages WHERE dialog_id=:d"), {"d": did}).scalar() or 0
+            dialogs_cnt = db.execute(sa_text("SELECT COUNT(*) FROM dialogs WHERE user_id=:u AND is_deleted=FALSE"),
+                                     {"u": uid}).scalar() or 0
 
-        title, model, style, created_dt, updated_dt = row
-        created = created_dt.strftime("%Y-%m-%d %H:%M") if created_dt else "-"
-        updated = updated_dt.strftime("%Y-%m-%d %H:%M") if updated_dt else "-"
-        docs = [r[0] for r in links] if links else []
-
-        await m.reply_text("\n".join([
-            f"whoami: cg={tg}, role={role}, lang={lang}",
-            "",
-            f"Диалог: {did} — {title or ''}",
-            f"Модель: {model or settings.openai_model} | Стиль: {style or '-'}",
-            f"Создан: {created} | Изменён: {updated}",
-            f"Подключённые документы ({len(docs)}):",
-            *([f"• {p}" for p in docs] or ["• —"]),
-            "",
-            f"Всего твоих диалогов: {total_dialogs} | Сообщений в этом диалоге: {msg_count}",
-        ]))
+            text = (
+                f"whoami: tg={tg_id}, role={'admin' if _is_admin(tg_id) else 'allowed'}\n\n"
+                f"Диалог: {d['id']} — {d['created_at']:%Y-%m-%d} | диалог: {d['title'] or d['id']}\n"
+                f"Модель: {d['model'] or settings.openai_model} | Стиль: {d['style'] or 'pro'}\n"
+                f"Создан: {d['created_at'] or '-'} | Изменён: {d['last_message_at'] or '-'}\n"
+                f"Подключённые документы ({len(doc_lines)}):\n" + "\n".join(doc_lines) + "\n\n"
+                f"Всего твоих диалогов: {dialogs_cnt} | Сообщений в этом диалоге: {msgs_cnt}"
+            )
+            await _send_long(m, text)
     except Exception:
         log.exception("stats failed")
         await m.reply_text("⚠ Ошибка /stats")
@@ -1922,22 +1910,123 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 async def kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    tg_id = update.effective_user.id
     try:
-        tg_id = update.effective_user.id
         with SessionLocal() as db:
             uid = _ensure_user(db, tg_id)
-            _ensure_dialog(db, uid)
-            dlg_id, rows, page, pages, conn_ids = _kb_fetch(db, uid, 1, "all")
-        buttons = []
-        for d_id, path in rows:
-            checked = "☑" if d_id in conn_ids else "☐"
-            fname = path.split("/")[-1]
-            buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:all")])
-        kb_markup = _kb_keyboard(buttons, page, pages, "all", admin=_is_admin(tg_id))
-        await update.message.reply_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
+            dlg_id = _get_active_dialog_id_by_uid(db, uid)
+            if not dlg_id:
+                await m.reply_text("Нет активного диалога. Создайте новый /dialog_new")
+                return
+
+            # подключённые документы
+            conn_ids = {
+                r[0] for r in db.execute(sa_text(
+                    "SELECT document_id FROM dialog_kb_links WHERE dialog_id=:d"
+                ), {"d": dlg_id}).all()
+            }
+
+            # выводим "подключённые" (первая страница, без пагинации — для надёжного старта)
+            rows = db.execute(sa_text("""
+                SELECT id, path
+                FROM kb_documents
+                WHERE is_active
+                ORDER BY path
+                LIMIT 30
+            """)).all()
+
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            keyboard = []
+
+            for doc_id, path in rows:
+                fname = (path or "").split("/")[-1] or path or "—"
+                checked = "☑" if doc_id in conn_ids else "☐"
+                keyboard.append([InlineKeyboardButton(f"{checked} {fname}",
+                                 callback_data=f"kb:toggle:{doc_id}:1:connected")])
+
+            # фильтры / сервисные кнопки
+            keyboard.append([
+                InlineKeyboardButton("Все", callback_data="kb:list:1:all"),
+                InlineKeyboardButton("Подключённые", callback_data="kb:list:1:connected"),
+                InlineKeyboardButton("Доступные", callback_data="kb:list:1:available"),
+            ])
+            keyboard.append([InlineKeyboardButton("📎 Сбросить все документы", callback_data="kb:reset_all")])
+            if _is_admin(tg_id):
+                keyboard.append([InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:sync")])
+            keyboard.append([InlineKeyboardButton("📁 Статус БЗ", callback_data="kb:status")])
+
+            await m.reply_text(
+                "Меню БЗ: выберите документы для подключения к активному диалогу.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
     except Exception:
         log.exception("kb failed")
-        await update.message.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+        await m.reply_text("⚠ Что-то пошло не так. Попробуйте ещё раз.")
+
+from telegram.error import BadRequest
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+PAGE_SIZE = 10
+
+def _kb_page(db, dlg_id: int, page: int, flt: str):
+    conn_ids = {
+        r[0] for r in db.execute(sa_text(
+            "SELECT document_id FROM dialog_kb_links WHERE dialog_id=:d"
+        ), {"d": dlg_id}).all()
+    }
+    where = "WHERE is_active"
+    params = {}
+    if flt == "connected":
+        if conn_ids:
+            where += " AND id = ANY(:ids)"
+            params["ids"] = list(conn_ids)
+        else:
+            return [], 1, 1, conn_ids
+    elif flt == "available" and conn_ids:
+        where += " AND NOT (id = ANY(:ids))"
+        params["ids"] = list(conn_ids)
+
+    total = (db.execute(sa_text(f"SELECT COUNT(*) FROM kb_documents {where}"), params).scalar() or 0)
+    pages = max(1, (total + PAGE_SIZE - 1)//PAGE_SIZE)
+    page = max(1, min(page, pages))
+
+    rows = db.execute(sa_text(f"""
+        SELECT id, path
+        FROM kb_documents
+        {where}
+        ORDER BY path
+        OFFSET :off LIMIT :lim
+    """), {**params, "off": (page-1)*PAGE_SIZE, "lim": PAGE_SIZE}).all()
+    return rows, page, pages, conn_ids
+
+def _kb_markup(rows, conn_ids, page, pages, flt, is_admin: bool):
+    kb = []
+    for doc_id, path in rows:
+        fname = (path or "").split("/")[-1] or path or "—"
+        checked = "☑" if doc_id in conn_ids else "☐"
+        kb.append([InlineKeyboardButton(f"{checked} {fname}",
+                 callback_data=f"kb:toggle:{doc_id}:{page}:{flt}")])
+    # пагинация
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton("«", callback_data=f"kb:list:{page-1}:{flt}"))
+    nav.append(InlineKeyboardButton(f"Страница {page}/{pages}", callback_data="kb:nop"))
+    if page < pages:
+        nav.append(InlineKeyboardButton("»", callback_data=f"kb:list:{page+1}:{flt}"))
+    kb.append(nav)
+    # фильтр
+    kb.append([
+        InlineKeyboardButton("Все", callback_data="kb:list:1:all"),
+        InlineKeyboardButton("Подключённые", callback_data="kb:list:1:connected"),
+        InlineKeyboardButton("Доступные", callback_data="kb:list:1:available"),
+    ])
+    # сервис
+    kb.append([InlineKeyboardButton("📎 Сбросить все документы", callback_data="kb:reset_all")])
+    if is_admin:
+        kb.append([InlineKeyboardButton("🔄 Синхронизация", callback_data="kb:sync")])
+    kb.append([InlineKeyboardButton("📁 Статус БЗ", callback_data="kb:status")])
+    return InlineKeyboardMarkup(kb)
 
 async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1947,62 +2036,56 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_id = update.effective_user.id
         with SessionLocal() as db:
             uid = _ensure_user(db, tg_id)
+            dlg_id = _get_active_dialog_id_by_uid(db, uid)
+            if not dlg_id:
+                await q.message.reply_text("Нет активного диалога — создайте новый /dialog_new")
+                return
 
             if data.startswith("kb:list:"):
                 _, _, page, flt = data.split(":", 3)
-                dlg_id, rows, page, pages, conn_ids = _kb_fetch(db, uid, int(page), flt)
-                buttons = []
-                for d_id, path in rows:
-                    checked = "☑" if d_id in conn_ids else "☐"
-                    fname = path.split("/")[-1]
-                    buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:{flt}")])
-                kb_markup = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
+                rows, page, pages, conn_ids = _kb_page(db, dlg_id, int(page), flt)
+                markup = _kb_markup(rows, conn_ids, page, pages, flt, _is_admin(tg_id))
                 try:
-                    await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
+                    await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=markup)
                 except BadRequest as e:
-                    if "Message is not modified" not in str(e):
+                    if "not modified" not in str(e).lower():
                         raise
                 return
 
             if data.startswith("kb:toggle:"):
                 _, _, doc_id, page, flt = data.split(":", 4)
                 doc_id = int(doc_id)
-                dlg_id = _get_active_dialog_id_by_uid(db, uid)
-                if not dlg_id:
-                    await q.message.reply_text("Нет активного диалога — создайте новый /dialog_new")
-                    return
-                is_linked = bool(_exec_scalar(db, "SELECT 1 FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc", d=dlg_id, doc=doc_id))
-                if is_linked:
-                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc"), {"d": dlg_id, "doc": doc_id})
+                linked = db.execute(sa_text("""
+                    SELECT 1 FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc
+                """), {"d": dlg_id, "doc": doc_id}).first()
+                if linked:
+                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d AND document_id=:doc"),
+                               {"d": dlg_id, "doc": doc_id})
                 else:
-                    db.execute(sa_text("INSERT INTO dialog_kb_links (dialog_id, document_id) VALUES (:d,:doc) ON CONFLICT DO NOTHING"), {"d": dlg_id, "doc": doc_id})
+                    db.execute(sa_text("""
+                        INSERT INTO dialog_kb_links (dialog_id, document_id)
+                        VALUES (:d, :doc) ON CONFLICT DO NOTHING
+                    """), {"d": dlg_id, "doc": doc_id})
                 db.commit()
-
-                dlg_id, rows, page, pages, conn_ids = _kb_fetch(db, uid, int(page), flt)
-                buttons = []
-                for d_id, path in rows:
-                    checked = "☑" if d_id in conn_ids else "☐"
-                    fname = path.split("/")[-1]
-                    buttons.append([InlineKeyboardButton(f"{checked} {fname}", callback_data=f"kb:toggle:{d_id}:{page}:{flt}")])
-                kb_markup = _kb_keyboard(buttons, page, pages, flt, admin=_is_admin(tg_id))
+                # перерисовать текущую страницу
+                rows, page, pages, conn_ids = _kb_page(db, dlg_id, int(page), flt)
+                markup = _kb_markup(rows, conn_ids, page, pages, flt, _is_admin(tg_id))
                 try:
-                    await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=kb_markup)
+                    await q.edit_message_text("Меню БЗ: выберите документы для подключения к активному диалогу.", reply_markup=markup)
                 except BadRequest as e:
-                    if "Message is not modified" not in str(e):
+                    if "not modified" not in str(e).lower():
                         raise
                 return
 
             if data == "kb:reset_all":
-                dlg_id = _get_active_dialog_id_by_uid(db, uid)
-                if dlg_id:
-                    db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d"), {"d": dlg_id})
-                    db.commit()
+                db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d"), {"d": dlg_id})
+                db.commit()
                 await q.edit_message_text("📎 Все документы отключены.")
                 return
 
             if data == "kb:status":
-                docs = _exec_scalar(db, "SELECT COUNT(*) FROM kb_documents WHERE is_active") or 0
-                chunks = _exec_scalar(db, "SELECT COUNT(*) FROM kb_chunks") or 0
+                docs = db.execute(sa_text("SELECT COUNT(*) FROM kb_documents WHERE is_active")).scalar() or 0
+                chunks = db.execute(sa_text("SELECT COUNT(*) FROM kb_chunks")).scalar() or 0
                 await q.edit_message_text(f"Документов: {docs}\nЧанков: {chunks}")
                 return
 
@@ -2542,12 +2625,13 @@ def build_app() -> Application:
 
 def _get_active_dialog_id_by_uid(db, uid: int) -> int | None:
     row = db.execute(sa_text("""
-    SELECT d.id
-    FROM dialogs d
-    WHERE d.user_id = :u AND d.is_deleted = FALSE
-    ORDER BY COALESCE(d.last_message_at, to_timestamp(0)) DESC,
-             COALESCE(d.created_at,      to_timestamp(0)) DESC,
-             d.id DESC
-    LIMIT 1
+        SELECT d.id
+        FROM dialogs d
+        WHERE d.user_id = :u AND d.is_deleted = FALSE
+        ORDER BY COALESCE(d.last_message_at, to_timestamp(0)) DESC,
+                 COALESCE(d.created_at,      to_timestamp(0)) DESC,
+                 d.id DESC
+        LIMIT 1
     """), {"u": uid}).first()
     return row[0] if row else None
+
