@@ -1769,20 +1769,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             updated = d['last_message_at'] if d else None
 
             text = (
-                f"whoami: tg={tg_id}, role={'admin' if _is_admin(tg_id) else 'allowed'}
-
-"
-                f"Диалог: {did} — {created or '-'} | {title}
-"
-                f"Модель: {model} | Стиль: {style}
-"
-                f"Создан: {created or '-'} | Изменён: {updated or '-'}
-"
-                f"Подключённые документы ({len(doc_lines)}):
-" + "
-".join(doc_lines) + "
-
-"
+                f"whoami: tg={tg_id}, role={'admin' if _is_admin(tg_id) else 'allowed'}"
+                f"Диалог: {did} — {created or '-'} | {title}"
+                f"Модель: {model} | Стиль: {style}"
+                f"Создан: {created or '-'} | Изменён: {updated or '-'}"
+                f"Подключённые документы ({len(doc_lines)}):" + "".join(doc_lines) + ""
                 f"Всего твоих диалогов: {dialogs_cnt} | Сообщений в этом диалоге: {msgs_cnt}"
             )
             await _send_long(m, text)
