@@ -458,92 +458,61 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if recent_updates.seen(update.update_id):
         return
-
     m = update.effective_message or update.message
-    if not m:
-        return
-
+    if not m: return
     uid = update.effective_user.id
     if not _is_allowed_user(uid):
         return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
-
     try:
-        voice = getattr(m, "voice", None) or getattr(m, "audio", None)
-        if not voice:
-            return await m.reply_text("🎙️ Голосовое не найдено. Пришлите voice/aac/ogg файл.")
+        voice = getattr(m,"voice",None) or getattr(m,"audio",None)
+        if not voice: return await m.reply_text("🎙️ Голосовое не найдено. Пришлите voice/aac/ogg файл.")
         file = await context.bot.get_file(voice.file_id)
-
         import tempfile, os
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tf:
-            await file.download_to_drive(tf.name)
-            tmp_path = tf.name
-
+            await file.download_to_drive(tf.name); path=tf.name
         try:
             from bot.openai_helper import transcribe_audio
-            text = await transcribe_audio(tmp_path)
+            text = await transcribe_audio(path)
         finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
+            try: os.remove(path)
+            except Exception: pass
         text = (text or "").strip()
-        if not text:
-            return await m.reply_text("🤷 Не удалось распознать речь. Попробуйте ещё раз.")
-
-        # Далее — та же логика, что и в on_text
+        if not text: return await m.reply_text("🤷 Не удалось распознать речь. Попробуйте ещё раз.")
         with SessionLocal() as db:
             did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
-
             try:
-                k = int(getattr(settings, "max_kb_chunks", 6) or 6)
-            except Exception:
-                k = 6
+                k = int(getattr(settings,"max_kb_chunks",6) or 6)
+            except Exception: k=6
             try:
                 chunks = _retrieve_chunks(db, did, text, k=k)
             except Exception:
-                log.exception("retrieve_chunks failed (voice) — fallback to no-RAG")
-                chunks = []
-
-        ctx_blocks = [c.get("content", "")[:1000] for c in (chunks or [])]
-
-        max_ctx = getattr(settings, "max_context_tokens", 4000) or 4000
+                log.exception("retrieve_chunks failed (voice)"); chunks=[]
+        ctx_blocks=[c.get("content","")[:1000] for c in (chunks or [])]
+        max_ctx = getattr(settings,"max_context_tokens",4000) or 4000
         model_id = (dia_model or settings.openai_model or "").lower()
-        if "3.5" in model_id or "gpt-3" in model_id or "turbo" in model_id:
-            max_ctx = min(max_ctx, 3500)
-        elif "4o" in model_id or "o4" in model_id:
-            max_ctx = min(max_ctx, 128000)
-        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, max_ctx)
-
-        prompt = _build_prompt_with_style(ctx_blocks, text, dia_style) if ctx_blocks else text
-
-        system = {"role": "system", "content": "RAG assistant"}
-        user   = {"role": "user",   "content": prompt}
-        temperature = float(getattr(settings, "temperature", 0.2) or 0.2)
-
-        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=temperature), tries=3)
-        answer = answer or "—"
-
+        if "3.5" in model_id or "gpt-3" in model_id or "turbo" in model_id: max_ctx=min(max_ctx,3500)
+        elif "4o" in model_id or "o4" in model_id: max_ctx=min(max_ctx,128000)
+        ctx_blocks=_trim_ctx_by_tokens(ctx_blocks,max_ctx)
+        prompt=_build_prompt_with_style(ctx_blocks,text,dia_style) if ctx_blocks else text
+        msgs=[{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}]
+        temperature=float(getattr(settings,"temperature",0.2) or 0.2)
+        answer=await retry_async(lambda:_chat_full(dia_model,msgs,temperature=temperature),tries=3)
+        answer=answer or "—"
         try:
             with SessionLocal() as db:
                 _save_msg(db, did, "user", f"[voice] {text}")
                 _save_msg(db, did, "assistant", answer)
-                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
-                db.commit()
-        except Exception:
-            log.exception("save messages failed (voice)")
-
+                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did}); db.commit()
+        except Exception: log.exception("save messages failed (voice)")
         await _send_long(m, answer)
-
     except Exception:
         log.exception("on_voice failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-
 async def rag_selftest(update, context):
     from sqlalchemy import text as sa_text
     m = update.effective_message or update.message
@@ -640,76 +609,49 @@ def _format_citations(chunks: List[dict]) -> str:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if recent_updates.seen(update.update_id):
         return
-    t0 = time.perf_counter()
-
     m = update.effective_message or update.message
-    if not m:
-        return
+    if not m: return
     q = (m.text or "").strip()
-    if not q:
-        return
-
+    if not q: return
     uid = update.effective_user.id
     if not _is_allowed_user(uid):
         return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
     if not _rate_check_and_tick(uid):
         return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
-
     try:
         with SessionLocal() as db:
             did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
-
-            # RAG
             try:
                 k = int(getattr(settings, "max_kb_chunks", 6) or 6)
-            except Exception:
-                k = 6
+            except Exception: k = 6
             try:
                 chunks = _retrieve_chunks(db, did, q, k=k)
             except Exception:
-                log.exception("retrieve_chunks failed (text) — fallback to no-RAG")
-                chunks = []
-
-        ctx_blocks = [c.get("content", "")[:1000] for c in (chunks or [])]
-
-        # Обрезка контекста по модели
-        max_ctx = getattr(settings, "max_context_tokens", 4000) or 4000
+                log.exception("retrieve_chunks failed (text)"); chunks = []
+        ctx_blocks = [c.get("content","")[:1000] for c in (chunks or [])]
+        max_ctx = getattr(settings,"max_context_tokens",4000) or 4000
         model_id = (dia_model or settings.openai_model or "").lower()
-        if "3.5" in model_id or "gpt-3" in model_id or "turbo" in model_id:
-            max_ctx = min(max_ctx, 3500)
-        elif "4o" in model_id or "o4" in model_id:
-            max_ctx = min(max_ctx, 128000)
+        if "3.5" in model_id or "gpt-3" in model_id or "turbo" in model_id: max_ctx=min(max_ctx,3500)
+        elif "4o" in model_id or "o4" in model_id: max_ctx=min(max_ctx,128000)
         ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, max_ctx)
-
         prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-
-        system = {"role": "system", "content": "RAG assistant"}
-        user   = {"role": "user",   "content": prompt}
-        temperature = float(getattr(settings, "temperature", 0.2) or 0.2)
-
-        # Надёжный вызов модели
-        answer = await retry_async(lambda: _chat_full(dia_model, [system, user], temperature=temperature), tries=3)
+        msgs=[{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}]
+        temperature=float(getattr(settings,"temperature",0.2) or 0.2)
+        answer = await retry_async(lambda:_chat_full(dia_model,msgs,temperature=temperature),tries=3)
         answer = answer or "—"
-
-        # Сохранение истории
         try:
             with SessionLocal() as db:
                 _save_msg(db, did, "user", q)
                 _save_msg(db, did, "assistant", answer)
-                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
-                db.commit()
-        except Exception:
-            log.exception("save messages failed (text)")
-
+                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did}); db.commit()
+        except Exception: log.exception("save messages failed (text)")
         await _send_long(m, answer)
-
     except Exception:
         log.exception("on_text failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
@@ -1795,7 +1737,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with SessionLocal() as db:
             uid = _ensure_user(db, tg_id)
-            did = _get_active_dialog_id(db, tg_id)  # активный по last_message_at
+            did = _get_active_dialog_id(db, tg_id)
             if not did:
                 await m.reply_text("Нет активного диалога. Создайте новый /dialog_new")
                 return
@@ -1820,19 +1762,33 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dialogs_cnt = db.execute(sa_text("SELECT COUNT(*) FROM dialogs WHERE user_id=:u AND is_deleted=FALSE"),
                                      {"u": uid}).scalar() or 0
 
+            title = (d['title'] or f"диалог #{d['id']}") if d else f"диалог #{did}"
+            model = (d['model'] if d and d['model'] else settings.openai_model)
+            style = (d['style'] if d and d['style'] else 'pro')
+            created = d['created_at'] if d else None
+            updated = d['last_message_at'] if d else None
+
             text = (
-                f"whoami: tg={tg_id}, role={'admin' if _is_admin(tg_id) else 'allowed'}\n\n"
-                f"Диалог: {d['id']} — {d['created_at']:%Y-%m-%d} | диалог: {d['title'] or d['id']}\n"
-                f"Модель: {d['model'] or settings.openai_model} | Стиль: {d['style'] or 'pro'}\n"
-                f"Создан: {d['created_at'] or '-'} | Изменён: {d['last_message_at'] or '-'}\n"
-                f"Подключённые документы ({len(doc_lines)}):\n" + "\n".join(doc_lines) + "\n\n"
+                f"whoami: tg={tg_id}, role={'admin' if _is_admin(tg_id) else 'allowed'}
+
+"
+                f"Диалог: {did} — {created or '-'} | {title}
+"
+                f"Модель: {model} | Стиль: {style}
+"
+                f"Создан: {created or '-'} | Изменён: {updated or '-'}
+"
+                f"Подключённые документы ({len(doc_lines)}):
+" + "
+".join(doc_lines) + "
+
+"
                 f"Всего твоих диалогов: {dialogs_cnt} | Сообщений в этом диалоге: {msgs_cnt}"
             )
             await _send_long(m, text)
     except Exception:
         log.exception("stats failed")
         await m.reply_text("⚠ Ошибка /stats")
-
 async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2570,7 +2526,9 @@ def build_app() -> Application:
 
     _add_cmd_if_present(app, "reset", "reset")
 
-    # === Web search (/web)
+    
+    _add_cmd_if_present(app, "img", "img")
+# === Web search (/web)
     if globals().get("web_cmd") or globals().get("cmd_web"):
         if getattr(settings, "enable_web_search", False) and callable(globals().get("web_cmd")):
             app.add_handler(CommandHandler("web", globals()["web_cmd"]))
@@ -2635,3 +2593,26 @@ def _get_active_dialog_id_by_uid(db, uid: int) -> int | None:
     """), {"u": uid}).first()
     return row[0] if row else None
 
+
+
+async def img(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = update.effective_message or update.message
+    prompt = (m.text or "").split(" ", 1)[1].strip() if (m and m.text and " " in m.text) else ""
+    if not prompt:
+        return await m.reply_text("Использование: /img <описание изображения>")
+    try:
+        from bot.openai_helper import generate_image
+    except Exception:
+        generate_image = None
+    try:
+        if generate_image:
+            url = await generate_image(prompt)
+        else:
+            url = None
+        if url:
+            await context.bot.send_photo(chat_id=m.chat_id, photo=url, caption=prompt[:1024])
+        else:
+            await m.reply_text("Генератор изображений недоступен. Проверьте OPENAI_IMAGE_MODEL.")
+    except Exception:
+        log.exception("img failed")
+        await m.reply_text("⚠ Ошибка генерации изображения.")
