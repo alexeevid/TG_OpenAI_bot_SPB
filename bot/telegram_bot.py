@@ -1739,47 +1739,61 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid = _ensure_user(db, tg_id)
             did = _get_active_dialog_id(db, tg_id)
             if not did:
-                await m.reply_text("Нет активного диалога. Создайте новый /dialog_new")
-                return
+                return await m.reply_text("Нет активного диалога. Создайте новый /dialog_new")
 
             d = db.execute(sa_text("""
                 SELECT d.id, d.title, d.model, d.style,
                        d.created_at, d.last_message_at
                 FROM dialogs d
-                WHERE d.id=:d
+                WHERE d.id = :d
             """), {"d": did}).mappings().first()
 
+            # Только документы, подключённые к ТЕКУЩЕМУ диалогу!
             doc_rows = db.execute(sa_text("""
                 SELECT kd.path
                 FROM dialog_kb_links l
                 JOIN kb_documents kd ON kd.id = l.document_id
-                WHERE l.dialog_id=:d
+                WHERE l.dialog_id = :d
                 ORDER BY kd.path
             """), {"d": did}).all()
             doc_lines = [f"• {r[0]}" for r in doc_rows] or ["• —"]
 
-            msgs_cnt = db.execute(sa_text("SELECT COUNT(*) FROM messages WHERE dialog_id=:d"), {"d": did}).scalar() or 0
-            dialogs_cnt = db.execute(sa_text("SELECT COUNT(*) FROM dialogs WHERE user_id=:u AND is_deleted=FALSE"),
-                                     {"u": uid}).scalar() or 0
+            msgs_cnt = db.execute(sa_text(
+                "SELECT COUNT(*) FROM messages WHERE dialog_id = :d"
+            ), {"d": did}).scalar() or 0
 
-            title = (d['title'] or f"диалог #{d['id']}") if d else f"диалог #{did}"
-            model = (d['model'] if d and d['model'] else settings.openai_model)
-            style = (d['style'] if d and d['style'] else 'pro')
+            dialogs_cnt = db.execute(sa_text("""
+                SELECT COUNT(*) FROM dialogs
+                WHERE user_id = :u AND is_deleted = FALSE
+            """), {"u": uid}).scalar() or 0
+
+            title   = (d['title'] or f"диалог #{d['id']}") if d else f"диалог #{did}"
+            model   = (d['model'] if d and d['model'] else settings.openai_model)
+            style   = (d['style'] if d and d['style'] else 'pro')
             created = d['created_at'] if d else None
             updated = d['last_message_at'] if d else None
 
-            text = (
-                f"whoami: tg={tg_id}, role={'admin' if _is_admin(tg_id) else 'allowed'}"
-                f"Диалог: {did} — {created or '-'} | {title}"
-                f"Модель: {model} | Стиль: {style}"
-                f"Создан: {created or '-'} | Изменён: {updated or '-'}"
-                f"Подключённые документы ({len(doc_lines)}):" + "".join(doc_lines) + ""
-                f"Всего твоих диалогов: {dialogs_cnt} | Сообщений в этом диалоге: {msgs_cnt}"
-            )
+            # Аккуратная, построчная структура
+            lines = [
+                f"👤 Пользователь: {tg_id} ({'admin' if _is_admin(tg_id) else 'allowed'})",
+                f"💬 Диалог: #{did} | {title}",
+                f"🧠 Модель/стиль: {model} / {style}",
+                f"🗓 Создан: {created or '-'}",
+                f"✏️ Изменён: {updated or '-'}",
+                "",
+                f"📚 Документы ({len(doc_lines)}):",
+                *doc_lines,
+                "",
+                "📈 Счётчики:",
+                f"• Диалогов: {dialogs_cnt}",
+                f"• Сообщений в этом диалоге: {msgs_cnt}",
+            ]
+            text = "\n".join(lines)
             await _send_long(m, text)
     except Exception:
         log.exception("stats failed")
         await m.reply_text("⚠ Ошибка /stats")
+
 async def dialog_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -2045,21 +2059,69 @@ async def kb_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
+    tg_id = update.effective_user.id
+
+    if not _is_allowed_user(tg_id):
+        return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
+
+    # режим: /reset hard — дополнительно чистим историю сообщений
+    hard = False
+    txt = (m.text or "").strip().lower() if m and m.text else ""
+    if "reset hard" in txt or (context.args and any(a.lower() == "hard" for a in context.args)):
+        hard = True
+
     try:
         with SessionLocal() as db:
-            tg_id = update.effective_user.id
-            uid = _ensure_user(db, tg_id)
-            did = _ensure_dialog(db, uid)
-            db.execute(sa_text("DELETE FROM messages WHERE dialog_id=:d"),   {"d": did})
-            db.execute(sa_text("DELETE FROM dialog_kb_links WHERE dialog_id=:d"), {"d": did})
-            db.execute(sa_text("DELETE FROM pdf_passwords WHERE dialog_id=:d"),   {"d": did})
-            db.execute(sa_text("UPDATE dialogs SET last_message_at=NULL WHERE id=:d"), {"d": did})
-            db.commit()
-        context.user_data.clear()
-        await m.reply_text("♻️ Диалог очищен: история, привязки БЗ и пароли PDF сброшены.")
+            did = _get_active_dialog_id(db, tg_id)
+            if not did:
+                # Если диалога ещё нет — создаём новый и сообщаем
+                did = _create_new_dialog_for_tg(db, tg_id)
+                return await m.reply_text("♻️ Новый диалог создан. Контекст пуст.")
+
+            _reset_dialog_context(
+                db, did,
+                reset_model_and_style=True,
+                wipe_messages=hard,
+            )
+
+        if hard:
+            await m.reply_text("♻️ Диалог сброшен: документы отцеплены, модель/стиль — по умолчанию, история очищена.")
+        else:
+            await m.reply_text("♻️ Диалог сброшен: документы отцеплены, модель/стиль — по умолчанию, история сохранена.")
     except Exception:
         log.exception("reset failed")
-        await m.reply_text("⚠ Не удалось сбросить диалог.")
+        await m.reply_text("⚠ Ошибка при сбросе диалога. Попробуйте ещё раз.")
+
+def _reset_dialog_context(
+    db,
+    dialog_id: int,
+    *,
+    reset_model_and_style: bool = True,
+    wipe_messages: bool = False,
+):
+    # 1) Отцепить все документы KB от активного диалога
+    db.execute(sa_text("""
+        DELETE FROM dialog_kb_links
+        WHERE dialog_id = :d
+    """), {"d": dialog_id})
+
+    # 2) Очистить историю сообщений (опционально)
+    if wipe_messages:
+        db.execute(sa_text("""
+            DELETE FROM messages
+            WHERE dialog_id = :d
+        """), {"d": dialog_id})
+
+    # 3) Сбросить модель/стиль к умолчаниям (опционально)
+    if reset_model_and_style:
+        db.execute(sa_text("""
+            UPDATE dialogs
+            SET model = NULL, style = NULL
+            WHERE id = :d
+        """), {"d": dialog_id})
+
+    db.commit()
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Единый дружелюбный обработчик исключений."""
