@@ -227,7 +227,7 @@ def _is_allowed_user(tg_id: int) -> bool:
     # 2) иначе — проверяем users.is_allowed (по умолчанию True при первом заходе)
     try:
         with SessionLocal() as db:
-            row = db.execute(sa_text("SELECT is_allowed FROM users WHERE tg_user_id=:tg"), {"tg": cg_id}).first()
+            row = db.execute(sa_text("SELECT is_allowed FROM users WHERE tg_user_id=:tg"), {"tg": tg_id}).first()
             return bool(row[0]) if row else True
     except Exception:
         # на всякий случай — не блокируем пользователя из-за сбоя БД
@@ -362,14 +362,14 @@ def _get_active_dialog_id(db, tg_id: int) -> int | None:
                  COALESCE(d.created_at,      to_timestamp(0)) DESC,
                  d.id DESC
         LIMIT 1
-    """), {"tg": cg_id}).first()
+    """), {"tg": tg_id}).first()
     return row[0] if row else None
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_id = update.effective_user.id
         with SessionLocal() as db:
-            row = db.execute(sa_text("SELECT id, is_admin, is_allowed, lang FROM users WHERE tg_user_id=:tg"), {"tg": cg_id}).first()
+            row = db.execute(sa_text("SELECT id, is_admin, is_allowed, lang FROM users WHERE tg_user_id=:tg"), {"tg": tg_id}).first()
             if not row:
                 uid = _ensure_user(db, tg_id)
                 row = db.execute(sa_text("SELECT id, is_admin, is_allowed, lang FROM users WHERE id=:id"), {"id": uid}).first()
@@ -377,7 +377,7 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_allowed = bool(row[2]) if row else True
         lang = (row[3] or "ru") if row else "ru"
         role = "admin" if is_admin else ("allowed" if is_allowed else "guest")
-        await (update.message or update.effective_message).reply_text(f"whoami: cg={tg_id}, role={role}, lang={lang}")
+        await (update.message or update.effective_message).reply_text(f"whoami: tg={tg_id}, role={role}, lang={lang}")
     except Exception:
         log.exception("whoami failed")
         await (update.message or update.effective_message).reply_text("⚠ Ошибка whoami")
