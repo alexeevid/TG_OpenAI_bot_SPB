@@ -2230,25 +2230,18 @@ def _model_score(mid: str) -> int:
     return score
 
 # фильтруем только чатовые семейства и исключаем всё лишнее
-def _keep_chat_model(mid: str) -> bool:
-    m = mid.lower()
-    if any(x in m for x in ["embedding", "text-embedding", "dall-e", "whisper", "tts", "audio", "moderation", "computer-use"]):
-        return False
-    # скрываем явный мусор/несуществующие
-    if m.startswith("babbage") or m.startswith("davinci") or m.startswith("curie") or m.startswith("ada"):
-        return False
-    if m.startswith("gpt-5"):  # не показываем
-        return False
-    # оставляем gpt-4/4o/4.1/o4, 3.5, chatgpt-4o-latest
-    return any(x in m for x in ["gpt-4", "gpt-3.5", "chatgpt-4o", "o4"])
+def _keep_chat_model(m: str) -> bool:
+    """
+    Теперь не фильтруем по имени — показываем все модели,
+    которые возвращает OpenAI API для данного ключа.
+    """
+    return True
 
-def _sort_models(models):
-    # сортируем по created (desc), если есть; иначе по эвристике
-    def score(item):
-        mid = getattr(item, "id", "")
-        created = getattr(item, "created", 0) or 0
-        return (created, len(mid) * -1)
-    return sorted(models, key=score, reverse=True)
+def _sort_models(models: list) -> list:
+    """
+    Сортируем модели по дате добавления (от новых к старым).
+    """
+    return sorted(models, key=lambda m: m.created, reverse=True)
 
 async def model_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
