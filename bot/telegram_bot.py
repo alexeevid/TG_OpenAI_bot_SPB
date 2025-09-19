@@ -25,7 +25,7 @@ import time
 from telegram.ext import CommandHandler
 from telegram import Update
 from telegram.ext import ContextTypes, MessageHandler, filters
-
+from bot.openai_helper import transcribe_audio
 from openai import BadRequestError, RateLimitError, APITimeoutError, APIConnectionError, AuthenticationError, APIStatusError
 
 from datetime import datetime
@@ -520,7 +520,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             k = int(getattr(settings, "max_kb_chunks", 6) or 6)
             search_q = _build_search_text(text, history)        # 👈 новое
-            chunks   = _retrieve_chunks_for_dialog(db, did, search_q, k=k)
+            chunks = _retrieve_chunks(db, did, search_q, k=k)
 
         rag_prompt, used_chunks, cite_list = _build_strict_prompt(text, chunks or [], dia_style)
         msgs = _compose_messages_with_history(dia_style, text, history, rag_prompt)
@@ -631,6 +631,45 @@ def _build_prompt_with_style(ctx_blocks: List[str], user_q: str, dialog_style: s
     ctx = "\n\n".join([f"[Фрагмент #{i+1}]\n{t}" for i, t in enumerate(ctx_blocks)])
     return f"{header}\nСтиль: {style_line}\n\nКонтекст:\n{ctx}\n\nВопрос: {user_q}"
 
+def _build_strict_prompt(user_q: str, chunks: list[dict], dialog_style: str):
+    """
+    Совместимая «строгая» сборка промпта:
+    - формирует промпт со стилем поверх контекста;
+    - возвращает used_chunks (для проверки STRICT_RAG) и cite_list.
+    """
+    # оставим кусочки текста (аккуратно, чтобы не раздувать контекст)
+    ctx_blocks = [ (c.get("content") or "")[:1000] for c in (chunks or []) ]
+    prompt = _build_prompt_with_style(ctx_blocks, user_q, dialog_style)
+    # список цитат по именам файлов
+    def _short(p: str) -> str:
+        return (p or "").split("/")[-1].split("?")[0]
+    cite_list = []
+    seen = set()
+    for c in (chunks or []):
+        name = _short(c.get("path") or (c.get("meta") or {}).get("path", ""))
+        if name and name not in seen:
+            seen.add(name)
+            cite_list.append(f"- {name}")
+    used_chunks = chunks or []
+    return prompt, used_chunks, cite_list
+
+def _compose_messages_with_history(dialog_style: str, user_q: str, history: list[dict], rag_prompt: str):
+    """
+    Склеиваем сообщения для Chat Completions:
+    - system: стиль + инструкции + RAG-контекст
+    - затем короткая история диалога (user/assistant)
+    - и текущий вопрос пользователя
+    """
+    msgs = []
+    msgs.append({"role": "system", "content": rag_prompt})
+    # добавляем историю (без system), только последние реплики
+    for m in (history or [])[-12:]:
+        role = m.get("role")
+        if role in ("user","assistant"):
+            msgs.append({"role": role, "content": m.get("content") or ""})
+    msgs.append({"role": "user", "content": user_q})
+    return msgs
+
 def _format_citations(chunks: List[dict]) -> str:
     # Берём короткое имя файла
     def short(p: str) -> str:
@@ -676,7 +715,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # ВАЖНО: история-осознанный запрос для ретривера
             k = int(getattr(settings, "max_kb_chunks", 6) or 6)
             search_q = _build_search_text(q, history)           # 👈 новое
-            chunks   = _retrieve_chunks_for_dialog(db, did, search_q, k=k)
+            chunks = _retrieve_chunks(db, did, search_q, k=k)
 
         # строгий RAG-промпт + сборка сообщений с историей
         rag_prompt, used_chunks, cite_list = _build_strict_prompt(q, chunks or [], dia_style)
