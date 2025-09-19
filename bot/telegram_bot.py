@@ -459,60 +459,81 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if recent_updates.seen(update.update_id):
         return
     m = update.effective_message or update.message
-    if not m: return
-    uid = update.effective_user.id
-    if not _is_allowed_user(uid):
+    if not m:
+        return
+
+    tg_id = update.effective_user.id
+    if not _is_allowed_user(tg_id):
         return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
-    if not _rate_check_and_tick(uid):
-        return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
+
     try:
-        voice = getattr(m,"voice",None) or getattr(m,"audio",None)
-        if not voice: return await m.reply_text("🎙️ Голосовое не найдено. Пришлите voice/aac/ogg файл.")
-        file = await context.bot.get_file(voice.file_id)
+        voice = getattr(m, "voice", None) or getattr(m, "audio", None)
+        if not voice:
+            return await m.reply_text("🎙️ Голосовое не найдено. Пришлите voice/aac/ogg файл.")
+
+        f = await context.bot.get_file(voice.file_id)
         import tempfile, os
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tf:
-            await file.download_to_drive(tf.name); path=tf.name
+            await f.download_to_drive(tf.name)
+            path = tf.name
+
         try:
-            from bot.openai_helper import transcribe_audio
             text = await transcribe_audio(path)
         finally:
-            try: os.remove(path)
-            except Exception: pass
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
         text = (text or "").strip()
-        if not text: return await m.reply_text("🤷 Не удалось распознать речь. Попробуйте ещё раз.")
+        if not text:
+            return await m.reply_text("🤷 Не удалось распознать речь. Попробуйте ещё раз.")
+
         with SessionLocal() as db:
-            did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
+            did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
-            try:
-                k = int(getattr(settings,"max_kb_chunks",6) or 6)
-            except Exception: k=6
-            try:
-                chunks = _retrieve_chunks(db, did, text, k=k)
-            except Exception:
-                log.exception("retrieve_chunks failed (voice)"); chunks=[]
-        ctx_blocks=[c.get("content","")[:1000] for c in (chunks or [])]
-        max_ctx = getattr(settings,"max_context_tokens",4000) or 4000
-        model_id = (dia_model or settings.openai_model or "").lower()
-        if "3.5" in model_id or "gpt-3" in model_id or "turbo" in model_id: max_ctx=min(max_ctx,3500)
-        elif "4o" in model_id or "o4" in model_id: max_ctx=min(max_ctx,128000)
-        ctx_blocks=_trim_ctx_by_tokens(ctx_blocks,max_ctx)
-        prompt=_build_prompt_with_style(ctx_blocks,text,dia_style) if ctx_blocks else text
-        msgs=[{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}]
-        temperature=float(getattr(settings,"temperature",0.2) or 0.2)
-        answer=await retry_async(lambda:_chat_full(dia_model,msgs,temperature=temperature),tries=3)
-        answer=answer or "—"
+
+            history = _load_recent_messages(
+                db, did,
+                int(os.getenv("HISTORY_MAX_MESSAGES", "12")),
+                int(os.getenv("HISTORY_MAX_TOKENS", "2000")),
+            )
+
+            k = int(getattr(settings, "max_kb_chunks", 6) or 6)
+            search_q = _build_search_text(text, history)        # 👈 новое
+            chunks   = _retrieve_chunks_for_dialog(db, did, search_q, k=k)
+
+        rag_prompt, used_chunks, cite_list = _build_strict_prompt(text, chunks or [], dia_style)
+        msgs = _compose_messages_with_history(dia_style, text, history, rag_prompt)
+        temperature = float(getattr(settings, "temperature", 0.2) or 0.2)
+
+        if os.getenv("STRICT_RAG", "1") == "1" and not used_chunks:
+            answer = "В подключённых документах не найдено."
+        else:
+            answer = await retry_async(lambda: _chat_full(dia_model, msgs, temperature=temperature), tries=3)
+            answer = answer or "—"
+            if used_chunks:
+                answer = answer.rstrip() + "\n\nИсточники:\n" + "\n".join(cite_list)
+
         try:
             with SessionLocal() as db:
                 _save_msg(db, did, "user", f"[voice] {text}")
                 _save_msg(db, did, "assistant", answer)
-                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did}); db.commit()
-        except Exception: log.exception("save messages failed (voice)")
+                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
+                db.commit()
+        except Exception:
+            import logging as log
+            log.exception("save messages failed (voice)")
+
         await _send_long(m, answer)
+
     except Exception:
+        import logging as log
         log.exception("on_voice failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
+
 async def rag_selftest(update, context):
     from sqlalchemy import text as sa_text
     m = update.effective_message or update.message
@@ -610,48 +631,67 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if recent_updates.seen(update.update_id):
         return
     m = update.effective_message or update.message
-    if not m: return
+    if not m:
+        return
     q = (m.text or "").strip()
-    if not q: return
-    uid = update.effective_user.id
-    if not _is_allowed_user(uid):
+    if not q:
+        return
+
+    tg_id = update.effective_user.id
+    if not _is_allowed_user(tg_id):
         return await m.reply_text("⛔ Доступ ограничён. Обратитесь к администратору.")
-    if not _rate_check_and_tick(uid):
-        return await m.reply_text("⚠️ Слишком часто. Попробуйте чуть позже.")
+
     try:
         with SessionLocal() as db:
-            did = _get_active_dialog_id(db, uid) or _create_new_dialog_for_tg(db, uid)
+            # активный диалог + параметры
+            did = _get_active_dialog_id(db, tg_id) or _create_new_dialog_for_tg(db, tg_id)
             row = db.execute(sa_text("SELECT model, style FROM dialogs WHERE id=:d"), {"d": did}).first()
             dia_model = row[0] if row and row[0] else settings.openai_model
             dia_style = row[1] if row and row[1] else "pro"
-            try:
-                k = int(getattr(settings, "max_kb_chunks", 6) or 6)
-            except Exception: k = 6
-            try:
-                chunks = _retrieve_chunks(db, did, q, k=k)
-            except Exception:
-                log.exception("retrieve_chunks failed (text)"); chunks = []
-        ctx_blocks = [c.get("content","")[:1000] for c in (chunks or [])]
-        max_ctx = getattr(settings,"max_context_tokens",4000) or 4000
-        model_id = (dia_model or settings.openai_model or "").lower()
-        if "3.5" in model_id or "gpt-3" in model_id or "turbo" in model_id: max_ctx=min(max_ctx,3500)
-        elif "4o" in model_id or "o4" in model_id: max_ctx=min(max_ctx,128000)
-        ctx_blocks = _trim_ctx_by_tokens(ctx_blocks, max_ctx)
-        prompt = _build_prompt_with_style(ctx_blocks, q, dia_style) if ctx_blocks else q
-        msgs=[{"role":"system","content":"RAG assistant"},{"role":"user","content":prompt}]
-        temperature=float(getattr(settings,"temperature",0.2) or 0.2)
-        answer = await retry_async(lambda:_chat_full(dia_model,msgs,temperature=temperature),tries=3)
-        answer = answer or "—"
+
+            # история диалога для модели
+            history = _load_recent_messages(
+                db, did,
+                int(os.getenv("HISTORY_MAX_MESSAGES", "12")),
+                int(os.getenv("HISTORY_MAX_TOKENS", "2000")),
+            )
+
+            # ВАЖНО: история-осознанный запрос для ретривера
+            k = int(getattr(settings, "max_kb_chunks", 6) or 6)
+            search_q = _build_search_text(q, history)           # 👈 новое
+            chunks   = _retrieve_chunks_for_dialog(db, did, search_q, k=k)
+
+        # строгий RAG-промпт + сборка сообщений с историей
+        rag_prompt, used_chunks, cite_list = _build_strict_prompt(q, chunks or [], dia_style)
+        msgs = _compose_messages_with_history(dia_style, q, history, rag_prompt)
+        temperature = float(getattr(settings, "temperature", 0.2) or 0.2)
+
+        if os.getenv("STRICT_RAG", "1") == "1" and not used_chunks:
+            answer = "В подключённых документах не найдено."
+        else:
+            answer = await retry_async(lambda: _chat_full(dia_model, msgs, temperature=temperature), tries=3)
+            answer = answer or "—"
+            if used_chunks:
+                answer = answer.rstrip() + "\n\nИсточники:\n" + "\n".join(cite_list)
+
+        # сохранить историю диалога
         try:
             with SessionLocal() as db:
                 _save_msg(db, did, "user", q)
                 _save_msg(db, did, "assistant", answer)
-                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did}); db.commit()
-        except Exception: log.exception("save messages failed (text)")
+                db.execute(sa_text("UPDATE dialogs SET last_message_at=now() WHERE id=:d"), {"d": did})
+                db.commit()
+        except Exception:
+            import logging as log
+            log.exception("save messages failed (text)")
+
         await _send_long(m, answer)
+
     except Exception:
+        import logging as log
         log.exception("on_text failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
+
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
