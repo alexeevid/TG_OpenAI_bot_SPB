@@ -55,8 +55,6 @@ from bot.settings import load_settings
 from bot.db.session import SessionLocal  # engine импортируем внутри apply_migrations_if_needed
 import logging
 # сразу после imports, на верхушке модуля:
-if '_load_recent_messages' not in globals():
-    def _load_recent_messages(*args, **kwargs): return []
 # унифицируем логгер
 try:
     log
@@ -68,6 +66,94 @@ log = logging.getLogger(__name__)
 settings = load_settings()
 _oa_client = OpenAI(api_key=settings.openai_api_key)
 
+
+# =====================[ История диалога: загрузка и тримминг ]=====================
+# Полноценная реализация _load_recent_messages с триммингом по токенам.
+from typing import List, Dict, Any
+import logging
+try:
+    from sqlalchemy import text as sa_text  # безопасный импорт
+except Exception:
+    sa_text = None  # type: ignore
+
+def _tok_len(text: str) -> int:
+    """Подсчёт токенов через tiktoken; при ошибке — грубая оценка."""
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text or ""))
+    except Exception:
+        s = text or ""
+        return max(1, len(s) // 4)  # ~4 символа на токен
+
+def _trim_history_by_tokens(history: List[Dict[str, str]], max_tokens: int) -> List[Dict[str, str]]:
+    """Обрезаем историю с конца (свежие сообщения приоритетнее), укладываясь в лимит токенов."""
+    if max_tokens <= 0 or not history:
+        return []
+    total = 0
+    kept_rev: List[Dict[str, str]] = []
+    for msg in reversed(history):
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        t = _tok_len(content)
+        if total + t > max_tokens:
+            break
+        kept_rev.append({"role": msg.get("role") or "user", "content": content})
+        total += t
+    return list(reversed(kept_rev))
+
+def _load_recent_messages(db, dialog_id: Any, max_messages: int = 12, max_tokens: int = 2000) -> List[Dict[str, str]]:
+    """
+    Возвращает последние сообщения диалога в формате [{role, content}], с ограничением по количеству и по токенам.
+    На любых ошибках БД/схемы возвращает пустой список, чтобы бот продолжал отвечать.
+    """
+    history: List[Dict[str, str]] = []
+    try:
+        if sa_text is not None:
+            rows = db.execute(
+                sa_text("""
+                    SELECT role, content
+                    FROM messages
+                    WHERE dialog_id = :d
+                    ORDER BY created_at DESC
+                    LIMIT :n
+                """),
+                {"d": dialog_id, "n": int(max(1, max_messages))}
+            ).mappings().all()
+            history = [{"role": (r.get("role") or "user"), "content": (r.get("content") or "")} for r in reversed(rows)]
+        else:
+            # Fallback: пробуем ORM, если доступно
+            try:
+                from bot.db.models import Message  # type: ignore
+            except Exception:
+                try:
+                    from db.models import Message  # type: ignore
+                except Exception:
+                    Message = None  # type: ignore
+            if Message is not None:
+                q = (
+                    db.query(Message)
+                    .filter(Message.dialog_id == dialog_id)
+                    .order_by(Message.created_at.desc())
+                    .limit(max_messages)
+                )
+                rows = list(q.all())
+                history = [{"role": getattr(r, "role", "user"), "content": getattr(r, "content", "")} for r in reversed(rows)]
+            else:
+                history = []
+    except Exception:
+        logging.getLogger(__name__).warning("_load_recent_messages: fallback to empty history", exc_info=True)
+        history = []
+
+    # Тримминг по токенам или кастомный триммер проекта
+    try:
+        if "_trim_ctx_by_tokens" in globals() and callable(globals()["_trim_ctx_by_tokens"]):  # type: ignore
+            return globals()["_trim_ctx_by_tokens"](history, int(max_tokens or 0))  # type: ignore
+        return _trim_history_by_tokens(history, int(max_tokens or 0))
+    except Exception:
+        logging.getLogger(__name__).warning("History trimming failed, returning raw history", exc_info=True)
+        return history
+# ====================[ /История диалога: загрузка и тримминг ]====================
 # rate limit (простое «ведерко» на пользователя)
 _RATE_WINDOW_SEC = 60
 _rate_buckets: dict[int, deque] = {}
