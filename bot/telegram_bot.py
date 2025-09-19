@@ -54,6 +54,9 @@ from sqlalchemy import text as sa_text
 from bot.settings import load_settings
 from bot.db.session import SessionLocal  # engine импортируем внутри apply_migrations_if_needed
 import logging
+# сразу после imports, на верхушке модуля:
+if '_load_recent_messages' not in globals():
+    def _load_recent_messages(*args, **kwargs): return []
 # унифицируем логгер
 try:
     log
