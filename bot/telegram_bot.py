@@ -67,6 +67,22 @@ settings = load_settings()
 _oa_client = OpenAI(api_key=settings.openai_api_key)
 
 
+
+
+import logging
+logger = logging.getLogger(__name__)
+
+async def _send_safe(msg, text: str, **kwargs):
+    text = (text or "").strip()
+    logger.info("send_reply.try", extra={"len": len(text)})
+    try:
+        if not text:
+            text = "🟡 Не нашёл релевантных материалов. Отвечаю общим образом."
+        r = await msg.reply_text(text, **kwargs)
+        logger.info("send_reply.ok", extra={"len": len(text)})
+        return r
+    except Exception:
+        logger.exception("send_reply.fail")
 # =====================[ История диалога: загрузка и тримминг ]=====================
 # Полноценная реализация _load_recent_messages с триммингом по токенам.
 from typing import List, Dict, Any
@@ -562,6 +578,7 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sent = False
     if recent_updates.seen(update.update_id):
         return
     m = update.effective_message or update.message
@@ -639,6 +656,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         import logging as log
         log.exception("on_voice failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
+
+    if not sent:
+        await _send_safe(update.message, "⚠️ Не удалось сформировать ответ (пустой результат). Подключите документы к диалогу или переформулируйте запрос.")
 
 async def rag_selftest(update, context):
     from sqlalchemy import text as sa_text
@@ -773,6 +793,7 @@ def _format_citations(chunks: List[dict]) -> str:
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sent = False
     if recent_updates.seen(update.update_id):
         return
     m = update.effective_message or update.message
@@ -836,6 +857,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         import logging as log
         log.exception("on_text failed")
         await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
+
+    if not sent:
+        await _send_safe(update.message, "⚠️ Не удалось сформировать ответ (пустой результат). Подключите документы к диалогу или переформулируйте запрос.")
 
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -2771,7 +2795,7 @@ def build_app() -> Application:
     if callable(globals().get("text_router")):
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, globals()["text_router"]), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=1)
-    app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    app.add_handler(MessageHandler((filters.VOICE | filters.AUDIO), on_voice))
 
     # === Unknown command fallback (registered last)
     known_commands = set()
