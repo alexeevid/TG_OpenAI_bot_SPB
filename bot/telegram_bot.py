@@ -252,6 +252,23 @@ def _rate_check_and_tick(tg_id: int) -> bool:
     dq.append(now)
     return True
 
+def _build_search_text(user_query: str, history: list[dict], max_len: int = 400) -> str:
+    """
+    Формируем историю-осознанный запрос для ретривера.
+    Берём последние содержательные пользовательские реплики, чтобы раскрыть анафору
+    («эта методика», «продолжи» и т.п.), и добавляем текущий вопрос.
+    """
+    pieces: list[str] = []
+    # последние 4 реплики пользователя (с конца), не короче 10 символов
+    for m in reversed(history):
+        if m.get("role") == "user":
+            txt = (m.get("content") or "").strip()
+            if len(txt) >= 10:
+                pieces.append(txt)
+            if len(" ".join(pieces)) >= max_len:
+                break
+    pieces.append(user_query.strip())
+    return " ".join(pieces)[-max_len:]
 
 def _trim_ctx_by_tokens(ctx_blocks: list[str], max_tokens: int) -> list[str]:
     """Аккуратно урезает суммарный контекст (по токенам tiktoken)."""
