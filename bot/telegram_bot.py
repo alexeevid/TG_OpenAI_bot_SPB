@@ -607,8 +607,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _t_lo.startswith("нарисуй "):
             from bot.openai_helper import generate_image_bytes
             content, final_prompt = await generate_image_bytes(text[7:].strip())
-            await m.reply_photo(photo=content, caption=f"🖼️ Сгенерировано DALL·E 3
-Prompt → {final_prompt}")
+            await m.reply_photo(photo=content, caption=f"🖼️ Сгенерировано DALL·E 3\\nPrompt → {final_prompt}")
             return
         if _t_lo.startswith("веб поиск "):
             note = await m.reply_text("🔎 Ищу в вебе, подожди пару секунд…")
