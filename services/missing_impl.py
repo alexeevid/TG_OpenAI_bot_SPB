@@ -1,13 +1,12 @@
 
 """
-services/missing_impl.py
-(see v2) — same as in v1 with minor tweaks
+services/missing_impl.py (v4)
+Provides LLM helpers if missing. Keeps v3 behavior.
 """
 from __future__ import annotations
 import asyncio, logging, builtins, hashlib, math
 from typing import List, Any
 
-# Try both names, depending on project layout
 _openai_helper = None
 for _mod in ("bot.openai_helper", "openai_helper"):
     try:
@@ -52,7 +51,6 @@ async def embed_query(text: str) -> List[float]:
                 return embs[0] if embs else []
         except Exception as e:
             logger.exception("embed_query via openai_helper.embed failed: %s", e)
-    # Fallback pseudo-embedding (keeps bot running, not semantic)
     h = hashlib.sha256(text.encode("utf-8")).digest()
     vec = [((h[i] / 255.0) - 0.5) for i in range(64)]
     norm = math.sqrt(sum(v*v for v in vec)) or 1.0
@@ -66,7 +64,7 @@ def _build_prompt(user_q: str, chunks: list[Any]) -> str:
         if not t:
             continue
         key = (t[:80], len(t))
-        if key in seen: 
+        if key in seen:
             continue
         seen.add(key)
         texts.append(t)
@@ -99,10 +97,9 @@ async def _llm_answer_with_rag(prompt: str) -> str:
             logger.exception("_llm_answer_with_rag failed: %s", e)
     return "Извини, не удалось получить ответ от модели."
 
-# export into builtins so existing code finds them
 builtins.embed_query = embed_query
 builtins._build_prompt = _build_prompt
 builtins._llm_answer_no_rag = _llm_answer_no_rag
 builtins._llm_answer_with_rag = _llm_answer_with_rag
 
-logger.info("Hotfix v2 registered: embed_query/_build_prompt/_llm_answer_*")
+logger.info("Hotfix v4 registered: embed_query/_build_prompt/_llm_answer_*")
