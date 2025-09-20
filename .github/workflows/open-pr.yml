@@ -1,0 +1,108 @@
+name: Open PR (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      change_type:
+        description: 'Type of change: single or zip'
+        required: true
+        default: 'single'
+      file_path:
+        description: 'Path to file (for change_type=single)'
+        required: false
+        default: 'README.md'
+      file_content:
+        description: 'New file content (paste here, multiline OK)'
+        required: false
+      zip_url:
+        description: 'Public URL to a ZIP (unpacked into repo root) for change_type=zip'
+        required: false
+      pr_title:
+        description: 'PR title'
+        required: false
+        default: 'Automated update'
+      pr_body:
+        description: 'PR body'
+        required: false
+        default: 'Proposed changes from assistant workflow'
+      commit_message:
+        description: 'Commit message'
+        required: false
+        default: 'chore: automated update'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A) Одним файлом (контент берём через env → без heredoc)
+      - name: Apply changes (single file)
+        if: ${{ github.event.inputs.change_type == 'single' }}
+        shell: bash
+        env:
+          FILE_PATH: ${{ github.event.inputs.file_path }}
+          FILE_CONTENT: ${{ github.event.inputs.file_content }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FILE_PATH:-}" ]; then
+            echo "::error::file_path is empty"; exit 1
+          fi
+          mkdir -p "$(dirname "$FILE_PATH")"
+          # сохраняем МНОГОСТРОЧНЫЙ контент как есть
+          printf "%s" "$FILE_CONTENT" > "$FILE_PATH"
+          echo "Wrote $FILE_PATH"
+          echo "Changed files:"
+          git status --porcelain || true
+
+      # Б) ZIP в корень репозитория
+      - name: Apply changes from ZIP
+        if: ${{ github.event.inputs.change_type == 'zip' }}
+        shell: bash
+        env:
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ZIP_URL:-}" ]; then
+            echo "::error::zip_url is empty"; exit 1
+          fi
+          echo "Downloading $ZIP_URL"
+          curl -fsSL "$ZIP_URL" -o /tmp/patch.zip
+          unzip -o /tmp/patch.zip -d .
+          echo "Unzipped:" && ls -la
+
+      # Есть ли изменения?
+      - name: Detect changes
+        id: diff
+        shell: bash
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            echo "No changes detected."
+          else
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+            echo "Changes detected."
+            git status
+          fi
+
+      # Создать PR (если есть изменения)
+      - name: Create Pull Request
+        if: ${{ steps.diff.outputs.changed == '1' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}   # встроенного токена достаточно
+          commit-message: ${{ github.event.inputs.commit_message }}
+          title: ${{ github.event.inputs.pr_title }}
+          body: ${{ github.event.inputs.pr_body }}
+          branch: bot-pr/${{ github.run_id }}-${{ github.run_number }}
+          delete-branch: true
+          author: assistant-bot <assistant-bot@users.noreply.github.com>
+          committer: assistant-bot <assistant-bot@users.noreply.github.com>
+
+      - name: No changes summary
+        if: ${{ steps.diff.outputs.changed == '0' }}
+        run: echo "No changes detected. Nothing to commit." >> "$GITHUB_STEP_SUMMARY"
