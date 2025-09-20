@@ -650,14 +650,17 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             import logging as log
             log.exception("save messages failed (voice)")
 
+        sent = True
+
+
         await _send_long(m, answer)
 
     except Exception:
         import logging as log
         log.exception("on_voice failed")
-        await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-
-    if not sent:
+        await _send_safe(m, \"⚠️ Что-то пошло не так. Попробуйте ещё раз.\")
+        sent = True
+if not sent:
         await _send_safe(update.message, "⚠️ Не удалось сформировать ответ (пустой результат). Подключите документы к диалогу или переформулируйте запрос.")
 
 async def rag_selftest(update, context):
@@ -851,14 +854,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             import logging as log
             log.exception("save messages failed (text)")
 
+        sent = True
+
+
         await _send_long(m, answer)
 
     except Exception:
         import logging as log
         log.exception("on_text failed")
-        await m.reply_text("⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-
-    if not sent:
+        await _send_safe(m, \"⚠️ Что-то пошло не так. Попробуйте ещё раз.\")
+        sent = True
+if not sent:
         await _send_safe(update.message, "⚠️ Не удалось сформировать ответ (пустой результат). Подключите документы к диалогу или переформулируйте запрос.")
 
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
