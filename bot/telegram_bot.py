@@ -9,7 +9,7 @@ from bot.legacy.telegram_legacy import (
 )
 
 def build_app():
-    app_ = Application.builder().token(settings.bot_token).build()
+    app_ = Application.builder().token(settings.telegram_bot_token).build()
 
     # Handlers
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=1)
