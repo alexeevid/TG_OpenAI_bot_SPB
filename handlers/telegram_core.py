@@ -577,47 +577,75 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Я могу ответить своими знаниями или попробовать найти в БЗ через /kb."
     )
 
+from telegram import Update
+from telegram.ext import ContextTypes
+
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
+    db = None
+    ogg_path = None
     try:
-        # Получение и расшифровка аудио
+        # ---- 1) Получаем файл от Telegram ----
+        if not m or (not m.voice and not m.audio):
+            await _send_safe(m, "Это не голосовое сообщение. Пришлите голос.")
+            return
+
         file_id = m.voice.file_id if m.voice else m.audio.file_id
-        ogg_path = await _download_voice(context.bot, file_id)
-        text = await transcribe_audio(ogg_path)
+        ogg_path = await _download_voice(context.bot, file_id)  # скачиваем во временный .ogg
+
+        # ---- 2) Распознаём речь ----
+        text = await transcribe_audio(ogg_path)     # твоя обёртка OpenAI
         if not text:
             await _send_safe(m, "Не удалось распознать голосовое сообщение.")
             return
 
-        # Подготовка
+        # ---- 3) Инициализация БД/диалога ----
         db = SessionLocal()
         uid = _ensure_user(db, m.from_user.id)
         did = _ensure_dialog(db, uid)
-        k = settings.kb_top_k
+
+        # ---- 4) Подготовка запроса к БЗ ----
+        k = int(getattr(settings, "kb_top_k", 5))
         search_q = _normalize_query_for_kb(text)
 
-        # Получаем эмбеддинг
+        # эмбеддинг запроса (как и раньше в твоём коде)
         global embedding_vec
         embedding_vec = await embed_query(search_q)
 
-        # ✅ Без активного диалога — ответ без RAG
+        # ---- 5) Если нет активного диалога — отвечаем без RAG ----
         if not did:
             answer = await _llm_answer_no_rag(text)
             await _send_safe(m, answer)
             return
 
-        # ✅ Есть диалог — ищем в БЗ
+        # ---- 6) RAG: получаем чанки из БЗ ----
         chunks = _retrieve_chunks(db, did, search_q, k=k)
 
-        # Генерация ответа с RAG
+        # ---- 7) Формирование промпта и ответ модели ----
         prompt = _build_prompt(text, chunks)
         final_answer = await _llm_answer_with_rag(prompt)
 
+        # ---- 8) Отправка ответа ----
         await _send_long(m, final_answer)
 
-    except Exception as e:
+    except Exception:
         log.exception("on_voice failed")
         await _send_safe(m, "⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-        return
+        return  # <— гарантируем один ответ
+    finally:
+        # Убираем временный файл и закрываем БД
+        try:
+            if ogg_path:
+                import os
+                if os.path.exists(ogg_path):
+                    os.remove(ogg_path)
+        except Exception:
+            pass
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
 
 async def rag_selftest(update, context):
     from sqlalchemy import text as sa_text
@@ -664,8 +692,6 @@ def _retrieve_chunks(db, did, search_q, k=5):
     # ✅ GUARD: без диалога не ищем в БЗ
     if not did:
         return []
-
-    # Аккуратно нормализуем тип диалога
     if isinstance(did, str):
         try:
             did = int(did)
@@ -785,43 +811,57 @@ def _format_citations(chunks: List[dict]) -> str:
         return ""
     return "\n\nИсточники: " + "; ".join(f"[{i+1}] {n}" for i, n in enumerate(uniq[:5]))
 
+from telegram import Update
+from telegram.ext import ContextTypes
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
+    db = None
     try:
-        q = (m.text or "").strip()
+        # ---- 1) Валидация входа ----
+        q = (m.text or "").strip() if m else ""
         if not q:
             return
 
-        # Подготовка
+        # ---- 2) Инициализация БД/диалога ----
         db = SessionLocal()
-        uid = _ensure_user(db, m.from_user.id)
-        did = _ensure_dialog(db, uid)  # или твой способ выбора активного диалога
-        k = settings.kb_top_k
-        search_q = _normalize_query_for_kb(q)
+        uid = _ensure_user(db, m.from_user.id)      # твоя функция
+        did = _ensure_dialog(db, uid)               # активный диалог (или None, если у тебя так)
 
-        # Получаем эмбеддинг
+        # ---- 3) Подготовка запроса к БЗ ----
+        k = int(getattr(settings, "kb_top_k", 5))
+        search_q = _normalize_query_for_kb(q)       # твоя функция нормализации
+
+        # эмбеддинг запроса (как и раньше в твоём коде)
         global embedding_vec
-        embedding_vec = await embed_query(search_q)
+        embedding_vec = await embed_query(search_q) # твоя функция эмбеддинга
 
-        # ✅ Без активного диалога — даём чистый ответ без RAG
+        # ---- 4) Если нет активного диалога — отвечаем без RAG ----
         if not did:
-            answer = await _llm_answer_no_rag(q)
+            answer = await _llm_answer_no_rag(q)    # твоя функция "чистого" ответа модели
             await _send_safe(m, answer)
             return
 
-        # ✅ Есть диалог — ищем в БЗ
+        # ---- 5) RAG: получаем чанки из БЗ ----
         chunks = _retrieve_chunks(db, did, search_q, k=k)
 
-        # Генерация ответа с RAG
-        prompt = _build_prompt(q, chunks)
-        final_answer = await _llm_answer_with_rag(prompt)
+        # ---- 6) Формирование промпта и ответ модели ----
+        prompt = _build_prompt(q, chunks)           # твоя функция сборки промпта
+        final_answer = await _llm_answer_with_rag(prompt)  # твой вызов LLM с RAG
 
-        await _send_long(m, final_answer)
+        # ---- 7) Отправка ответа ----
+        await _send_long(m, final_answer)           # твоя функция для длинных сообщений
 
-    except Exception as e:
+    except Exception:
         log.exception("on_text failed")
         await _send_safe(m, "⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-        return
+        return  # <— гарантируем один ответ
+    finally:
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
 
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
@@ -2834,3 +2874,45 @@ async def img(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("img failed")
         await m.reply_text("⚠ Ошибка генерации изображения.")
+
+# =====================[ Utility functions ]=====================
+
+def _normalize_query_for_kb(text: str) -> str:
+    """
+    Минимальная нормализация текста для поиска по базе знаний.
+    - обрезает пробелы
+    - приводит к нижнему регистру
+    """
+    return (text or "").strip().lower()
+
+
+async def _download_voice(bot, file_id: str) -> str:
+    """
+    Скачивает голосовое сообщение (или аудио) во временный файл .ogg
+    и возвращает путь к нему.
+    """
+    import tempfile, os
+    file = await bot.get_file(file_id)
+    fd, path = tempfile.mkstemp(suffix=".ogg")
+    os.close(fd)
+    await file.download_to_drive(path)
+    return path
+
+
+async def transcribe_audio(file_path: str) -> str:
+    """
+    Простейшая обёртка для распознавания речи через OpenAI API.
+    Ожидает, что settings.openai_api_key задан в окружении.
+    """
+    from openai import OpenAI
+    client = OpenAI(api_key=settings.openai_api_key)
+    try:
+        with open(file_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=f
+            )
+        return result.text.strip() if result and hasattr(result, "text") else ""
+    except Exception:
+        log.exception("Ошибка при расшифровке аудио")
+        return ""
