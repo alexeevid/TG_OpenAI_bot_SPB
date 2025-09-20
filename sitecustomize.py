@@ -1,16 +1,14 @@
 
 """
-sitecustomize.py
-
-Python imports this module automatically on startup (unless run with -S).
-We use it to load our hotfix that provides missing functions required by handlers/telegram_core.py.
-This avoids editing your existing files.
+sitecustomize.py (v2)
+Loads hotfix modules that (1) provide missing LLM/embedding functions and
+(2) auto-register core command handlers for PTB if they were not wired.
 """
-import importlib
-try:
-    importlib.import_module("services.missing_impl")
-except Exception as e:
-    # Keep process running; just print a warning so the bot still starts even if this fails.
-    import sys, traceback
-    print("[sitecustomize] Failed to import services.missing_impl:", e, file=sys.stderr)
-    traceback.print_exc()
+import importlib, sys, traceback
+
+for mod in ("services.missing_impl", "services.patch_ptb_commands"):
+    try:
+        importlib.import_module(mod)
+    except Exception as e:
+        print(f"[sitecustomize] Failed to import {mod}: {e}", file=sys.stderr)
+        traceback.print_exc()
