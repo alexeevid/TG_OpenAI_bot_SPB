@@ -580,31 +580,44 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
     try:
-        # ... твоя логика скачивания/распознавания аудио ...
-        # text = распознанный текст
+        # Получение и расшифровка аудио
+        file_id = m.voice.file_id if m.voice else m.audio.file_id
+        ogg_path = await _download_voice(context.bot, file_id)
+        text = await transcribe_audio(ogg_path)
         if not text:
             await _send_safe(m, "Не удалось распознать голосовое сообщение.")
             return
 
-        # ... твоя логика загрузки БД/диалога/параметров ...
-        # Пример: db = SessionLocal(); did = current_dialog_id; search_q = text; k = settings.kb_top_k
+        # Подготовка
+        db = SessionLocal()
+        uid = _ensure_user(db, m.from_user.id)
+        did = _ensure_dialog(db, uid)
+        k = settings.kb_top_k
+        search_q = _normalize_query_for_kb(text)
 
-        # ✅ Без активного диалога — не делаем RAG
+        # Получаем эмбеддинг
+        global embedding_vec
+        embedding_vec = await embed_query(search_q)
+
+        # ✅ Без активного диалога — ответ без RAG
         if not did:
-            answer = await _llm_answer_no_rag(text)  # оставь свою реализацию
+            answer = await _llm_answer_no_rag(text)
             await _send_safe(m, answer)
             return
 
-        # ✅ RAG только при наличии did
+        # ✅ Есть диалог — ищем в БЗ
         chunks = _retrieve_chunks(db, did, search_q, k=k)
 
-        # ... остальная твоя логика ответа ...
-        # await _send_long(m, final_answer)
+        # Генерация ответа с RAG
+        prompt = _build_prompt(text, chunks)
+        final_answer = await _llm_answer_with_rag(prompt)
+
+        await _send_long(m, final_answer)
 
     except Exception as e:
         log.exception("on_voice failed")
         await _send_safe(m, "⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-        return  # ✅ чтобы не было второго ответа
+        return
 
 async def rag_selftest(update, context):
     from sqlalchemy import text as sa_text
@@ -632,27 +645,48 @@ def _embed_query(text: str) -> List[float]:
     client = OpenAI(api_key=settings.openai_api_key)
     return client.embeddings.create(model=settings.embedding_model, input=[text]).data[0].embedding
 
+from sqlalchemy.sql import text as sa_text
+
 def _retrieve_chunks(db, did, search_q, k=5):
     """
-    Возвращает топ-k чанков из БЗ для текущего диалога.
-    Ожидается, что embedding_vec для search_q уже рассчитан выше по коду
-    (как и было в твоём файле). Здесь мы только выполняем SQL-запрос.
+    Возвращает top-k чанков из Базы знаний для указанного диалога.
+
+    ОЖИДАНИЕ:
+      - Переменная `embedding_vec` уже посчитана выше по коду из `search_q`
+        (ровно как у тебя было ранее), и доступна тут как внешняя переменная.
+      - Таблицы: kb_chunks (embedding vector), kb_documents (is_active), dialog_kb_links.
+
+    ПОВЕДЕНИЕ:
+      - Если нет активного диалога (did пустой) — возвращаем пустой список (не лезем в SQL).
+      - Если did строковый — аккуратно приводим к int, при ошибке — пустой список.
     """
 
-    # ✅ GUARD: нет активного диалога — не лезем в БЗ
+    # ✅ GUARD: без диалога не ищем в БЗ
     if not did:
         return []
 
-    # На всякий случай нормализуем тип
+    # Аккуратно нормализуем тип диалога
     if isinstance(did, str):
         try:
             did = int(did)
         except Exception:
             return []
 
-    # --- дальше твой исходный код запроса ---
+    # Ещё один защитный шаг: k должен быть положительным int
+    try:
+        k = int(k)
+        if k <= 0:
+            k = 5
+    except Exception:
+        k = 5
+
+    # --- SQL запрос с использованием pgvector (<=>) ---
     sql = """
-        SELECT c.content, c.meta, d.path, (1 - (c.embedding <=> CAST(:q AS vector))) AS cos_sim
+        SELECT
+            c.content,
+            c.meta,
+            d.path,
+            (1 - (c.embedding <=> CAST(:q AS vector))) AS cos_sim
         FROM kb_chunks c
         JOIN kb_documents d    ON d.id = c.document_id AND d.is_active = TRUE
         JOIN dialog_kb_links l ON l.document_id = c.document_id
@@ -660,19 +694,22 @@ def _retrieve_chunks(db, did, search_q, k=5):
         ORDER BY c.embedding <=> CAST(:q AS vector)
         LIMIT :k
     """
-    params = {"q": embedding_vec, "did": did, "k": k}  # embedding_vec уже существует в твоём коде выше
+
+    # Важно: embedding_vec должен быть доступен в области видимости (как у тебя раньше)
+    params = {"q": embedding_vec, "did": did, "k": k}
+
     rows = db.execute(sa_text(sql), params).mappings().all()
 
+    # Приводим к удобной структуре
     chunks = []
     for r in rows:
         chunks.append({
-            "content": r["content"],
+            "content": r.get("content"),
             "meta": r.get("meta"),
             "path": r.get("path"),
             "cos_sim": r.get("cos_sim"),
         })
     return chunks
-
 
 _STYLE_EXAMPLES = {
     "pro":    "Кратко, по шагам, чек-лист. Без воды. Пример: «Шаги 1–5, риски, KPI, дедлайны».",
@@ -755,31 +792,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not q:
             return
 
-        # ... твоя логика загрузки БД/диалога/параметров ...
-        # Пример: db = SessionLocal(); did = current_dialog_id; search_q = q; k = settings.kb_top_k
+        # Подготовка
+        db = SessionLocal()
+        uid = _ensure_user(db, m.from_user.id)
+        did = _ensure_dialog(db, uid)  # или твой способ выбора активного диалога
+        k = settings.kb_top_k
+        search_q = _normalize_query_for_kb(q)
 
-        # ✅ Без активного диалога — либо отвечаем без БЗ, либо подсказка создать диалог
+        # Получаем эмбеддинг
+        global embedding_vec
+        embedding_vec = await embed_query(search_q)
+
+        # ✅ Без активного диалога — даём чистый ответ без RAG
         if not did:
-            # Вариант A: ответ без RAG (если у тебя есть функция простого ответа модели)
-            answer = await _llm_answer_no_rag(q)  # оставь свою реализацию
+            answer = await _llm_answer_no_rag(q)
             await _send_safe(m, answer)
             return
 
-            # Вариант B (если хочешь вместо этого): подсказка и выход
-            # await _send_safe(m, "Создайте диалог: /dialogs → «➕ Новый диалог»")
-            # return
-
-        # ✅ RAG только при наличии did
+        # ✅ Есть диалог — ищем в БЗ
         chunks = _retrieve_chunks(db, did, search_q, k=k)
 
-        # ... остальная твоя логика формирования промпта/вызова LLM/ответа ...
-        # await _send_long(m, final_answer)
+        # Генерация ответа с RAG
+        prompt = _build_prompt(q, chunks)
+        final_answer = await _llm_answer_with_rag(prompt)
+
+        await _send_long(m, final_answer)
 
     except Exception as e:
         log.exception("on_text failed")
         await _send_safe(m, "⚠️ Что-то пошло не так. Попробуйте ещё раз.")
-        return  # ✅ гарантируем ровно один ответ
-
+        return
 
 async def kb_pdf_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message or update.message
