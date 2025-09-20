@@ -1,7 +1,6 @@
 from alembic import op
 import sqlalchemy as sa
 
-# Alembic identifiers
 revision = '002_add_voice_fields'
 down_revision = '001_initial'
 branch_labels = None
