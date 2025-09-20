@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     yandex_root_path: str = Field(..., validation_alias=AliasChoices('YANDEX_ROOT_PATH'))
 
     openai_model: str = Field('gpt-4o-mini', validation_alias=AliasChoices('OPENAI_MODEL'))
+    temperature: float = Field(0.2, validation_alias=AliasChoices('OPENAI_TEMPERATURE','TEMPERATURE'))
     image_model: str = Field('dall-e-3', validation_alias=AliasChoices('OPENAI_IMAGE_MODEL', 'IMAGE_MODEL'))
     embedding_model: str = Field('text-embedding-3-large', validation_alias=AliasChoices('OPENAI_EMBEDDING_MODEL', 'EMBEDDING_MODEL'))
 
