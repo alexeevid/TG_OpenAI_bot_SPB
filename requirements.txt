@@ -1,0 +1,10 @@
+
+python-telegram-bot==20.7
+pydantic==2.8.2
+requests>=2.31.0
+SQLAlchemy>=2.0.23
+psycopg2-binary>=2.9.9
+pgvector==0.2.5
+tiktoken>=0.7.0
+openai>=1.40.0
+alembic>=1.13.2
