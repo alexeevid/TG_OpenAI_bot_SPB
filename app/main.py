@@ -9,8 +9,7 @@ def run():
     setup_logging()
     settings = load_settings()
 
-    # Регистрируем коллбеки корректно через builder,
-    # чтобы не трогать app.post_init / app.post_shutdown напрямую
+    # Вешаем коллбеки жизненного цикла через builder (исключает AttributeError: None.append)
     builder = (
         Application.builder()
         .token(settings.telegram_token)
