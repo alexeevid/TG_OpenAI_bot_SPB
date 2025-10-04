@@ -21,38 +21,89 @@ import logging
 log = logging.getLogger(__name__)
 
 # ⬇️ добавьте импорт
-from sqlalchemy import inspect, text  # убедитесь, что импорт есть наверху файла
+from sqlalchemy import inspect, text
 
 def _ensure_schema(engine):
     """
     Горячая автопочинка схемы в проде:
-    - users.tg_id (VARCHAR, уникальный индекс)
-    - users.role (VARCHAR, default 'user')
-    - users.created_at (TIMESTAMP, default NOW()) — на случай очень старой таблицы
+    users:    tg_id (unique), role (default 'user'), created_at (default NOW())
+    dialogs:  user_id, title (default ''), created_at (default NOW())
+    messages: dialog_id, role, content, created_at (default NOW())
+    + снятие NOT NULL c 'лишних' колонок без дефолта (на случай артефактов старых схем)
     """
     insp = inspect(engine)
 
+    def _apply(stmts):
+        if not stmts: return
+        with engine.begin() as conn:
+            for s in stmts:
+                conn.execute(text(s))
+
+    # ---- users ----
     if insp.has_table("users"):
         cols = {c["name"] for c in insp.get_columns("users")}
         stmts = []
-
         if "tg_id" not in cols:
             stmts.append("ALTER TABLE users ADD COLUMN tg_id VARCHAR")
-            # индекс как в модели
             stmts.append("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_tg_id ON users (tg_id)")
-
         if "role" not in cols:
             stmts.append("ALTER TABLE users ADD COLUMN role VARCHAR")
-            # заполним существующие нуллы или пустые значением 'user'
             stmts.append("UPDATE users SET role = 'user' WHERE role IS NULL")
-        # иногда в старой схеме нет created_at
         if "created_at" not in cols:
             stmts.append("ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT NOW()")
+        _apply(stmts)
 
-        if stmts:
-            with engine.begin() as conn:
-                for s in stmts:
-                    conn.execute(text(s))
+    # ---- dialogs ----
+    if insp.has_table("dialogs"):
+        cols = insp.get_columns("dialogs")
+        colnames = {c["name"] for c in cols}
+        stmts = []
+        if "user_id" not in colnames:
+            stmts.append("ALTER TABLE dialogs ADD COLUMN user_id INTEGER")
+        if "title" not in colnames:
+            stmts.append("ALTER TABLE dialogs ADD COLUMN title VARCHAR")
+            stmts.append("UPDATE dialogs SET title = '' WHERE title IS NULL")
+        if "created_at" not in colnames:
+            stmts.append("ALTER TABLE dialogs ADD COLUMN created_at TIMESTAMP DEFAULT NOW()")
+        _apply(stmts)
+
+        # Снимаем NOT NULL у неизвестных полей без дефолта
+        keep = {"id","user_id","title","created_at"}
+        with engine.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT column_name, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='dialogs'
+            """)).fetchall()
+            for name, is_nullable, default in rows:
+                if name not in keep and is_nullable == 'NO' and default is None:
+                    conn.execute(text(f'ALTER TABLE dialogs ALTER COLUMN "{name}" DROP NOT NULL'))
+
+    # ---- messages ----
+    if insp.has_table("messages"):
+        cols = insp.get_columns("messages")
+        colnames = {c["name"] for c in cols}
+        stmts = []
+        if "dialog_id" not in colnames:
+            stmts.append("ALTER TABLE messages ADD COLUMN dialog_id INTEGER")
+        if "role" not in colnames:
+            stmts.append("ALTER TABLE messages ADD COLUMN role VARCHAR")
+        if "content" not in colnames:
+            stmts.append("ALTER TABLE messages ADD COLUMN content TEXT")
+        if "created_at" not in colnames:
+            stmts.append("ALTER TABLE messages ADD COLUMN created_at TIMESTAMP DEFAULT NOW()")
+        _apply(stmts)
+
+        keep = {"id","dialog_id","role","content","created_at"}
+        with engine.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT column_name, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='messages'
+            """)).fetchall()
+            for name, is_nullable, default in rows:
+                if name not in keep and is_nullable == 'NO' and default is None:
+                    conn.execute(text(f'ALTER TABLE messages ALTER COLUMN "{name}" DROP NOT NULL'))
 
 def build(settings: Settings) -> dict:
     sf, engine = make_session_factory(settings.database_url)
