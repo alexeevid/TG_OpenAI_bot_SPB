@@ -16,6 +16,10 @@ from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
 from .db.models import Base
 
+from sqlalchemy import inspect, text
+import logging
+log = logging.getLogger(__name__)
+
 # ⬇️ добавьте импорт
 from sqlalchemy import inspect, text  # убедитесь, что импорт есть наверху файла
 
@@ -54,6 +58,18 @@ def build(settings: Settings) -> dict:
     sf, engine = make_session_factory(settings.database_url)
     # safety net: создаём таблицы, если их нет
     Base.metadata.create_all(bind=engine)
+    
+    def _dump_table_schema(engine, table):
+        insp = inspect(engine)
+        if not insp.has_table(table):
+            log.info("schema: table %s — нет", table)
+            return
+        cols = insp.get_columns(table)
+        log.info("schema: %s -> %s", table, [(c['name'], c.get('type'), c.get('nullable'), c.get('default')) for c in cols])
+    
+    _dump_table_schema(engine, "users")
+    _dump_table_schema(engine, "dialogs")
+    _dump_table_schema(engine, "messages")
 
     # ⬇️ ВАЖНО: автопроверка/починка схемы
     _ensure_schema(engine)
