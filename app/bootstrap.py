@@ -17,19 +17,38 @@ from .db.repo_kb import KBRepo
 from .db.models import Base
 
 # ⬇️ добавьте импорт
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text  # убедитесь, что импорт есть наверху файла
 
 def _ensure_schema(engine):
-    """Горячая автопочинка схемы: добавляем users.tg_id при отсутствии."""
+    """
+    Горячая автопочинка схемы в проде:
+    - users.tg_id (VARCHAR, уникальный индекс)
+    - users.role (VARCHAR, default 'user')
+    - users.created_at (TIMESTAMP, default NOW()) — на случай очень старой таблицы
+    """
     insp = inspect(engine)
+
     if insp.has_table("users"):
         cols = {c["name"] for c in insp.get_columns("users")}
+        stmts = []
+
         if "tg_id" not in cols:
-            # безопасно добавляем колонку и индекс
+            stmts.append("ALTER TABLE users ADD COLUMN tg_id VARCHAR")
+            # индекс как в модели
+            stmts.append("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_tg_id ON users (tg_id)")
+
+        if "role" not in cols:
+            stmts.append("ALTER TABLE users ADD COLUMN role VARCHAR")
+            # заполним существующие нуллы или пустые значением 'user'
+            stmts.append("UPDATE users SET role = 'user' WHERE role IS NULL")
+        # иногда в старой схеме нет created_at
+        if "created_at" not in cols:
+            stmts.append("ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT NOW()")
+
+        if stmts:
             with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE users ADD COLUMN tg_id VARCHAR"))
-                # уникальный индекс, если он вам нужен (в коде идёт поиск по tg_id)
-                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_tg_id ON users (tg_id)"))
+                for s in stmts:
+                    conn.execute(text(s))
 
 def build(settings: Settings) -> dict:
     sf, engine = make_session_factory(settings.database_url)
