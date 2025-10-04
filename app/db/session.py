@@ -8,7 +8,7 @@ def _normalize_db_url(url: str | None) -> str:
     if not url or not url.strip():
         return "sqlite+pysqlite:///:memory:"
     url = url.strip()
-    # Railway/Heroku часто отдают DSN вида "postgres://"
+    # Railway/Heroku часто выдают postgres:// — SQLAlchemy 2.x ждёт postgresql+psycopg2://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg2://", 1)
     elif url.startswith("postgresql://"):
