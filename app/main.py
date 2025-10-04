@@ -9,7 +9,6 @@ def run():
     setup_logging()
     settings = load_settings()
 
-    # Вешаем коллбеки жизненного цикла через builder (исключает AttributeError: None.append)
     builder = (
         Application.builder()
         .token(settings.telegram_token)
@@ -21,4 +20,10 @@ def run():
     app.bot_data.update(build(settings))
     register(app)
 
-    app.run_polling(close_loop=False, allowed_updates=None)
+    # Важно: drop_pending_updates=True — дополнительно чистим хвост,
+    # чтобы исключить конфликты и зависшие апдейты.
+    app.run_polling(
+        close_loop=False,
+        allowed_updates=None,
+        drop_pending_updates=True,
+    )
