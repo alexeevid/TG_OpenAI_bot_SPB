@@ -1,19 +1,28 @@
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from ..services.dialog_service import DialogService
 from ..db.models import Dialog, User
+
+def _fmt_err(e: Exception) -> str:
+    base = e.__class__.__name__
+    det = getattr(e, "orig", None)
+    if det:
+        return f"{base}: {det}"
+    return f"{base}: {e}"
 
 async def cmd_dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ds: DialogService = context.bot_data['svc_dialog']
     try:
         d = ds.get_or_create_active(update.effective_user.id)
         await update.message.reply_text(f"Создан новый диалог #{d.id}")
+    except IntegrityError as e:
+        await update.message.reply_text(f"⚠️ Ошибка БД при создании диалога — {_fmt_err(e)}")
     except SQLAlchemyError as e:
-        await update.message.reply_text(f"⚠️ Ошибка БД при создании диалога: {e.__class__.__name__}")
+        await update.message.reply_text(f"⚠️ Ошибка БД при создании диалога — {_fmt_err(e)}")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Не удалось создать диалог: {e}")
+        await update.message.reply_text(f"⚠️ Не удалось создать диалог — {e}")
 
 async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repo = context.bot_data['repo_dialogs']
@@ -35,9 +44,9 @@ async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "Последние диалоги:\n" + "\n".join([f"• #{d.id} — {d.title or 'без названия'}" for d in rows])
         await update.message.reply_text(text)
     except SQLAlchemyError as e:
-        await update.message.reply_text(f"⚠️ Ошибка БД при чтении диалогов: {e.__class__.__name__}")
+        await update.message.reply_text(f"⚠️ Ошибка БД при чтении диалогов — {_fmt_err(e)}")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Не удалось получить диалоги: {e}")
+        await update.message.reply_text(f"⚠️ Не удалось получить диалоги — {e}")
 
 def register(app: Application) -> None:
     app.add_handler(CommandHandler("dialog_new", cmd_dialog_new))
