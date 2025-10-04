@@ -7,7 +7,7 @@ from ..services.dialog_service import DialogService
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ds: DialogService = context.bot_data['svc_dialog']
     gen: GenService = context.bot_data['svc_gen']
-    d = ds.ensure_dialog(update.effective_user.id)
+    d = ds.get_or_create_active(update.effective_user.id)
     question = update.message.text
     ds.add_user_message(d.id, question)
     ans = await gen.chat(user_msg=question, dialog_id=d.id)
