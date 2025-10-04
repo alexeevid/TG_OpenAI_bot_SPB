@@ -51,7 +51,14 @@ def _ensure_schema(engine):
             stmts.append("UPDATE users SET role = 'user' WHERE role IS NULL")
         if "created_at" not in cols:
             stmts.append("ALTER TABLE users ADD COLUMN created_at TIMESTAMP DEFAULT NOW()")
-        _apply(stmts)
+        # ⬇️ новое — снимаем NOT NULL у старой колонки tg_user_id
+        if "tg_user_id" in cols:
+            with engine.begin() as conn:
+                conn.execute(text('ALTER TABLE users ALTER COLUMN "tg_user_id" DROP NOT NULL'))
+        if stmts:
+            with engine.begin() as conn:
+                for s in stmts:
+                    conn.execute(text(s))
 
     # ---- dialogs ----
     if insp.has_table("dialogs"):
