@@ -1,4 +1,3 @@
-
 from .settings import Settings
 from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
@@ -17,9 +16,28 @@ from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
 from .db.models import Base
 
+# ⬇️ добавьте импорт
+from sqlalchemy import inspect, text
+
+def _ensure_schema(engine):
+    """Горячая автопочинка схемы: добавляем users.tg_id при отсутствии."""
+    insp = inspect(engine)
+    if insp.has_table("users"):
+        cols = {c["name"] for c in insp.get_columns("users")}
+        if "tg_id" not in cols:
+            # безопасно добавляем колонку и индекс
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN tg_id VARCHAR"))
+                # уникальный индекс, если он вам нужен (в коде идёт поиск по tg_id)
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_tg_id ON users (tg_id)"))
+
 def build(settings: Settings) -> dict:
     sf, engine = make_session_factory(settings.database_url)
+    # safety net: создаём таблицы, если их нет
     Base.metadata.create_all(bind=engine)
+
+    # ⬇️ ВАЖНО: автопроверка/починка схемы
+    _ensure_schema(engine)
 
     repo_dialogs = DialogsRepo(sf)
     kb_repo = KBRepo(sf, dim=settings.pgvector_dim)
