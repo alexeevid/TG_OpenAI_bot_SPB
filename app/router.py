@@ -14,3 +14,4 @@ def register(app: Application) -> None:
     admin.register(app)
     voice.register(app)
     text.register(app)
+    errors.register(app)
