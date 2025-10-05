@@ -57,7 +57,7 @@ class OpenAIClient:
         """
         Альтернатива: принимаем открытый файл (rb).
         """
-        res = self._client.audio.transcriptions.create(
+        res = self.client.audio.transcriptions.create(
             model="whisper-1",
             file=fobj,
         )
