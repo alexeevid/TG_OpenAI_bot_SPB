@@ -5,14 +5,8 @@ log = logging.getLogger(__name__)
 
 class VoiceService:
     """
-    Универсальный сервис распознавания:
-    - Совместим с текущим bootstrap: __init__(openai_client, settings)
-    - Три безопасных слоя:
-        1) transcribe_path(path): открывает файл в 'rb' и вызывает клиент
-        2) transcribe(message): скачивает voice и проксирует в transcribe_path
-        3) Любые исключения -> лог + человекочитаемое сообщение
-    Ожидается, что openai_client имеет метод transcribe(file_or_path),
-    как в нашем OpenAIClient-обёртке.
+    Совместим с bootstrap: __init__(openai_client, settings)
+    Безопасно открывает аудио как bytes и передаёт клиенту.
     """
 
     def __init__(self, openai_client, settings=None):
@@ -26,24 +20,22 @@ class VoiceService:
                 log.error("VOICE: файл не найден: %s", p)
                 return "[ошибка: файл не найден]"
 
-            # Пытаемся сначала через бинарный поток (надёжно для Whisper)
             text = None
-            try:
-                # Если у клиента есть low-level метод, принимающий file-объект:
-                fn = getattr(self._openai, "transcribe_file", None)
-                if callable(fn):
+            # если у клиента есть метод, принимающий file-объект
+            fn_file = getattr(self._openai, "transcribe_file", None)
+            if callable(fn_file):
+                try:
                     with open(p, "rb") as f:
-                        text = fn(f)
-            except Exception as e:
-                log.exception("VOICE: transcribe_file(f) failed: %s", e)
+                        text = fn_file(f)
+                except Exception as e:
+                    log.exception("VOICE: transcribe_file(f) failed: %s", e)
 
-            # Фолбэк: если есть high-level метод, принимающий путь
+            # fallback — если есть метод, принимающий путь
             if not text:
-                fn2 = getattr(self._openai, "transcribe", None)
-                if callable(fn2):
-                    text = fn2(str(p))  # <-- передаём строковый путь, не Path
+                fn_path = getattr(self._openai, "transcribe", None)
+                if callable(fn_path):
+                    text = fn_path(str(p))  # передаём СТРОКОВЫЙ путь
 
-            # Защита от пустого результата
             text = (text or "").strip()
             if not text:
                 text = "[пустой результат распознавания]"
@@ -55,10 +47,9 @@ class VoiceService:
             return f"[ошибка распознавания: {e.__class__.__name__}]"
 
     async def transcribe(self, message) -> str:
-        """Совместимость со старым интерфейсом: принимает Telegram message."""
+        """Совместимость со старым интерфейсом: принимает Telegram message (voice)."""
         try:
             file = await message.voice.get_file()
-            # Сохраняем под стабильным именем (voice note присылается как OGG/WEBM)
             local_path = f"/tmp/{file.file_unique_id}.ogg"
             await file.download_to_drive(custom_path=local_path)
             return await self.transcribe_path(local_path)
