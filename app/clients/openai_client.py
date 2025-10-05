@@ -6,8 +6,21 @@ import io
 log = logging.getLogger(__name__)
 
 class OpenAIClient:
-    def __init__(self, api_key: str | None):
-        self.client = OpenAI(api_key=api_key) if api_key else None
+    def __init__(self, api_key: Optional[str] = None):
+        self.client = OpenAI(api_key=api_key)
+
+    # 1) Распознавание из bytes
+    def transcribe_bytes(self, audio_bytes: bytes, filename: str = "audio.ogg", model: str = "whisper-1") -> str:
+        bio = BytesIO(audio_bytes)
+        bio.name = filename
+        res = self.client.audio.transcriptions.create(model=model, file=bio)
+        return res.text.strip()
+
+    # 2) Распознавание из локального файла
+    def transcribe_path(self, path: str, model: str = "whisper-1") -> str:
+        with open(path, "rb") as f:
+            res = self.client.audio.transcriptions.create(model=model, file=f)
+        return res.text.strip()
 
     def is_enabled(self) -> bool:
         return self.client is not None
@@ -37,19 +50,6 @@ class OpenAIClient:
             return "https://via.placeholder.com/512?text=image+stub"
         out = self.client.images.generate(model=model, prompt=prompt)
         return out.data[0].url
-    def transcribe_bytes(self, raw: bytes, filename: str = "audio.ogg") -> str:
-        """
-        Надёжная передача Whisper'у: даём file-like объект на основе BytesIO.
-        """
-        bio = io.BytesIO(raw)
-        # openai sdk использует name для определения расширения; задаём имя
-        bio.name = filename
-        res = self._client.audio.transcriptions.create(
-            model="whisper-1",
-            file=bio,
-        )
-        text = (res.text or "").strip()
-        return text
 
     def transcribe_file(self, fobj) -> str:
         """
@@ -62,15 +62,3 @@ class OpenAIClient:
         text = (res.text or "").strip()
         return text
 
-    def transcribe_path(self, path: str) -> str:
-        """
-        На крайний случай: открываем путь сами и отправляем file-like.
-        (Не передаём путь строкой напрямую, чтобы избежать 'bytes-like required')
-        """
-        with open(path, "rb") as f:
-            res = self._client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-            )
-        text = (res.text or "").strip()
-        return text
