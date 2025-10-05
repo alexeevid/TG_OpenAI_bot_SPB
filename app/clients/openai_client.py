@@ -1,7 +1,9 @@
 
 from typing import List
+import logging
 from openai import OpenAI
 import io
+log = logging.getLogger(__name__)
 
 class OpenAIClient:
     def __init__(self, api_key: str | None):
@@ -35,3 +37,40 @@ class OpenAIClient:
             return "https://via.placeholder.com/512?text=image+stub"
         out = self.client.images.generate(model=model, prompt=prompt)
         return out.data[0].url
+    def transcribe_bytes(self, raw: bytes, filename: str = "audio.ogg") -> str:
+        """
+        Надёжная передача Whisper'у: даём file-like объект на основе BytesIO.
+        """
+        bio = io.BytesIO(raw)
+        # openai sdk использует name для определения расширения; задаём имя
+        bio.name = filename
+        res = self._client.audio.transcriptions.create(
+            model="whisper-1",
+            file=bio,
+        )
+        text = (res.text or "").strip()
+        return text
+
+    def transcribe_file(self, fobj) -> str:
+        """
+        Альтернатива: принимаем открытый файл (rb).
+        """
+        res = self._client.audio.transcriptions.create(
+            model="whisper-1",
+            file=fobj,
+        )
+        text = (res.text or "").strip()
+        return text
+
+    def transcribe_path(self, path: str) -> str:
+        """
+        На крайний случай: открываем путь сами и отправляем file-like.
+        (Не передаём путь строкой напрямую, чтобы избежать 'bytes-like required')
+        """
+        with open(path, "rb") as f:
+            res = self._client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+            )
+        text = (res.text or "").strip()
+        return text
