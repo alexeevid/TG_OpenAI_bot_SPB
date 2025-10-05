@@ -14,7 +14,7 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from ..services.dialog_service import DialogService
 from ..services.gen_service import GenService
 from ..services.voice_service import VoiceService
-from ..core import settings  # ожидаются флаги: SHOW_VOICE_TRANSCRIPT, VOICE_TRANSCRIPT_MAXLEN
+from app.core import settings
 
 log = logging.getLogger(__name__)
 
