@@ -1,4 +1,6 @@
 
+from typing import Optional
+from io import BytesIO
 from typing import List
 import logging
 from openai import OpenAI
