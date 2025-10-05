@@ -1,5 +1,6 @@
 
 from pydantic import BaseModel
+from typing import ClassVar
 import os
 
 class Settings(BaseModel):
@@ -29,8 +30,8 @@ class Settings(BaseModel):
     web_search_provider: str | None = os.getenv("WEB_SEARCH_PROVIDER")
     transcribe_model: str = os.getenv("OPENAI_TRANSCRIBE_MODEL","whisper-1")
     pgvector_dim: int = int(os.getenv("PGVECTOR_DIM","3072"))
-    SHOW_VOICE_TRANSCRIPT = bool(int(os.getenv("SHOW_VOICE_TRANSCRIPT", "1")))  # 1=включено, 0=выключено
-    VOICE_TRANSCRIPT_MAXLEN = int(os.getenv("VOICE_TRANSCRIPT_MAXLEN", "400"))  # усечение, чтобы не спамить
+    SHOW_VOICE_TRANSCRIPT: ClassVar[bool] = True
+    VOICE_TRANSCRIPT_MAXLEN: ClassVar[int] = 400
 
 def load_settings() -> Settings:
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
@@ -43,3 +44,4 @@ def load_settings() -> Settings:
         webhook_domain=os.getenv("WEBHOOK_DOMAIN"),
         webhook_secret=os.getenv("WEBHOOK_SECRET"),
     )
+settings = load_settings()  # ← модульная «синглтон»-инстанция
