@@ -29,6 +29,8 @@ class Settings(BaseModel):
     web_search_provider: str | None = os.getenv("WEB_SEARCH_PROVIDER")
     transcribe_model: str = os.getenv("OPENAI_TRANSCRIBE_MODEL","whisper-1")
     pgvector_dim: int = int(os.getenv("PGVECTOR_DIM","3072"))
+    SHOW_VOICE_TRANSCRIPT = bool(int(os.getenv("SHOW_VOICE_TRANSCRIPT", "1")))  # 1=включено, 0=выключено
+    VOICE_TRANSCRIPT_MAXLEN = int(os.getenv("VOICE_TRANSCRIPT_MAXLEN", "400"))  # усечение, чтобы не спамить
 
 def load_settings() -> Settings:
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
