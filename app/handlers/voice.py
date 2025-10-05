@@ -87,5 +87,5 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 def register(app: Application) -> None:
-    # Только voice (если понадобится audio → добавим filters.AUDIO отдельно)
-    app.add_handler(MessageHandler(filters.VOICE, on_voice))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+
