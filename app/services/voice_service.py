@@ -32,59 +32,34 @@ class VoiceService:
                 log.error("VOICE: файл не найден: %s", p)
                 return "[ошибка: файл не найден]"
 
-            # читаем БАЙТЫ (это устраняет 'bytes-like object required, not str')
-            raw = p.read_bytes()
+            # 🔹 исправление: открываем файл как bytes
+            with open(p, "rb") as f:
+                audio_bytes = f.read()
 
-            # 1) bytes-интерфейс
-            fn_bytes = getattr(self._openai, "transcribe_bytes", None)
-            if callable(fn_bytes):
-                try:
-                    if _is_coro_fn(fn_bytes):
-                        text = await fn_bytes(raw, filename=p.name)
-                    else:
-                        text = fn_bytes(raw, filename=p.name)
-                    text = (text or "").strip()
-                    if text:
-                        log.info("VOICE: распознано (bytes): %r", text)
-                        return text
-                except Exception as e:
-                    log.exception("VOICE: transcribe_bytes failed: %s", e)
+            # Если клиент умеет transcribe_bytes — используем его
+            if hasattr(self._openai, "transcribe_bytes"):
+                text = self._openai.transcribe_bytes(audio_bytes, filename=p.name)
 
-            # 2) file-like интерфейс
-            fn_file = getattr(self._openai, "transcribe_file", None)
-            if callable(fn_file):
-                try:
-                    with open(p, "rb") as f:
-                        if _is_coro_fn(fn_file):
-                            text = await fn_file(f)
-                        else:
-                            text = fn_file(f)
-                    text = (text or "").strip()
-                    if text:
-                        log.info("VOICE: распознано (file): %r", text)
-                        return text
-                except Exception as e:
-                    log.exception("VOICE: transcribe_file failed: %s", e)
+            # Если клиент умеет transcribe_file — используем file-like
+            elif hasattr(self._openai, "transcribe_file"):
+                with open(p, "rb") as f:
+                    text = self._openai.transcribe_file(f)
 
-            # 3) явный путь-строкой (если клиент так умеет)
-            for name in ("transcribe_path", "transcribe"):
-                fn = getattr(self._openai, name, None)
-                if callable(fn):
-                    try:
-                        if _is_coro_fn(fn):
-                            text = await fn(str(p))
-                        else:
-                            text = fn(str(p))   # ← передаём СТРОКУ пути, не Path
-                        text = (text or "").strip()
-                        if text:
-                            log.info("VOICE: распознано (%s): %r", name, text)
-                            return text
-                    except Exception as e:
-                        log.exception("VOICE: %s failed: %s", name, e)
+            # Если только общий метод transcribe, но он ожидает bytes
+            elif hasattr(self._openai, "transcribe"):
+                with open(p, "rb") as f:
+                    text = self._openai.transcribe(f)
 
-            # fallback: ничего не распознали
-            log.warning("VOICE: пустой результат распознавания для %s", p)
-            return "[пустой результат распознавания]"
+            else:
+                log.error("VOICE: метод транскрипции не найден в OpenAIClient")
+                return "[ошибка: не найден метод транскрипции]"
+
+            text = (text or "").strip()
+            if not text:
+                text = "[пустой результат распознавания]"
+
+            log.info("VOICE: успешно распознан текст: %s", text)
+            return text
 
         except Exception as e:
             log.exception("VOICE: ошибка транскрипции: %s", e)
