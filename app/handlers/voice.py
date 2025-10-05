@@ -6,6 +6,7 @@ from ..services.gen_service import GenService
 from ..services.dialog_service import DialogService
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("VOICE: получен голос длиной %s", update.message.voice.duration)
     file = await update.message.voice.get_file()
     b = await file.download_as_bytearray()
     voice: VoiceService = context.bot_data['svc_voice']
