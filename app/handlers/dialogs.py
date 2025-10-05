@@ -15,7 +15,7 @@ def _fmt_err(e: Exception) -> str:
 async def cmd_dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ds: DialogService = context.bot_data['svc_dialog']
     try:
-        d = ds.get_or_create_active(update.effective_user.id)
+        d = ds.new_dialog(update.effective_user.id)
         await update.message.reply_text(f"Создан новый диалог #{d.id}")
     except IntegrityError as e:
         await update.message.reply_text(f"⚠️ Ошибка БД при создании диалога — {_fmt_err(e)}")
