@@ -1,49 +1,52 @@
+from __future__ import annotations
+import logging
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-import logging
-from ..services.gen_service import GenService
+
 from ..services.dialog_service import DialogService
+from ..services.gen_service import GenService
 
 log = logging.getLogger(__name__)
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not update.message or not update.message.text:
+        msg = update.message
+        if not msg or not msg.text:
             return
 
-        ds: DialogService = context.bot_data["svc_dialog"]
-        gen: GenService = context.bot_data["svc_gen"]
+        ds: DialogService = context.bot_data.get("svc_dialog")
+        gen: GenService = context.bot_data.get("svc_gen")
+        if not ds or not gen:
+            await msg.reply_text("⚠️ Сервисы диалогов/генерации не сконфигурированы.")
+            return
 
-        # Берём последний диалог (создаём только если ни одного нет)
         d = ds.get_or_create_active(update.effective_user.id)
+        # тянем историю последних N реплик (минимум)
+        history = ds.get_last_history_as_messages(d.id, limit=8)  # верни [{'role','content'}, ...]
 
-        question = update.message.text.strip()
-        if not question:
-            await update.message.reply_text("⚠️ Пустое сообщение.")
-            return
+        # настройки диалога (модель, стиль)
+        st = ds.get_settings(d.id) or {}
+        model = st.get("model")
+        style = st.get("style")
 
-        ds.add_user_message(d.id, question)
-        log.info("TEXT: user=%s dialog=%s msg_len=%s", update.effective_user.id, d.id, len(question))
+        user_text = msg.text.strip()
+        ds.add_user_message(d.id, user_text)
 
-        # Основная генерация с защитой
-        try:
-            ans = await gen.chat(user_msg=question, dialog_id=d.id)
-            text = (ans.text or "").strip() if ans else ""
-        except Exception as e:
-            log.exception("TEXT: gen.chat failed: %s", e)
-            await update.message.reply_text(f"⚠️ Ошибка генерации: {e.__class__.__name__}")
-            return
-
-        if not text:
-            # Явный фолбэк, чтобы в чате не было тишины
-            text = "Я получил ваше сообщение, но не смог сгенерировать ответ. Попробуйте переформулировать или /reset."
-        ds.add_assistant_message(d.id, text)
-        await update.message.reply_text(text)
+        ans = await gen.chat(
+            user_msg=user_text,
+            dialog_id=d.id,
+            history=history,
+            model=model,
+            style=style,
+        )
+        reply = (ans.text or "").strip()
+        ds.add_assistant_message(d.id, reply)
+        await msg.reply_text(reply)
 
     except Exception as e:
-        log.exception("TEXT handler crashed: %s", e)
+        log.exception("TEXT handler error: %s", e)
         try:
-            await update.message.reply_text(f"⚠️ Ошибка обработки: {e.__class__.__name__}")
+            await update.message.reply_text("⚠️ Ошибка обработки текста.")
         except Exception:
             pass
 
