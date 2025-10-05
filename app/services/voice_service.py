@@ -4,69 +4,66 @@ import asyncio
 
 log = logging.getLogger(__name__)
 
-def _is_coro_fn(fn):
-    try:
-        return asyncio.iscoroutinefunction(fn)
-    except Exception:
-        return False
-
 class VoiceService:
-    """
-    Совместим с bootstrap: __init__(openai_client, settings).
-    Нормализует аудио в байты и пробует интерфейсы клиента в порядке:
-    1) transcribe_bytes(raw_bytes, filename="audio.ogg")
-    2) transcribe_file(file_obj)          # file-like (rb)
-    3) transcribe_path(str_path)          # строковый путь
-    4) transcribe(str_path)               # старый путь
-    Любая ошибка → человекочитаемое сообщение, без падения процесса.
-    """
-
     def __init__(self, openai_client, settings=None):
         self._openai = openai_client
         self._settings = settings
+
+    async def _run_io(self, fn, *args, **kwargs):
+        # Выполняем синхронный вызов SDK в threadpool, чтобы не блокировать event-loop
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     async def transcribe_path(self, path: str | Path) -> str:
         p = Path(path)
         try:
             if not p.exists():
                 log.error("VOICE: файл не найден: %s", p)
-                return "[ошибка: файл не найден]"
+                return "[ошибка распознавания: file_not_found]"
 
-            # 🔹 исправление: открываем файл как bytes
-            with open(p, "rb") as f:
-                audio_bytes = f.read()
+            raw = p.read_bytes()
 
-            # Если клиент умеет transcribe_bytes — используем его
+            # 1) предпочтительно — через bytes → BytesIO
             if hasattr(self._openai, "transcribe_bytes"):
-                text = self._openai.transcribe_bytes(audio_bytes, filename=p.name)
+                try:
+                    text = await self._run_io(self._openai.transcribe_bytes, raw, p.name)
+                    text = (text or "").strip()
+                    if text:
+                        log.info("VOICE: распознан (bytes): %s", text)
+                        return text
+                except Exception as e:
+                    log.exception("VOICE: transcribe_bytes failed: %s", e)
 
-            # Если клиент умеет transcribe_file — используем file-like
-            elif hasattr(self._openai, "transcribe_file"):
-                with open(p, "rb") as f:
-                    text = self._openai.transcribe_file(f)
+            # 2) через file-like
+            if hasattr(self._openai, "transcribe_file"):
+                try:
+                    with open(p, "rb") as f:
+                        text = await self._run_io(self._openai.transcribe_file, f)
+                    text = (text or "").strip()
+                    if text:
+                        log.info("VOICE: распознан (file): %s", text)
+                        return text
+                except Exception as e:
+                    log.exception("VOICE: transcribe_file failed: %s", e)
 
-            # Если только общий метод transcribe, но он ожидает bytes
-            elif hasattr(self._openai, "transcribe"):
-                with open(p, "rb") as f:
-                    text = self._openai.transcribe(f)
+            # 3) через path (мы всё равно откроем файл внутри клиента)
+            if hasattr(self._openai, "transcribe_path"):
+                try:
+                    text = await self._run_io(self._openai.transcribe_path, str(p))
+                    text = (text or "").strip()
+                    if text:
+                        log.info("VOICE: распознан (path): %s", text)
+                        return text
+                except Exception as e:
+                    log.exception("VOICE: transcribe_path failed: %s", e)
 
-            else:
-                log.error("VOICE: метод транскрипции не найден в OpenAIClient")
-                return "[ошибка: не найден метод транскрипции]"
-
-            text = (text or "").strip()
-            if not text:
-                text = "[пустой результат распознавания]"
-
-            log.info("VOICE: успешно распознан текст: %s", text)
-            return text
+            log.warning("VOICE: пустой результат распознавания: %s", p)
+            return "[ошибка распознавания: empty]"
 
         except Exception as e:
             log.exception("VOICE: ошибка транскрипции: %s", e)
             return f"[ошибка распознавания: {e.__class__.__name__}]"
 
     async def transcribe(self, message) -> str:
-        """Совместимость: принимает Telegram voice message."""
         try:
             file = await message.voice.get_file()
             local_path = f"/tmp/{file.file_unique_id}.ogg"
