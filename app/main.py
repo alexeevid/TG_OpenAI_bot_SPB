@@ -84,38 +84,68 @@ def build_application() -> Application:
     )
     log = logging.getLogger(__name__)
 
-    # Telegram Application
-    if not getattr(cfg, "TELEGRAM_BOT_TOKEN", None):
-        raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует в настройках")
+    # --- helpers ------------------------------------------------------------
+    def pick(*names: str, default: Optional[str] = None) -> Optional[str]:
+        """
+        Берём значение из ENV по любому из имён, иначе из cfg (атрибуты с теми же именами),
+        иначе default. Пустые строки считаем отсутствием значения.
+        """
+        for n in names:
+            v = os.getenv(n)
+            if v is not None and str(v).strip() != "":
+                return v
+            if hasattr(cfg, n):
+                v = getattr(cfg, n)
+                if v is not None and str(v).strip() != "":
+                    return v
+        return default
 
-    app = Application.builder() \
-        .token(cfg.TELEGRAM_BOT_TOKEN) \
-        .post_init(_post_init) \
-        .build()
+    def as_bool(val: Optional[object], default: bool = True) -> bool:
+        """Корректно парсим булевы ENV ('1','true','yes','on' => True; '0','false','no','off' => False)."""
+        if isinstance(val, bool):
+            return val
+        if val is None:
+            return default
+        s = str(val).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+        return default
+    # -----------------------------------------------------------------------
+
+    # Telegram Application
+    tg_token = pick("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "TELEGRAM_TOKEN")
+    if not tg_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует в настройках/окружении")
+
+    app = Application.builder().token(tg_token).post_init(_post_init).build()
 
     # База данных
-    if not getattr(cfg, "DATABASE_URL", None):
-        raise RuntimeError("DATABASE_URL отсутствует в настройках")
-    conn = _build_db_connection(cfg.DATABASE_URL)
+    db_url = pick("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL отсутствует в настройках/окружении")
+    conn = _build_db_connection(db_url)
     try:
         ensure_dialog_settings(conn)  # добавит dialogs.settings jsonb при необходимости
     except Exception as e:
         log.warning("ensure_dialog_settings skipped/failed: %s", e)
 
     # OpenAI / клиенты
-    if not getattr(cfg, "OPENAI_API_KEY", None):
+    oai_key = pick("OPENAI_API_KEY")
+    if not oai_key:
         log.warning("OPENAI_API_KEY пуст — генерация/транскрибирование не заработают")
 
-    oai_client = OpenAIClient(api_key=cfg.OPENAI_API_KEY)
+    oai_client = OpenAIClient(api_key=oai_key)
 
     # Текстовая генерация (Chat Completions)
-    default_model = getattr(cfg, "OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
-    gen = GenService(api_key=cfg.OPENAI_API_KEY, default_model=default_model)
+    default_model = pick("OPENAI_DEFAULT_MODEL", default="gpt-4o-mini")
+    gen = GenService(api_key=oai_key, default_model=default_model)
 
     # Картинки
-    enable_images = bool(getattr(cfg, "ENABLE_IMAGE_GENERATION", True))
-    image_model   = getattr(cfg, "OPENAI_IMAGE_MODEL", "gpt-image-1")
-    img = ImageService(api_key=cfg.OPENAI_API_KEY, image_model=image_model) if enable_images else None
+    enable_images = as_bool(pick("ENABLE_IMAGE_GENERATION"), default=True)
+    image_model   = pick("OPENAI_IMAGE_MODEL", "IMAGE_MODEL", default="gpt-image-1")
+    img = ImageService(api_key=oai_key, image_model=image_model) if enable_images else None
 
     # Диалоги
     ds = DialogService(db=conn)  # подстрой параметры под твой конструктор
@@ -133,7 +163,6 @@ def build_application() -> Application:
         "svc_image": img,
         "svc_voice": vs,
 
-        # Под будущие сервисы:
         # "svc_search": ...   # веб-поиск
         # "svc_kb": ...       # RAG
     })
@@ -149,7 +178,6 @@ def build_application() -> Application:
     h_text.register(app)     # обычный текст (в конце, чтобы не перехватывал команды)
 
     return app
-
 
 def run() -> None:
     """
