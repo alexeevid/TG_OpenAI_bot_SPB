@@ -1,4 +1,3 @@
-from .db.repo_dialogs import DialogsRepo
 from __future__ import annotations
 
 import logging
