@@ -1,3 +1,4 @@
+from .db.repo_dialogs import DialogsRepo
 from __future__ import annotations
 
 import logging
@@ -148,7 +149,8 @@ def build_application() -> Application:
     img = ImageService(api_key=oai_key, image_model=image_model) if enable_images else None
 
     # Диалоги
-    ds = DialogService(db=conn)  # подстрой параметры под твой конструктор
+    repo_dialogs = DialogsRepo(conn)
+    ds = DialogService(repo_dialogs)
 
     # Голосовой сервис (Whisper через OpenAIClient)
     vs = VoiceService(openai_client=oai_client)  # подстрой под твой конструктор
