@@ -11,6 +11,7 @@ from telegram.ext import Application
 from .settings import load_settings
 
 # Сервисы
+from .db.repo_dialogs import DialogsRepo
 from .services.gen_service import GenService
 from .services.image_service import ImageService
 from .services.voice_service import VoiceService
