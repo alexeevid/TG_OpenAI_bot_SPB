@@ -11,6 +11,7 @@ from telegram.ext import Application
 from .settings import load_settings
 
 # Сервисы
+from .db.sqlalchemy_factory import make_session_factory
 from .db.repo_dialogs import DialogsRepo
 from .services.gen_service import GenService
 from .services.image_service import ImageService
@@ -127,6 +128,9 @@ def build_application() -> Application:
     if not db_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках/окружении")
     conn = _build_db_connection(db_url)
+    session_factory = make_session_factory(db_url)
+    repo_dialogs = DialogsRepo(session_factory)
+
     try:
         ensure_dialog_settings(conn)  # добавит dialogs.settings jsonb при необходимости
     except Exception as e:
