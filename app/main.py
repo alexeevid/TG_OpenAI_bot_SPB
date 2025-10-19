@@ -5,7 +5,7 @@ from telegram.ext import Application
 from sqlalchemy import text
 
 # Настройки проекта
-from .settings import load_settings, pick
+from .settings import load_settings
 
 # Сервисы
 from .services.gen_service import GenService
@@ -71,7 +71,7 @@ def build_application() -> Application:
         .build()
 
     # База данных (через SQLAlchemy)
-    db_url = pick("DATABASE_URL")
+    db_url = cfg.DATABASE_URL
     if not db_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках/окружении")
 
