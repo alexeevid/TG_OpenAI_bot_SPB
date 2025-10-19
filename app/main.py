@@ -62,18 +62,18 @@ def build_application() -> Application:
     log = logging.getLogger(__name__)
 
     # Telegram
-    if not getattr(cfg, "TELEGRAM_BOT_TOKEN", None):
-        raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует в настройках")
+    if not cfg.telegram_token:
+        raise RuntimeError("telegram_token отсутствует в настройках")
 
     app = Application.builder() \
-        .token(cfg.TELEGRAM_BOT_TOKEN) \
+        .token(cfg.telegram_token) \
         .post_init(_post_init) \
         .build()
 
     # База данных (через SQLAlchemy)
-    db_url = cfg.DATABASE_URL
+    db_url = cfg.database_url
     if not db_url:
-        raise RuntimeError("DATABASE_URL отсутствует в настройках/окружении")
+        raise RuntimeError("DATABASE_URL отсутствует в настройках")
 
     session_factory, engine = make_session_factory(db_url)
     Base.metadata.create_all(bind=engine)
@@ -85,16 +85,16 @@ def build_application() -> Application:
     repo_dialogs = DialogsRepo(session_factory)
 
     # OpenAI
-    if not getattr(cfg, "OPENAI_API_KEY", None):
+    if not cfg.openai_api_key:
         log.warning("OPENAI_API_KEY пуст — генерация/транскрибирование не заработают")
 
-    oai_client = OpenAIClient(api_key=cfg.OPENAI_API_KEY)
-    default_model = getattr(cfg, "OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
-    gen = GenService(api_key=cfg.OPENAI_API_KEY, default_model=default_model)
+    oai_client = OpenAIClient(api_key=cfg.openai_api_key)
+    default_model = cfg.text_model
+    gen = GenService(api_key=cfg.openai_api_key, default_model=default_model)
 
-    enable_images = bool(getattr(cfg, "ENABLE_IMAGE_GENERATION", True))
-    image_model   = getattr(cfg, "OPENAI_IMAGE_MODEL", "gpt-image-1")
-    img = ImageService(api_key=cfg.OPENAI_API_KEY, image_model=image_model) if enable_images else None
+    img = None
+    if cfg.enable_image_generation:
+        img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model)
 
     ds = DialogService(repo_dialogs)
     vs = VoiceService(openai_client=oai_client)
