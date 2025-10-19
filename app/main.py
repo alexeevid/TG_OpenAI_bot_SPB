@@ -61,7 +61,6 @@ def build_application() -> Application:
     )
     log = logging.getLogger(__name__)
 
-    # Telegram
     if not cfg.telegram_token:
         raise RuntimeError("telegram_token отсутствует в настройках")
 
@@ -70,7 +69,6 @@ def build_application() -> Application:
         .post_init(_post_init) \
         .build()
 
-    # База данных (через SQLAlchemy)
     db_url = cfg.database_url
     if not db_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках")
@@ -78,39 +76,33 @@ def build_application() -> Application:
     session_factory, engine = make_session_factory(db_url)
     Base.metadata.create_all(bind=engine)
 
-    # Добавим поле settings (если его нет)
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
 
     repo_dialogs = DialogsRepo(session_factory)
+    ds = DialogService(repo_dialogs)
 
-    # OpenAI
     if not cfg.openai_api_key:
         log.warning("OPENAI_API_KEY пуст — генерация/транскрибирование не заработают")
 
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-    default_model = cfg.text_model
-    gen = GenService(api_key=cfg.openai_api_key, default_model=default_model)
+    gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
 
     img = None
     if cfg.enable_image_generation:
         img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model)
 
-    ds = DialogService(repo_dialogs)
     vs = VoiceService(openai_client=oai_client)
 
     app.bot_data.update({
         "settings": cfg,
-
         "svc_dialog": ds,
         "svc_gen": gen,
         "svc_image": img,
         "svc_voice": vs,
-
         "repo_dialogs": repo_dialogs,
     })
 
-    # Регистрация хендлеров
     h_start.register(app)
     h_help.register(app)
     h_dialogs.register(app)
