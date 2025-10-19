@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import logging
-import os
-from typing import Optional
-
-import psycopg2
 from telegram.ext import Application
+from sqlalchemy import text
 
 # Настройки проекта
-from .settings import load_settings
+from .settings import load_settings, pick
 
 # Сервисы
 from .services.gen_service import GenService
@@ -19,16 +16,10 @@ from .services.dialog_service import DialogService
 # Клиенты
 from .clients.openai_client import OpenAIClient
 
-# Репозиторий и SQLAlchemy фабрика
+# База данных (SQLAlchemy)
+from .db.session import make_session_factory
 from .db.repo_dialogs import DialogsRepo
-from .db.sqlalchemy_factory import make_session_factory
-
-# Бутстрап БД (опционально)
-try:
-    from .db.bootstrap import ensure_dialog_settings
-except Exception:
-    def ensure_dialog_settings(conn):
-        pass
+from .db.models import Base
 
 # Хендлеры
 from .handlers import (
@@ -41,6 +32,7 @@ from .handlers import (
     mode as h_mode,
     dialogs as h_dialogs
 )
+
 
 async def _post_init(app: Application) -> None:
     try:
@@ -60,12 +52,6 @@ async def _post_init(app: Application) -> None:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
 
 
-def _build_db_connection(database_url: str):
-    conn = psycopg2.connect(database_url)
-    conn.autocommit = True
-    return conn
-
-
 def build_application() -> Application:
     cfg = load_settings()
 
@@ -75,7 +61,7 @@ def build_application() -> Application:
     )
     log = logging.getLogger(__name__)
 
-    # Telegram токен
+    # Telegram
     if not getattr(cfg, "TELEGRAM_BOT_TOKEN", None):
         raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует в настройках")
 
@@ -84,44 +70,36 @@ def build_application() -> Application:
         .post_init(_post_init) \
         .build()
 
-    # База данных
-    if not getattr(cfg, "DATABASE_URL", None):
-        raise RuntimeError("DATABASE_URL отсутствует в настройках")
-    db_url = cfg.DATABASE_URL
+    # База данных (через SQLAlchemy)
+    db_url = pick("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL отсутствует в настройках/окружении")
 
-    conn = _build_db_connection(db_url)
-    session_factory = make_session_factory(db_url)
+    session_factory, engine = make_session_factory(db_url)
+    Base.metadata.create_all(bind=engine)
+
+    # Добавим поле settings (если его нет)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
+
     repo_dialogs = DialogsRepo(session_factory)
-
-    try:
-        ensure_dialog_settings(conn)
-    except Exception as e:
-        log.warning("ensure_dialog_settings skipped/failed: %s", e)
 
     # OpenAI
     if not getattr(cfg, "OPENAI_API_KEY", None):
         log.warning("OPENAI_API_KEY пуст — генерация/транскрибирование не заработают")
 
     oai_client = OpenAIClient(api_key=cfg.OPENAI_API_KEY)
-
-    # Генерация
     default_model = getattr(cfg, "OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
     gen = GenService(api_key=cfg.OPENAI_API_KEY, default_model=default_model)
 
-    # Картинки
     enable_images = bool(getattr(cfg, "ENABLE_IMAGE_GENERATION", True))
     image_model   = getattr(cfg, "OPENAI_IMAGE_MODEL", "gpt-image-1")
     img = ImageService(api_key=cfg.OPENAI_API_KEY, image_model=image_model) if enable_images else None
 
-    # Диалоги
     ds = DialogService(repo_dialogs)
-
-    # Голос
     vs = VoiceService(openai_client=oai_client)
 
-    # Общие данные
     app.bot_data.update({
-        "db_conn": conn,
         "settings": cfg,
 
         "svc_dialog": ds,
@@ -129,7 +107,7 @@ def build_application() -> Application:
         "svc_image": img,
         "svc_voice": vs,
 
-        "repo_dialogs": repo_dialogs,  # 👈 теперь /dialogs работает корректно
+        "repo_dialogs": repo_dialogs,
     })
 
     # Регистрация хендлеров
@@ -143,6 +121,7 @@ def build_application() -> Application:
     h_text.register(app)
 
     return app
+
 
 def run() -> None:
     app = build_application()
