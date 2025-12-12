@@ -1,4 +1,4 @@
-from ..dialog_manager import Dialog  # Исправленный относительный импорт
+from app.handlers.dialogs import Dialog  # Исправленный относительный импорт
 import openai
 
 def generate_answer(prompt: str, dialog: Dialog) -> str:
