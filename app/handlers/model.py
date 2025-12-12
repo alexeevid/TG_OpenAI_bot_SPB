@@ -1,6 +1,6 @@
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes
-from services.dialog_manager import get_current_dialog, update_dialog_settings
+from ..services.dialog_manager import get_current_dialog, update_dialog_settings
 
 MODELS = ["gpt-4", "gpt-4o", "gpt-3.5-turbo"]
 

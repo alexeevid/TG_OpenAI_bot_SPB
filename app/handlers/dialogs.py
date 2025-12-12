@@ -1,3 +1,7 @@
+from telegram import Update
+from telegram.ext import ContextTypes
+from ..services import dialog_manager
+
 async def dialog_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Укажите ID диалога. Например: /dialog 123")
