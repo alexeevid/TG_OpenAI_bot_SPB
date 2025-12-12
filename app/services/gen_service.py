@@ -1,4 +1,4 @@
-from services.dialog_manager import Dialog  # или другой путь, где определён класс Dialog
+from services.dialog_manager import Dialog  # Добавлен импорт
 
 def generate_answer(prompt: str, dialog: Dialog) -> str:
     model = dialog.settings.get("model", "gpt-4")
