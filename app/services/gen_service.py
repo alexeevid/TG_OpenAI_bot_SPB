@@ -1,3 +1,5 @@
+from services.dialog_manager import Dialog  # или другой путь, где определён класс Dialog
+
 def generate_answer(prompt: str, dialog: Dialog) -> str:
     model = dialog.settings.get("model", "gpt-4")
     style = dialog.settings.get("style", "default")
