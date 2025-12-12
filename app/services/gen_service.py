@@ -1,4 +1,5 @@
-from services.dialog_manager import Dialog  # Добавлен импорт
+from ..dialog_manager import Dialog  # Исправленный относительный импорт
+import openai
 
 def generate_answer(prompt: str, dialog: Dialog) -> str:
     model = dialog.settings.get("model", "gpt-4")
@@ -17,7 +18,7 @@ def generate_answer(prompt: str, dialog: Dialog) -> str:
     ]
 
     if dialog.settings.get("kb_enabled"):
-        from services.rag_engine import retrieve_and_format
+        from ..rag_engine import retrieve_and_format
         rag_context = retrieve_and_format(prompt)
         messages.insert(1, {"role": "user", "content": rag_context})
 
