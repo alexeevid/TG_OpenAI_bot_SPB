@@ -1,30 +1,13 @@
-from app.handlers.dialogs import Dialog  # Исправленный относительный импорт
-import openai
+from app.services.openai_client import OpenAIClient
 
-def generate_answer(prompt: str, dialog: Dialog) -> str:
-    model = dialog.settings.get("model", "gpt-4")
-    style = dialog.settings.get("style", "default")
+class GenService:
+    def __init__(self):
+        self.client = OpenAIClient()
 
-    if style == "concise":
-        system_prompt = "Отвечай кратко и по существу."
-    elif style == "mcwilliams":
-        system_prompt = "Отвечай как профессор МакВильямс: высокоумно и с иронией."
-    else:
-        system_prompt = "Ты — полезный помощник."
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt},
-    ]
-
-    if dialog.settings.get("kb_enabled"):
-        from ..rag_engine import retrieve_and_format
-        rag_context = retrieve_and_format(prompt)
-        messages.insert(1, {"role": "user", "content": rag_context})
-
-    response = openai.ChatCompletion.create(
-        model=model,
-        messages=messages,
-        temperature=0.7,
-    )
-    return response["choices"][0]["message"]["content"]
+    def chat(self, prompt: str, history: list, model: str, system: str):
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.extend(history)
+        messages.append({"role": "user", "content": prompt})
+        return self.client.chat(messages, model=model)
