@@ -1,10 +1,11 @@
 """Project settings.
 
-This file preserves the contract expected by app.main:
+This module must satisfy existing imports/contracts in the repo:
     from .settings import load_settings
 
-It uses a lightweight dataclass-based loader (no pydantic dependency),
-reading values from environment variables.
+And existing attribute names used across the codebase (aliases), e.g.:
+    cfg.telegram_token   (legacy)
+    cfg.telegram_bot_token (new)
 """
 
 from __future__ import annotations
@@ -52,26 +53,61 @@ def _getenv_int_set(name: str) -> Set[int]:
 
 @dataclass(frozen=True)
 class Settings:
+    # Canonical names (preferred)
     telegram_bot_token: str
     openai_api_key: str
     database_url: str
 
+    # Models
     openai_text_model: str = "gpt-4.5-turbo"
     openai_image_model: str = "gpt-image-1"
     openai_embedding_model: str = "text-embedding-3-large"
     openai_transcribe_model: str = "whisper-1"
 
+    # Features / limits
     enable_web_search: bool = False
     rate_limit_per_min: int = 60
 
+    # Optional: admins
     admin_ids: Set[int] = None  # type: ignore[assignment]
+
+    # ---- Backward-compatible attribute aliases (used by existing code) ----
+    @property
+    def telegram_token(self) -> str:
+        return self.telegram_bot_token
+
+    @property
+    def openai_key(self) -> str:
+        return self.openai_api_key
+
+    @property
+    def db_url(self) -> str:
+        return self.database_url
+
+    @property
+    def text_model(self) -> str:
+        return self.openai_text_model
+
+    @property
+    def image_model(self) -> str:
+        return self.openai_image_model
+
+    @property
+    def embedding_model(self) -> str:
+        return self.openai_embedding_model
+
+    @property
+    def transcribe_model(self) -> str:
+        return self.openai_transcribe_model
 
 
 def load_settings() -> Settings:
+    """Load settings from environment variables."""
     telegram_bot_token = _getenv("TELEGRAM_BOT_TOKEN", "") or _getenv("BOT_TOKEN", "") or ""
     openai_api_key = _getenv("OPENAI_API_KEY", "") or ""
     database_url = _getenv("DATABASE_URL", "") or _getenv("POSTGRES_DSN", "") or ""
 
+    # Allow overrides
     openai_text_model = _getenv("OPENAI_TEXT_MODEL", _getenv("OPENAI_MODEL", "gpt-4.5-turbo")) or "gpt-4.5-turbo"
     openai_image_model = _getenv("OPENAI_IMAGE_MODEL", "gpt-image-1") or "gpt-image-1"
     openai_embedding_model = _getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large") or "text-embedding-3-large"
@@ -95,18 +131,21 @@ def load_settings() -> Settings:
     )
 
 
-_SETTINGS = None
+# Module-level cached settings + legacy constants (some modules may import these directly)
+_SETTINGS: Optional[Settings] = None
 
-def _settings() -> Settings:
+def get_settings() -> Settings:
     global _SETTINGS
     if _SETTINGS is None:
         _SETTINGS = load_settings()
     return _SETTINGS
 
 
-OPENAI_TEXT_MODEL = _settings().openai_text_model
-OPENAI_IMAGE_MODEL = _settings().openai_image_model
-OPENAI_EMBEDDING_MODEL = _settings().openai_embedding_model
-OPENAI_TRANSCRIBE_MODEL = _settings().openai_transcribe_model
-ENABLE_WEB_SEARCH = _settings().enable_web_search
-RATE_LIMIT_PER_MIN = _settings().rate_limit_per_min
+cfg = get_settings()
+
+OPENAI_TEXT_MODEL = cfg.openai_text_model
+OPENAI_IMAGE_MODEL = cfg.openai_image_model
+OPENAI_EMBEDDING_MODEL = cfg.openai_embedding_model
+OPENAI_TRANSCRIBE_MODEL = cfg.openai_transcribe_model
+ENABLE_WEB_SEARCH = cfg.enable_web_search
+RATE_LIMIT_PER_MIN = cfg.rate_limit_per_min
