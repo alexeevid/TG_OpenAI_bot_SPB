@@ -34,13 +34,6 @@ from .handlers import (
 )
 
 
-
-async def _on_error(update: object, context: object) -> None:
-    # Global safety net: log exceptions that escaped handlers.
-    try:
-        logging.getLogger(__name__).exception("Unhandled error in handler", exc_info=getattr(context, 'error', None))
-    except Exception:
-        pass
 async def _post_init(app: Application) -> None:
     try:
         await app.bot.set_my_commands([
@@ -76,8 +69,6 @@ def build_application() -> Application:
         .post_init(_post_init) \
         .build()
 
-    app.add_error_handler(_on_error)
-
     db_url = cfg.database_url
     if not db_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках")
@@ -96,13 +87,7 @@ def build_application() -> Application:
         log.warning("OPENAI_API_KEY пуст — генерация/транскрибирование не заработают")
 
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-    gen = GenService(
-        api_key=cfg.openai_api_key,
-        default_model=cfg.text_model,
-        temperature=cfg.openai_temperature,
-        max_output_tokens=getattr(cfg, 'max_output_tokens', None),
-        reasoning_effort=getattr(cfg, 'reasoning_effort', None),
-    )
+    gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
 
     img = None
     if cfg.enable_image_generation:
