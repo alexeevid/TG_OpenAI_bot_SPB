@@ -74,9 +74,7 @@ class OpenAIClient:
                 # Responses API supports role/content as strings (user/assistant).
                 turns.append({"role": role or "user", "content": content_s})
 
-        instructions = "
-
-".join(sys_parts).strip() or None
+        instructions = "\n\n".join(sys_parts).strip() or None
 
         def _extract_output_text(resp: Any) -> str:
             # SDKs expose output_text in newer versions.
@@ -150,7 +148,6 @@ class OpenAIClient:
         return (resp.choices[0].message.content or "").strip()
 
     # -------- images --------
- --------
     def generate_image_url(self, *, model: str, prompt: str, size: str = "1024x1024") -> str:
         out = self.client.images.generate(model=model, prompt=prompt, size=size)
         return out.data[0].url
