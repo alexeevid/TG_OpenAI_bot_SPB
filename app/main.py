@@ -37,19 +37,24 @@ from .handlers import (
 async def _post_init(app: Application) -> None:
     try:
         await app.bot.set_my_commands([
-            ("start",  "Приветствие и инициализация"),
-            ("help",   "Справка"),
-            ("reset",  "Новый диалог"),
-            ("dialogs","Список диалогов"),
+            ("start", "Приветствие и инициализация"),
+            ("help", "Справка по командам"),
+            ("reset", "Новый диалог"),
+            ("dialogs", "Список диалогов"),
             ("dialog", "Переключить диалог: /dialog <id>"),
-            ("model",  "Модель для текущего диалога"),
-            ("mode",   "Режим ответа: concise|detailed|mcwilliams"),
-            ("img",    "Сгенерировать изображение"),
-            ("stats",  "Статистика бота"),
-            ("kb",     "База знаний"),
+            ("model", "Выбрать модель: /model <название>"),
+            ("mode", "Режим ответа: concise|detailed|mcwilliams"),
+            ("img", "Сгенерировать изображение"),
+            ("stats", "Статистика текущего диалога"),
+            ("kb", "Работа с базой знаний"),
+            ("update", "Обновить функциональность"),
+            ("config", "Текущая конфигурация"),
+            ("about", "О проекте"),
+            ("feedback", "Оставить отзыв"),
         ])
     except Exception as e:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
+
 
 
 def build_application() -> Application:
@@ -112,6 +117,15 @@ def build_application() -> Application:
     h_image.register(app)
     h_voice.register(app)
     h_text.register(app)
+
+        # Новые хендлеры при их наличии
+    try:
+        from .handlers import stats as h_stats, kb as h_kb, config as h_config
+        h_stats.register(app)
+        h_kb.register(app)
+        h_config.register(app)
+    except ImportError as e:
+        log.warning("Дополнительные хендлеры не загружены: %s", e)
 
     return app
 
