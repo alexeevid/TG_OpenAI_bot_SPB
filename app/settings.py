@@ -88,6 +88,10 @@ class Settings:
     openai_temperature: float = 0.2
     max_context_tokens: int = 8000
 
+    # Output control (avoid Telegram 4096-char limit blowups)
+    max_output_tokens: Optional[int] = 900
+    reasoning_effort: Optional[str] = "medium"
+
     # Feature flags
     enable_image_generation: bool = False
     enable_web_search: bool = False
@@ -166,6 +170,18 @@ def load_settings() -> Settings:
 
     openai_temperature = _getenv_float("OPENAI_TEMPERATURE", 0.2)
     max_context_tokens = _getenv_int("MAX_CONTEXT_TOKENS", 8000)
+    max_output_tokens_raw = _getenv("MAX_OUTPUT_TOKENS")
+    if max_output_tokens_raw is None:
+        max_output_tokens: Optional[int] = 900
+    else:
+        try:
+            max_output_tokens = int(max_output_tokens_raw)
+            if max_output_tokens <= 0:
+                max_output_tokens = None
+        except ValueError:
+            max_output_tokens = 900
+
+    reasoning_effort = _getenv("OPENAI_REASONING_EFFORT", "medium") or "medium"
 
     # Feature flags
     enable_image_generation = _getenv_bool("ENABLE_IMAGE_GENERATION", False)
@@ -208,6 +224,8 @@ def load_settings() -> Settings:
         openai_transcribe_model=openai_transcribe_model,
         openai_temperature=openai_temperature,
         max_context_tokens=max_context_tokens,
+        max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
         enable_image_generation=enable_image_generation,
         enable_web_search=enable_web_search,
         web_search_provider=web_search_provider,
