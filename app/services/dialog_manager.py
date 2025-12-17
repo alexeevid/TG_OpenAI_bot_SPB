@@ -1,20 +1,18 @@
-"""Compatibility dialog manager.
+"""Legacy compatibility layer.
 
-Provides symbols expected by handlers importing:
-    from ..services.dialog_manager import get_current_dialog, update_dialog_settings
-
-If your project already has a DB-backed dialog manager, you can replace this
-module with an adapter to your persistence layer.
+Некоторые старые модули могли импортировать app.services.dialog_manager.
+В целевой архитектуре используйте DialogService + dialogs.settings в БД.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Any, Dict
 
-_DIALOGS: Dict[int, "Dialog"] = {}
+from .dialog_service import DialogService
 
 
+# Простейшие типы, чтобы старые импорты не падали.
 @dataclass
 class Dialog:
     user_id: int
@@ -22,16 +20,14 @@ class Dialog:
 
 
 def get_current_dialog(user_id: int) -> Dialog:
-    d = _DIALOGS.get(user_id)
-    if d is None:
-        d = Dialog(user_id=user_id, settings={})
-        _DIALOGS[user_id] = d
-    return d
+    # Legacy: без DB
+    return Dialog(user_id=user_id, settings={})
 
 
 def update_dialog_settings(dialog: Dialog) -> None:
-    _DIALOGS[dialog.user_id] = dialog
+    # Legacy no-op
+    return
 
 
 def reset_dialog(user_id: int) -> None:
-    _DIALOGS.pop(user_id, None)
+    return

@@ -78,6 +78,7 @@ def build_application() -> Application:
 
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
 
     repo_dialogs = DialogsRepo(session_factory)
     ds = DialogService(repo_dialogs)

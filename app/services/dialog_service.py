@@ -1,54 +1,77 @@
-from sqlalchemy.orm import Session
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
 from ..db.repo_dialogs import DialogsRepo
-from ..db.models import Dialog, User
+from ..db.models import Dialog, Message
+
 
 class DialogService:
+    """Единый сервис диалогов (DB-backed), используемый хендлерами."""
+
     def __init__(self, repo: DialogsRepo | None):
         self._repo = repo
 
-    def _sf(self):
-        return self._repo.sf if self._repo else None
-
-    def _get_user(self, tg_user_id: str | int):
+    def _ensure_repo(self) -> DialogsRepo:
         if not self._repo:
-            return None
-        return self._repo.ensure_user(str(tg_user_id))
+            raise RuntimeError("DialogsRepo not configured")
+        return self._repo
 
-    def get_last_dialog(self, tg_user_id: str | int):
-        """Вернуть последний (по id) диалог пользователя, если есть."""
-        if not self._repo:
-            return type("D",(object,),{"id":0})()
-        sf = self._sf()
-        uid = str(tg_user_id)
-        with sf() as s:  # type: Session
-            u = s.query(User).filter_by(tg_id=uid).first()
-            if not u:
-                return None
-            d = s.query(Dialog).filter(Dialog.user_id == u.id).order_by(Dialog.id.desc()).first()
+    def ensure_user(self, tg_user_id: str | int):
+        repo = self._ensure_repo()
+        return repo.ensure_user(str(tg_user_id))
+
+    def get_active_dialog(self, tg_user_id: str | int) -> Dialog:
+        repo = self._ensure_repo()
+        u = repo.ensure_user(str(tg_user_id))
+        d = repo.get_active_dialog(u.id)
+        if d:
             return d
+        # Если активного нет — создаём новый и делаем активным
+        d = repo.new_dialog(u.id, title="")
+        repo.set_active_dialog(u.id, d.id)
+        return d
 
-    def get_or_create_active(self, tg_user_id: str | int):
-        """
-        Теперь: НЕ создаём новый диалог, если у пользователя уже есть.
-        Возвращаем последний диалог; новый создаём только при полном отсутствии.
-        """
-        if not self._repo:
-            return type("D",(object,),{"id":0})()
-        last = self.get_last_dialog(tg_user_id)
-        if last:
-            return last
-        u = self._get_user(tg_user_id)
-        return self._repo.new_dialog(u.id, title="")
+    def new_dialog(self, tg_user_id: str | int, title: str = "") -> Dialog:
+        repo = self._ensure_repo()
+        u = repo.ensure_user(str(tg_user_id))
+        d = repo.new_dialog(u.id, title=title or "")
+        repo.set_active_dialog(u.id, d.id)
+        return d
 
-    def new_dialog(self, tg_user_id: str | int, title: str = ""):
-        """Явно создать новый диалог (для /dialog_new и /reset)."""
-        if not self._repo:
-            return type("D",(object,),{"id":0})()
-        u = self._get_user(tg_user_id)
-        return self._repo.new_dialog(u.id, title=title)
+    def switch_dialog(self, tg_user_id: str | int, dialog_id: int) -> bool:
+        repo = self._ensure_repo()
+        u = repo.ensure_user(str(tg_user_id))
+        d = repo.get_dialog_for_user(dialog_id, u.id)
+        if not d:
+            return False
+        repo.set_active_dialog(u.id, d.id)
+        return True
 
-    def add_user_message(self, dialog_id: int, text: str):
-        if self._repo: self._repo.add_message(dialog_id, "user", text)
+    def list_dialogs(self, tg_user_id: str | int, limit: int = 20) -> List[Dialog]:
+        repo = self._ensure_repo()
+        u = repo.ensure_user(str(tg_user_id))
+        return repo.list_dialogs(u.id, limit=limit)
 
-    def add_assistant_message(self, dialog_id: int, text: str):
-        if self._repo: self._repo.add_message(dialog_id, "assistant", text)
+    def update_active_settings(self, tg_user_id: str | int, patch: Dict[str, Any]) -> Dialog:
+        repo = self._ensure_repo()
+        d = self.get_active_dialog(tg_user_id)
+        updated = repo.update_dialog_settings(d.id, patch)
+        return updated or d
+
+    def get_active_settings(self, tg_user_id: str | int) -> Dict[str, Any]:
+        d = self.get_active_dialog(tg_user_id)
+        s = d.settings or {}
+        return s if isinstance(s, dict) else {}
+
+    def add_user_message(self, dialog_id: int, text: str) -> None:
+        repo = self._ensure_repo()
+        repo.add_message(dialog_id, "user", text)
+
+    def add_assistant_message(self, dialog_id: int, text: str) -> None:
+        repo = self._ensure_repo()
+        repo.add_message(dialog_id, "assistant", text)
+
+    def history(self, dialog_id: int, limit: int = 30) -> List[Message]:
+        repo = self._ensure_repo()
+        return repo.list_messages(dialog_id, limit=limit)

@@ -1,14 +1,70 @@
-from telegram import Update
-from telegram.ext import ContextTypes
-from ..services import dialog_manager
+from __future__ import annotations
 
-async def dialog_switch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Укажите ID диалога. Например: /dialog 123")
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+from ..services.dialog_service import DialogService
+
+
+async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ds: DialogService = context.bot_data.get("svc_dialog")
+    if not ds or not update.effective_user:
+        await update.message.reply_text("⚠️ Сервис диалогов не настроен.")
         return
-    dialog_id = context.args[0]
-    success = dialog_manager.switch_dialog(update.effective_user.id, dialog_id)
-    if success:
-        await update.message.reply_text(f"Переключено на диалог {dialog_id}")
-    else:
+
+    dialogs = ds.list_dialogs(update.effective_user.id, limit=20)
+    active = ds.get_active_dialog(update.effective_user.id)
+
+    if not dialogs:
+        await update.message.reply_text("Диалогов пока нет. Используйте /reset для создания.")
+        return
+
+    lines = []
+    for d in dialogs:
+        mark = "•"
+        if active and d.id == active.id:
+            mark = "▶"
+        title = (d.title or "").strip() or "(без названия)"
+        lines.append(f"{mark} {d.id}: {title}")
+    await update.message.reply_text("Ваши диалоги:\n" + "\n".join(lines))
+
+
+async def cmd_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ds: DialogService = context.bot_data.get("svc_dialog")
+    if not ds or not update.effective_user:
+        await update.message.reply_text("⚠️ Сервис диалогов не настроен.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /dialog <id>")
+        return
+    try:
+        did = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID диалога должен быть числом.")
+        return
+
+    ok = ds.switch_dialog(update.effective_user.id, did)
+    if not ok:
         await update.message.reply_text("Диалог не найден.")
+        return
+    await update.message.reply_text(f"Переключено на диалог {did}.")
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ds: DialogService = context.bot_data.get("svc_dialog")
+    if not ds or not update.effective_user:
+        await update.message.reply_text("⚠️ Сервис диалогов не настроен.")
+        return
+    d = ds.new_dialog(update.effective_user.id, title="")
+    await update.message.reply_text(f"Создан новый диалог: {d.id}")
+
+
+async def cmd_dialog_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_reset(update, context)
+
+
+def register(app: Application) -> None:
+    app.add_handler(CommandHandler("dialogs", cmd_dialogs))
+    app.add_handler(CommandHandler("dialog", cmd_dialog))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("dialog_new", cmd_dialog_new))

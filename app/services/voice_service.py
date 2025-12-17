@@ -1,74 +1,47 @@
+from __future__ import annotations
+
+import asyncio
 import logging
 from pathlib import Path
-import asyncio
 
 log = logging.getLogger(__name__)
 
+
 class VoiceService:
+    """Распознавание голоса через OpenAI (whisper-1 по умолчанию).
+
+    openai_client должен предоставлять метод transcribe_file(fobj, model=...).
+    """
+
     def __init__(self, openai_client, settings=None):
         self._openai = openai_client
         self._settings = settings
 
-    async def _run_io(self, fn, *args, **kwargs):
-        # Выполняем синхронный вызов SDK в threadpool, чтобы не блокировать event-loop
-        return await asyncio.to_thread(fn, *args, **kwargs)
-
     async def transcribe_path(self, path: str | Path) -> str:
         p = Path(path)
+        if not p.exists():
+            return "[ошибка распознавания: файл не найден]"
+
+        model = None
+        if self._settings is not None:
+            model = getattr(self._settings, "openai_transcribe_model", None) or getattr(self._settings, "transcribe_model", None)
+
         try:
-            if not p.exists():
-                log.error("VOICE: файл не найден: %s", p)
-                return "[ошибка распознавания: file_not_found]"
-
-            raw = p.read_bytes()
-
-            # 1) предпочтительно — через bytes → BytesIO
-            if hasattr(self._openai, "transcribe_bytes"):
-                try:
-                    text = await self._run_io(self._openai.transcribe_bytes, raw, p.name)
-                    text = (text or "").strip()
-                    if text:
-                        log.info("VOICE: распознан (bytes): %s", text)
-                        return text
-                except Exception as e:
-                    log.exception("VOICE: transcribe_bytes failed: %s", e)
-
-            # 2) через file-like
-            if hasattr(self._openai, "transcribe_file"):
-                try:
-                    with open(p, "rb") as f:
-                        text = await self._run_io(self._openai.transcribe_file, f)
-                    text = (text or "").strip()
-                    if text:
-                        log.info("VOICE: распознан (file): %s", text)
-                        return text
-                except Exception as e:
-                    log.exception("VOICE: transcribe_file failed: %s", e)
-
-            # 3) через path (мы всё равно откроем файл внутри клиента)
-            if hasattr(self._openai, "transcribe_path"):
-                try:
-                    text = await self._run_io(self._openai.transcribe_path, str(p))
-                    text = (text or "").strip()
-                    if text:
-                        log.info("VOICE: распознан (path): %s", text)
-                        return text
-                except Exception as e:
-                    log.exception("VOICE: transcribe_path failed: %s", e)
-
-            log.warning("VOICE: пустой результат распознавания: %s", p)
-            return "[ошибка распознавания: empty]"
-
+            with p.open("rb") as f:
+                if model:
+                    return await asyncio.to_thread(self._openai.transcribe_file, f, model)
+                return await asyncio.to_thread(self._openai.transcribe_file, f)
         except Exception as e:
-            log.exception("VOICE: ошибка транскрипции: %s", e)
+            log.exception("VOICE: transcribe_path failed: %s", e)
             return f"[ошибка распознавания: {e.__class__.__name__}]"
 
     async def transcribe(self, message) -> str:
+        """Скачивает voice/audio в /tmp и транскрибирует."""
         try:
-            file = await message.voice.get_file()
-            local_path = f"/tmp/{file.file_unique_id}.ogg"
-            await file.download_to_drive(custom_path=local_path)
+            tg_file = await message.voice.get_file() if message.voice else await message.audio.get_file()
+            local_path = f"/tmp/{tg_file.file_unique_id}.ogg"
+            await tg_file.download_to_drive(custom_path=local_path)
             return await self.transcribe_path(local_path)
         except Exception as e:
-            log.exception("VOICE: ошибка в transcribe(): %s", e)
+            log.exception("VOICE: transcribe failed: %s", e)
             return f"[ошибка распознавания: {e.__class__.__name__}]"
