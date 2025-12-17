@@ -86,7 +86,7 @@ class GenService:
         use_model = model or self.default_model
         use_temp = self.temperature if temperature is None else float(temperature)
 
-                try:
+        try:
             return await asyncio.to_thread(
                 self.client.generate_text,
                 model=use_model,
@@ -96,10 +96,8 @@ class GenService:
                 reasoning_effort=self.reasoning_effort,
             )
         except Exception as e:
-            # Typical root cause: выбранная модель недоступна на ключе/аккаунте или отклонена API.
             log.exception("OpenAI generate_text failed (model=%s): %s", use_model, e)
 
-            # Best-effort fallback to a known-working model to avoid "silent" bot.
             fallback_model = "gpt-4o"
             if use_model != fallback_model:
                 try:
@@ -111,9 +109,7 @@ class GenService:
                         max_output_tokens=self.max_output_tokens,
                         reasoning_effort=self.reasoning_effort,
                     )
-                    return f"⚠️ Выбранная модель `{use_model}` недоступна или вернула ошибку. Переключился на `{fallback_model}`.
-
-{txt}"
+                    return f"⚠️ Выбранная модель `{use_model}` недоступна или вернула ошибку. Переключился на `{fallback_model}`.\n\n{txt}"
                 except Exception as e2:
                     log.exception("Fallback model also failed: %s", e2)
             raise
