@@ -36,6 +36,7 @@ from .handlers import (
 
 async def _post_init(app: Application) -> None:
     try:
+        await app.bot.delete_my_commands()
         await app.bot.set_my_commands([
             ("start", "Приветствие и инициализация"),
             ("help", "Справка по командам"),
