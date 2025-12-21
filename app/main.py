@@ -12,14 +12,23 @@ from .services.gen_service import GenService
 from .services.image_service import ImageService
 from .services.voice_service import VoiceService
 from .services.dialog_service import DialogService
+from .services.rag_service import RagService
+from .services.authz_service import AuthzService
 
 # Клиенты
 from .clients.openai_client import OpenAIClient
+from .clients.yandex_disk_client import YandexDiskClient
 
 # База данных (SQLAlchemy)
 from .db.session import make_session_factory
 from .db.repo_dialogs import DialogsRepo
+from .db.repo_kb import KBRepo
 from .db.models import Base
+
+# Knowledge base components
+from .kb.embedder import Embedder
+from .kb.retriever import Retriever
+from .kb.syncer import KBSyncer
 
 # Хендлеры
 from .handlers import (
@@ -57,7 +66,6 @@ async def _post_init(app: Application) -> None:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
 
 
-
 def build_application() -> Application:
     cfg = load_settings()
 
@@ -82,6 +90,7 @@ def build_application() -> Application:
     session_factory, engine = make_session_factory(db_url)
     Base.metadata.create_all(bind=engine)
 
+    # Ensure new columns exist in legacy tables
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
@@ -101,6 +110,15 @@ def build_application() -> Application:
 
     vs = VoiceService(openai_client=oai_client)
 
+    # Initialize knowledge base and authorization services
+    repo_kb = KBRepo(session_factory, getattr(cfg, "pgvector_dim", 3072))
+    yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
+    embedder = Embedder(oai_client, cfg.openai_embedding_model)
+    retriever = Retriever(repo_kb, oai_client, getattr(cfg, "pgvector_dim", 3072))
+    rag = RagService(retriever)
+    authz = AuthzService(cfg)
+    syncer = KBSyncer(yd, embedder, repo_kb, cfg)
+
     app.bot_data.update({
         "settings": cfg,
         "svc_dialog": ds,
@@ -108,6 +126,12 @@ def build_application() -> Application:
         "svc_image": img,
         "svc_voice": vs,
         "repo_dialogs": repo_dialogs,
+        "repo_kb": repo_kb,
+        "svc_rag": rag,
+        "svc_authz": authz,
+        "yandex": yd,
+        "embedder": embedder,
+        "svc_syncer": syncer,
     })
 
     h_start.register(app)
@@ -119,12 +143,15 @@ def build_application() -> Application:
     h_voice.register(app)
     h_text.register(app)
 
-        # Новые хендлеры при их наличии
+    # Новые хендлеры (дополнительная функциональность)
     try:
-        from .handlers import stats as h_stats, kb as h_kb, config as h_config
+        from .handlers import stats as h_stats, kb as h_kb, config as h_config, update as h_update, about as h_about, feedback as h_feedback
         h_stats.register(app)
         h_kb.register(app)
         h_config.register(app)
+        h_update.register(app)
+        h_about.register(app)
+        h_feedback.register(app)
     except ImportError as e:
         log.warning("Дополнительные хендлеры не загружены: %s", e)
 
