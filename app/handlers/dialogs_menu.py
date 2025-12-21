@@ -1,29 +1,32 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ForceReply,
+)
 from telegram.ext import ContextTypes, CallbackQueryHandler, CommandHandler
 from telegram.constants import ParseMode
 
 from app.db.repo_dialogs import DialogsRepo
 
+
 def build_dialogs_menu(dialogs, active_dialog_id):
     keyboard = []
     for d in dialogs[:5]:
-        row = [
-            [
-                InlineKeyboardButton(
-                    text=f"🧾 {d.title or 'Без имени'}",
-                    callback_data=f"noop:{d.id}"
-                )
-            ],
-            [
-                InlineKeyboardButton("✏️", callback_data=f"rename:{d.id}"),
-                InlineKeyboardButton("🗑", callback_data=f"delete:{d.id}"),
-                InlineKeyboardButton(
-                    "⭐" if d.id == active_dialog_id else "☆",
-                    callback_data=f"setactive:{d.id}"
-                )
-            ]
+        title = d.title or "Без имени"
+        name_row = [
+            InlineKeyboardButton(
+                text=f"🧾 {title}",
+                callback_data=f"noop:{d.id}"
+            )
         ]
-        keyboard.extend(row)
+        controls_row = [
+            InlineKeyboardButton("✏️", callback_data=f"rename:{d.id}"),
+            InlineKeyboardButton("🗑", callback_data=f"delete:{d.id}"),
+            InlineKeyboardButton("⭐" if d.id == active_dialog_id else "☆", callback_data=f"setactive:{d.id}")
+        ]
+        keyboard.append(name_row)
+        keyboard.append(controls_row)
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -45,22 +48,26 @@ async def handle_dialogs_menu_click(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
 
     data = query.data
+    repo: DialogsRepo = context.bot_data["repo_dialogs"]
+    user_id = update.effective_user.id
+
     if data.startswith("rename:"):
         dialog_id = int(data.split(":")[1])
         context.user_data["rename_dialog_id"] = dialog_id
-        await query.message.reply_text("Введите новое имя для диалога:", reply_markup={"force_reply": True})
+        await query.message.reply_text(
+            "Введите новое имя для диалога:",
+            reply_markup=ForceReply(selective=True)
+        )
 
     elif data.startswith("delete:"):
         dialog_id = int(data.split(":")[1])
-        repo: DialogsRepo = context.bot_data["repo_dialogs"]
         repo.delete_dialog(dialog_id)
         await query.message.reply_text("🗑 Диалог удалён.")
         await show_dialogs_menu(update, context)
 
     elif data.startswith("setactive:"):
         dialog_id = int(data.split(":")[1])
-        repo: DialogsRepo = context.bot_data["repo_dialogs"]
-        repo.set_active_dialog(update.effective_user.id, dialog_id)
+        repo.set_active_dialog(user_id, dialog_id)
         await query.message.reply_text("⭐ Активный диалог обновлён.")
         await show_dialogs_menu(update, context)
 
