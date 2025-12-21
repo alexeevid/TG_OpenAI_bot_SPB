@@ -15,9 +15,9 @@ class DialogsRepo:
     # ---------- users ----------
     def ensure_user(self, tg_id: str) -> User:
         with self.sf() as s:  # type: Session
-            u = s.execute(select(User).where(User.tg_id == tg_id)).scalars().first()
+            u = s.execute(select(User).where(User.tg_id == str(tg_id))).scalars().first()
             if not u:
-                u = User(tg_id=tg_id, role="user")
+                u = User(tg_id=str(tg_id), role="user")
                 s.add(u)
                 s.commit()
                 s.refresh(u)
@@ -25,7 +25,7 @@ class DialogsRepo:
 
     def get_user(self, tg_id: str) -> Optional[User]:
         with self.sf() as s:
-            return s.execute(select(User).where(User.tg_id == tg_id)).scalars().first()
+            return s.execute(select(User).where(User.tg_id == str(tg_id))).scalars().first()
 
     def set_active_dialog(self, user_id: int, dialog_id: int) -> None:
         with self.sf() as s:
@@ -89,15 +89,6 @@ class DialogsRepo:
             s.refresh(m)
             return m
 
-    def rename_dialog(self, dialog_id: int, new_title: str) -> None:
-        with self.sf() as s:
-            d = s.get(Dialog, dialog_id)
-            if not d:
-                return
-            d.title = new_title
-            s.commit()
-
-    
     def list_messages(self, dialog_id: int, limit: int = 30) -> List[Message]:
         with self.sf() as s:
             q = select(Message).where(Message.dialog_id == dialog_id).order_by(Message.id.desc()).limit(limit)
