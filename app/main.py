@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from telegram.ext import Application
-from sqlalchemy.sql import text  # ✅ гарантированно работает в обоих SQLAlchemy 1.x и 2.x
+from sqlalchemy.sql.expression import text  # ✅ ИМЕННО ЭТОТ ИМПОРТ
 
 # Настройки проекта
 from .settings import load_settings
@@ -40,8 +40,8 @@ from .handlers import (
     model,
     mode,
     dialogs,
-    status,         # ← новая команда /status
-    dialogs_menu,   # ← новое меню диалогов /menu
+    status,
+    dialogs_menu,
 )
 
 async def _post_init(app: Application) -> None:
@@ -127,7 +127,6 @@ def build_application() -> Application:
         "svc_syncer": syncer,
     })
 
-    # Регистрируем команды
     start.register(app)
     help.register(app)
     dialogs.register(app)
@@ -136,8 +135,8 @@ def build_application() -> Application:
     image.register(app)
     voice.register(app)
     text.register(app)
-    status.register(app)         # 🆕 /status
-    dialogs_menu.register(app)   # 🆕 /menu
+    status.register(app)
+    dialogs_menu.register(app)
 
     return app
 
