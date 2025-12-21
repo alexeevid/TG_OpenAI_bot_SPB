@@ -89,6 +89,15 @@ class DialogsRepo:
             s.refresh(m)
             return m
 
+    def rename_dialog(self, dialog_id: int, new_title: str) -> None:
+        with self.sf() as s:
+            d = s.get(Dialog, dialog_id)
+            if not d:
+                return
+            d.title = new_title
+            s.commit()
+
+    
     def list_messages(self, dialog_id: int, limit: int = 30) -> List[Message]:
         with self.sf() as s:
             q = select(Message).where(Message.dialog_id == dialog_id).order_by(Message.id.desc()).limit(limit)
