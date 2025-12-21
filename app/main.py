@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from telegram.ext import Application
-from sqlalchemy import text
+from sqlalchemy.sql import text
 
 # Настройки проекта
 from .settings import load_settings
