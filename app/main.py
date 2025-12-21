@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
+import sqlalchemy  # 👈 Импортируем весь модуль
 from telegram.ext import Application
-from sqlalchemy.sql.expression import text  # ✅ ИМЕННО ЭТОТ ИМПОРТ
 
 # Настройки проекта
 from .settings import load_settings
@@ -92,8 +92,8 @@ def build_application() -> Application:
     Base.metadata.create_all(bind=engine)
 
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
-        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
+        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
+        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
 
     repo_dialogs = DialogsRepo(session_factory)
     ds = DialogService(repo_dialogs)
