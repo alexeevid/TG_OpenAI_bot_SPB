@@ -3,48 +3,29 @@ from telegram.ext import ContextTypes, CallbackQueryHandler, CommandHandler
 from telegram.constants import ParseMode
 
 from app.db.repo_dialogs import DialogsRepo
-from datetime import datetime
 
-def format_dialog_title(dialog):
-    created_date = dialog.created_at.strftime("%Y-%m-%d") if dialog.created_at else "????-??-??"
-    title = dialog.title or "Без имени"
-    return f"{created_date}_{title}"
-
-def build_dialogs_menu(dialogs, active_dialog_id, offset=0, page_size=3):
+def build_dialogs_list_menu(dialogs, active_dialog_id):
     keyboard = []
-    page_dialogs = dialogs[offset:offset + page_size]
-
-    for d in page_dialogs:
-        title_row = [
-            InlineKeyboardButton(
-                text=format_dialog_title(d),
-                callback_data=f"noop:{d.id}"
-            )
-        ]
-        button_row = [
-            InlineKeyboardButton("✏️", callback_data=f"rename:{d.id}"),
-            InlineKeyboardButton("🗑", callback_data=f"delete:{d.id}"),
-            InlineKeyboardButton(
-                "⭐" if d.id == active_dialog_id else "☆",
-                callback_data=f"setactive:{d.id}"
-            )
-        ]
-        keyboard.append(title_row)
-        keyboard.append(button_row)
-
-    # Pagination controls
-    nav_buttons = []
-    if offset > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"page:{offset - page_size}"))
-    if offset + page_size < len(dialogs):
-        nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"page:{offset + page_size}"))
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-
+    for d in dialogs:
+        title = d.title or 'Без имени'
+        label = f"\u2705 {title}" if d.id == active_dialog_id else title
+        keyboard.append([
+            InlineKeyboardButton(text=label, callback_data=f"select:{d.id}")
+        ])
     return InlineKeyboardMarkup(keyboard)
 
 
-async def show_dialogs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, offset: int = 0) -> None:
+def build_dialog_options_menu(dialog_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Переименовать", callback_data=f"rename:{dialog_id}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{dialog_id}"),
+            InlineKeyboardButton("⭐ Сделать активным", callback_data=f"setactive:{dialog_id}")
+        ]
+    ])
+
+
+async def show_dialogs_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     repo: DialogsRepo = context.bot_data["repo_dialogs"]
     user_id = update.effective_user.id
     dialogs = repo.list_dialogs(user_id)
@@ -53,41 +34,40 @@ async def show_dialogs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("У вас пока нет диалогов.")
         return
 
-    dialogs.sort(key=lambda d: d.updated_at or d.created_at, reverse=True)
-    menu = build_dialogs_menu(dialogs, user.active_dialog_id if user else None, offset)
-    await update.message.reply_text("Ваши диалоги:", reply_markup=menu)
+    menu = build_dialogs_list_menu(dialogs, user.active_dialog_id if user else None)
+    await update.message.reply_text("Выберите диалог:", reply_markup=menu)
 
 
-async def handle_dialogs_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_dialogs_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    repo: DialogsRepo = context.bot_data["repo_dialogs"]
-    user_id = update.effective_user.id
+    if data.startswith("select:"):
+        dialog_id = int(data.split(":")[1])
+        context.user_data["selected_dialog_id"] = dialog_id
+        await query.message.reply_text("Что сделать с диалогом?", reply_markup=build_dialog_options_menu(dialog_id))
 
-    if data.startswith("rename:"):
+    elif data.startswith("rename:"):
         dialog_id = int(data.split(":")[1])
         context.user_data["rename_dialog_id"] = dialog_id
         await query.message.reply_text("Введите новое имя для диалога:", reply_markup={"force_reply": True})
 
     elif data.startswith("delete:"):
         dialog_id = int(data.split(":")[1])
+        repo: DialogsRepo = context.bot_data["repo_dialogs"]
         repo.delete_dialog(dialog_id)
         await query.message.reply_text("🗑 Диалог удалён.")
-        await show_dialogs_menu(update, context)
+        await show_dialogs_list(update, context)
 
     elif data.startswith("setactive:"):
         dialog_id = int(data.split(":")[1])
-        repo.set_active_dialog(user_id, dialog_id)
+        repo: DialogsRepo = context.bot_data["repo_dialogs"]
+        repo.set_active_dialog(update.effective_user.id, dialog_id)
         await query.message.reply_text("⭐ Активный диалог обновлён.")
-        await show_dialogs_menu(update, context)
-
-    elif data.startswith("page:"):
-        offset = int(data.split(":")[1])
-        await show_dialogs_menu(update, context, offset)
+        await show_dialogs_list(update, context)
 
 
 def register(app) -> None:
-    app.add_handler(CommandHandler("menu", show_dialogs_menu))
-    app.add_handler(CallbackQueryHandler(handle_dialogs_menu_click, pattern=r"^(rename|delete|setactive|noop|page):"))
+    app.add_handler(CommandHandler("menu", show_dialogs_list))
+    app.add_handler(CallbackQueryHandler(handle_dialogs_click, pattern=r"^(select|rename|delete|setactive):"))
