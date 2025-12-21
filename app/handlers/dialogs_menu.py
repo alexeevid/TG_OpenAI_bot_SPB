@@ -1,6 +1,6 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import ContextTypes, CallbackQueryHandler, CommandHandler  # ✅ добавлен CommandHandler
 
 from app.db.repo_dialogs import DialogsRepo
 
@@ -21,7 +21,7 @@ async def show_dialogs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("У вас пока нет диалогов.")
         return
 
-    menu = build_dialogs_menu([(d.id, d.title) for d in dialogs])
+    menu = build_dialogs_menu(dialogs)
     await update.message.reply_text("Выберите диалог для переименования:", reply_markup=menu)
 
 
@@ -37,30 +37,10 @@ async def handle_dialogs_menu_click(update: Update, context: ContextTypes.DEFAUL
 
     await query.message.reply_text(
         "Введите новое имя для диалога:",
-        reply_markup=ForceReply(selective=True)
+        reply_markup={"force_reply": True}
     )
-
-
-async def handle_rename_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-
-    dialog_id = context.user_data.pop("rename_dialog_id", None)
-    if not dialog_id:
-        return
-
-    new_title = update.message.text.strip()
-    if not new_title:
-        await update.message.reply_text("⚠️ Имя не может быть пустым.")
-        return
-
-    repo: DialogsRepo = context.bot_data["repo_dialogs"]
-    repo.rename_dialog(dialog_id, new_title)
-
-    await update.message.reply_text(f"✅ Диалог переименован в «{new_title}».")
 
 
 def register(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_dialogs_menu_click, pattern=r"^rename:\d+$"))
-    app.add_handler(app.command_handler("menu", show_dialogs_menu))
-    app.add_handler(MessageHandler(filters.REPLY & filters.TEXT, handle_rename_reply))
+    app.add_handler(CommandHandler("menu", show_dialogs_menu))  # ✅ исправлено
