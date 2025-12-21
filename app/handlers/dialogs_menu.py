@@ -1,14 +1,12 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import ContextTypes, CallbackQueryHandler, CommandHandler  # ✅ добавлен CommandHandler
-
+from telegram.ext import ContextTypes, CallbackQueryHandler, CommandHandler
 from app.db.repo_dialogs import DialogsRepo
 
 
-def build_dialogs_menu(dialogs: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+def build_dialogs_menu(dialogs: list) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(dialog_name or f"Диалог {dialog_id}", callback_data=f"rename:{dialog_id}")]
-        for dialog_id, dialog_name in dialogs
+        [InlineKeyboardButton(dialog.title or f"Диалог {dialog.id}", callback_data=f"rename:{dialog.id}")]
+        for dialog in dialogs
     ]
     return InlineKeyboardMarkup(buttons)
 
@@ -37,10 +35,12 @@ async def handle_dialogs_menu_click(update: Update, context: ContextTypes.DEFAUL
 
     await query.message.reply_text(
         "Введите новое имя для диалога:",
-        reply_markup={"force_reply": True}
+        reply_markup=None,
+        reply_to_message_id=query.message.message_id,
+        allow_sending_without_reply=True
     )
 
 
 def register(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_dialogs_menu_click, pattern=r"^rename:\d+$"))
-    app.add_handler(CommandHandler("menu", show_dialogs_menu))  # ✅ исправлено
+    app.add_handler(CommandHandler("menu", show_dialogs_menu))
