@@ -19,29 +19,30 @@ from .services.authz_service import AuthzService
 from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
-# База данных (SQLAlchemy)
+# База данных
 from .db.session import make_session_factory
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
 from .db.models import Base
 
-# Knowledge base components
+# База знаний
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
 from .kb.syncer import KBSyncer
 
 # Хендлеры
 from .handlers import (
-    start as h_start,
-    help as h_help,
-    voice as h_voice,
-    text as h_text,
-    image as h_image,
-    model as h_model,
-    mode as h_mode,
-    dialogs as h_dialogs
+    start,
+    help,
+    voice,
+    text,
+    image,
+    model,
+    mode,
+    dialogs,
+    status,         # ← новая команда /status
+    dialogs_menu,   # ← новое меню диалогов /menu
 )
-
 
 async def _post_init(app: Application) -> None:
     try:
@@ -56,15 +57,16 @@ async def _post_init(app: Application) -> None:
             ("mode", "Режим ответа: concise|detailed|mcwilliams"),
             ("img", "Сгенерировать изображение"),
             ("stats", "Статистика текущего диалога"),
-            ("kb", "Работа с базой знаний"),
-            ("update", "Обновить функциональность"),
+            ("kb", "Поиск по базе знаний"),
+            ("update", "Обновить базу знаний"),
             ("config", "Текущая конфигурация"),
             ("about", "О проекте"),
             ("feedback", "Оставить отзыв"),
+            ("status", "Сводка по текущему диалогу"),
+            ("menu", "Меню управления диалогами"),
         ])
     except Exception as e:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
-
 
 def build_application() -> Application:
     cfg = load_settings()
@@ -73,7 +75,6 @@ def build_application() -> Application:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    log = logging.getLogger(__name__)
 
     if not cfg.telegram_token:
         raise RuntimeError("telegram_token отсутствует в настройках")
@@ -90,7 +91,6 @@ def build_application() -> Application:
     session_factory, engine = make_session_factory(db_url)
     Base.metadata.create_all(bind=engine)
 
-    # Ensure new columns exist in legacy tables
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
@@ -98,19 +98,12 @@ def build_application() -> Application:
     repo_dialogs = DialogsRepo(session_factory)
     ds = DialogService(repo_dialogs)
 
-    if not cfg.openai_api_key:
-        log.warning("OPENAI_API_KEY пуст — генерация/транскрибирование не заработают")
-
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
     gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
 
-    img = None
-    if cfg.enable_image_generation:
-        img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model)
-
+    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if cfg.enable_image_generation else None
     vs = VoiceService(openai_client=oai_client)
 
-    # Initialize knowledge base and authorization services
     repo_kb = KBRepo(session_factory, getattr(cfg, "pgvector_dim", 3072))
     yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
     embedder = Embedder(oai_client, cfg.openai_embedding_model)
@@ -134,29 +127,19 @@ def build_application() -> Application:
         "svc_syncer": syncer,
     })
 
-    h_start.register(app)
-    h_help.register(app)
-    h_dialogs.register(app)
-    h_model.register(app)
-    h_mode.register(app)
-    h_image.register(app)
-    h_voice.register(app)
-    h_text.register(app)
-
-    # Новые хендлеры (дополнительная функциональность)
-    try:
-        from .handlers import stats as h_stats, kb as h_kb, config as h_config, update as h_update, about as h_about, feedback as h_feedback
-        h_stats.register(app)
-        h_kb.register(app)
-        h_config.register(app)
-        h_update.register(app)
-        h_about.register(app)
-        h_feedback.register(app)
-    except ImportError as e:
-        log.warning("Дополнительные хендлеры не загружены: %s", e)
+    # Регистрируем команды
+    start.register(app)
+    help.register(app)
+    dialogs.register(app)
+    model.register(app)
+    mode.register(app)
+    image.register(app)
+    voice.register(app)
+    text.register(app)
+    status.register(app)         # 🆕 /status
+    dialogs_menu.register(app)   # 🆕 /menu
 
     return app
-
 
 def run() -> None:
     app = build_application()
