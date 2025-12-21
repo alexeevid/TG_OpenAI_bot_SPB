@@ -1,6 +1,6 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.constants import ParseMode
-from telegram.ext import ContextTypes, CallbackQueryHandler
+from telegram.ext import ContextTypes, CallbackQueryHandler, CommandHandler
 
 from app.db.repo_dialogs import DialogsRepo
 
@@ -37,10 +37,10 @@ async def handle_dialogs_menu_click(update: Update, context: ContextTypes.DEFAUL
 
     await query.message.reply_text(
         "Введите новое имя для диалога:",
-        reply_markup={"force_reply": True}
+        reply_markup=ForceReply(selective=True)
     )
 
 
 def register(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_dialogs_menu_click, pattern=r"^rename:\d+$"))
-    app.add_handler(app.command_handler("menu", show_dialogs_menu))
+    app.add_handler(CommandHandler("menu", show_dialogs_menu))
