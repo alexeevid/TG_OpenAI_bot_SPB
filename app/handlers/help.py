@@ -1,5 +1,6 @@
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+
 from ..services.authz_service import AuthzService
 
 HELP_TEXT = (
@@ -7,10 +8,9 @@ HELP_TEXT = (
     "/start — начать работу\n"
     "/help — справка по командам\n"
     "/reset — начать новый диалог\n"
-    "/dialogs — список текстом\n"
-    "/dialog <id> — переключить диалог\n"
-    "/menu — меню управления диалогами\n"
+    "/dialogs — управление диалогами (выбор / удаление / переименование)\n"
     "/status — информация о текущем диалоге\n"
+    "/stats — то же, что /status (если привычнее)\n"
     "/model — выбрать модель\n"
     "/mode — выбрать стиль ответа\n"
     "/img <описание> — сгенерировать изображение\n"
