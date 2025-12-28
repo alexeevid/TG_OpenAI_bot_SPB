@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import logging
-import sqlalchemy  # 👈 Импортируем весь модуль
+import sqlalchemy
 from telegram.ext import Application
 
-# Настройки проекта
 from .settings import load_settings
 
 # Сервисы
@@ -19,12 +18,13 @@ from .services.authz_service import AuthzService
 from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
-# Репозитории
-from .db.session import make_session_factory, init_db
+# База данных
+from .db.session import make_session_factory
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
+from .db.models import Base
 
-# KB
+# База знаний
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
 from .kb.syncer import KBSyncer
@@ -40,23 +40,31 @@ from .handlers import (
     mode,
     dialogs,
     status,
-    # dialogs_menu (removed),
+    # dialogs_menu  # REMOVED
 )
 
 async def _post_init(app: Application) -> None:
+    """
+    Публичные команды бота в Telegram UI.
+    По требованию: оставляем только одну команду управления диалогами (/dialogs),
+    убираем /menu из списка команд.
+    """
     try:
         await app.bot.delete_my_commands()
         await app.bot.set_my_commands([
             ("start", "Приветствие и инициализация"),
             ("help", "Справка по командам"),
-            ("dialogs", "Управление диалогами"),
             ("reset", "Новый диалог"),
-            ("status", "Сводка по текущему диалогу"),
+            ("dialogs", "Управление диалогами"),
             ("model", "Выбрать модель"),
-            ("mode", "Выбрать стиль ответа"),
+            ("mode", "Режим ответа"),
+            ("img", "Сгенерировать изображение"),
+            ("status", "Сводка по текущему диалогу"),
             ("kb", "Поиск по базе знаний"),
             ("update", "Обновить базу знаний"),
-            ("img", "Сгенерировать изображение"),
+            ("config", "Текущая конфигурация"),
+            ("about", "О проекте"),
+            ("feedback", "Оставить отзыв"),
         ])
     except Exception as e:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
@@ -70,29 +78,41 @@ def build_application() -> Application:
     )
 
     if not cfg.telegram_token:
-        raise RuntimeError("TELEGRAM_TOKEN is not set")
+        raise RuntimeError("telegram_token отсутствует в настройках")
 
-    sf = make_session_factory(cfg.database_url)
-    init_db(sf)
+    app = Application.builder() \
+        .token(cfg.telegram_token) \
+        .post_init(_post_init) \
+        .build()
 
-    repo_dialogs = DialogsRepo(sf)
-    repo_kb = KBRepo(sf)
+    db_url = cfg.database_url
+    if not db_url:
+        raise RuntimeError("DATABASE_URL отсутствует в настройках")
 
-    oai_client = OpenAIClient(cfg)
-    yd = YandexDiskClient(cfg)
+    session_factory, engine = make_session_factory(db_url)
+    Base.metadata.create_all(bind=engine)
 
+    # Совместимость со старой схемой
+    with engine.begin() as conn:
+        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
+        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
+
+    repo_dialogs = DialogsRepo(session_factory)
     ds = DialogService(repo_dialogs)
-    gen = GenService(oai_client, cfg)
-    img = ImageService(oai_client, cfg)
-    vs = VoiceService(oai_client, cfg)
 
+    oai_client = OpenAIClient(api_key=cfg.openai_api_key)
+    gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
+
+    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if cfg.enable_image_generation else None
+    vs = VoiceService(openai_client=oai_client)
+
+    repo_kb = KBRepo(session_factory, getattr(cfg, "pgvector_dim", 3072))
+    yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
     embedder = Embedder(oai_client, cfg.openai_embedding_model)
     retriever = Retriever(repo_kb, oai_client, getattr(cfg, "pgvector_dim", 3072))
     rag = RagService(retriever)
     authz = AuthzService(cfg)
     syncer = KBSyncer(yd, embedder, repo_kb, cfg)
-
-    app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
 
     app.bot_data.update({
         "settings": cfg,
@@ -111,13 +131,19 @@ def build_application() -> Application:
 
     start.register(app)
     help.register(app)
+
+    # ВАЖНО: dialogs.register(app) должен быть до text.register(app),
+    # чтобы ConversationHandler (переименование) отрабатывал корректно.
     dialogs.register(app)
+
     model.register(app)
     mode.register(app)
     image.register(app)
     voice.register(app)
     text.register(app)
     status.register(app)
+
+    # dialogs_menu.register(app)  # REMOVED
 
     return app
 
