@@ -19,13 +19,12 @@ from .services.authz_service import AuthzService
 from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
-# База данных
-from .db.session import make_session_factory
+# Репозитории
+from .db.session import make_session_factory, init_db
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
-from .db.models import Base
 
-# База знаний
+# KB
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
 from .kb.syncer import KBSyncer
@@ -41,7 +40,7 @@ from .handlers import (
     mode,
     dialogs,
     status,
-    dialogs_menu,
+    # dialogs_menu (removed),
 )
 
 async def _post_init(app: Application) -> None:
@@ -50,20 +49,14 @@ async def _post_init(app: Application) -> None:
         await app.bot.set_my_commands([
             ("start", "Приветствие и инициализация"),
             ("help", "Справка по командам"),
+            ("dialogs", "Управление диалогами"),
             ("reset", "Новый диалог"),
-            ("dialogs", "Список диалогов"),
-            ("dialog", "Переключить диалог: /dialog <id>"),
-            ("model", "Выбрать модель: /model <название>"),
-            ("mode", "Режим ответа: concise|detailed|mcwilliams"),
-            ("img", "Сгенерировать изображение"),
-            ("stats", "Статистика текущего диалога"),
+            ("status", "Сводка по текущему диалогу"),
+            ("model", "Выбрать модель"),
+            ("mode", "Выбрать стиль ответа"),
             ("kb", "Поиск по базе знаний"),
             ("update", "Обновить базу знаний"),
-            ("config", "Текущая конфигурация"),
-            ("about", "О проекте"),
-            ("feedback", "Оставить отзыв"),
-            ("status", "Сводка по текущему диалогу"),
-            ("menu", "Меню управления диалогами"),
+            ("img", "Сгенерировать изображение"),
         ])
     except Exception as e:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
@@ -77,40 +70,29 @@ def build_application() -> Application:
     )
 
     if not cfg.telegram_token:
-        raise RuntimeError("telegram_token отсутствует в настройках")
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
 
-    app = Application.builder() \
-        .token(cfg.telegram_token) \
-        .post_init(_post_init) \
-        .build()
+    sf = make_session_factory(cfg.database_url)
+    init_db(sf)
 
-    db_url = cfg.database_url
-    if not db_url:
-        raise RuntimeError("DATABASE_URL отсутствует в настройках")
+    repo_dialogs = DialogsRepo(sf)
+    repo_kb = KBRepo(sf)
 
-    session_factory, engine = make_session_factory(db_url)
-    Base.metadata.create_all(bind=engine)
+    oai_client = OpenAIClient(cfg)
+    yd = YandexDiskClient(cfg)
 
-    with engine.begin() as conn:
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
-
-    repo_dialogs = DialogsRepo(session_factory)
     ds = DialogService(repo_dialogs)
+    gen = GenService(oai_client, cfg)
+    img = ImageService(oai_client, cfg)
+    vs = VoiceService(oai_client, cfg)
 
-    oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-    gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
-
-    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if cfg.enable_image_generation else None
-    vs = VoiceService(openai_client=oai_client)
-
-    repo_kb = KBRepo(session_factory, getattr(cfg, "pgvector_dim", 3072))
-    yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
     embedder = Embedder(oai_client, cfg.openai_embedding_model)
     retriever = Retriever(repo_kb, oai_client, getattr(cfg, "pgvector_dim", 3072))
     rag = RagService(retriever)
     authz = AuthzService(cfg)
     syncer = KBSyncer(yd, embedder, repo_kb, cfg)
+
+    app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
 
     app.bot_data.update({
         "settings": cfg,
@@ -136,7 +118,6 @@ def build_application() -> Application:
     voice.register(app)
     text.register(app)
     status.register(app)
-    dialogs_menu.register(app)
 
     return app
 
