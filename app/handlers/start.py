@@ -1,12 +1,13 @@
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from ..services.dialog_service import DialogService
+
 from ..services.authz_service import AuthzService
+from ..services.dialog_service import DialogService
 
 WELCOME = (
     "👋 *Готово. Я на связи.*\n\n"
     "📍 Команды:\n"
-    "/menu — меню управления диалогами\n"
+    "/dialogs — управление диалогами\n"
     "/status — текущая конфигурация\n"
     "/model — выбрать модель\n"
     "/mode — выбрать стиль ответа\n"
