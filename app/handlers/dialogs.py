@@ -20,8 +20,7 @@ from ..services.authz_service import AuthzService
 from ..services.dialog_service import DialogService
 
 STATE_RENAME = 1
-
-SHOW_LIMIT = 5  # последние 5 по updated_at desc
+SHOW_LIMIT = 5
 
 CB_OPEN = "dlg:open"
 CB_RENAME = "dlg:rename"
@@ -47,10 +46,6 @@ def _parse_cb(data: str) -> Tuple[str, Optional[int]]:
     return data, None
 
 
-def _best_dt(d):
-    return getattr(d, "created_at", None) or getattr(d, "updated_at", None)
-
-
 def _fmt_dt(dt) -> str:
     if not dt:
         return "—"
@@ -60,14 +55,14 @@ def _fmt_dt(dt) -> str:
         return "—"
 
 
-def _date_prefix(d) -> str:
-    dt = _best_dt(d)
+def _prefix_from_created(d) -> Optional[str]:
+    dt = getattr(d, "created_at", None)
     if not dt:
-        return "—"
+        return None
     try:
         return dt.strftime("%Y-%m-%d")
     except Exception:
-        return "—"
+        return None
 
 
 def _truncate(s: str, n: int = 60) -> str:
@@ -77,41 +72,55 @@ def _truncate(s: str, n: int = 60) -> str:
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 
+def _ensure_mask_for_storage(d, user_part: str) -> str:
+    """
+    Сохраняем title в БД строго как YYYY-MM-DD_<user_part>.
+    Если created_at отсутствует (старые данные) — сохраняем как есть.
+    """
+    user_part = (user_part or "").strip()
+    if not user_part:
+        user_part = "Диалог"
+
+    prefix = _prefix_from_created(d)
+    if not prefix:
+        return user_part[:80]
+
+    # Если пользователь уже ввёл с префиксом — не дублируем
+    if len(user_part) >= 11 and user_part[:10] == prefix and user_part[10:11] == "_":
+        return user_part[:80]
+
+    return f"{prefix}_{user_part}"[:80]
+
+
 def _display_title(d) -> str:
     """
-    Отображение имени: YYYY-MM-DD_<title>.
-    Если даты нет — "<title>" без префикса (чтобы не было 0000-00-00).
+    Отображение имени:
+    - если в БД уже хранится YYYY-MM-DD_... — показываем как есть
+    - если created_at есть, но title без префикса — показываем с префиксом
+    - если created_at нет — показываем title как есть
     """
     raw = (getattr(d, "title", "") or "").strip()
-    title = _truncate(raw, 60)
 
-    prefix = _date_prefix(d)
-    if prefix == "—":
-        return title
+    prefix = _prefix_from_created(d)
+    if prefix and raw:
+        if len(raw) >= 11 and raw[:10] == prefix and raw[10:11] == "_":
+            return _truncate(raw, 80)
+        return f"{prefix}_{_truncate(raw, 60)}"
 
-    # если уже хранится "YYYY-MM-DD_..." — не дублируем
-    if raw and len(raw) >= 11 and raw[:10] == prefix and raw[10:11] == "_":
-        return _truncate(raw, 80)
+    if prefix and not raw:
+        return f"{prefix}_Диалог"
 
-    return f"{prefix}_{title}"
+    return _truncate(raw, 80) if raw else "Диалог"
 
 
 def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
-    """
-    Как договаривались:
-    1) строка на всю ширину: "✅ 59: 2025-12-29_Раз"
-    2) под ней две кнопки: переименовать / удалить
-    """
     kb: List[List[InlineKeyboardButton]] = []
 
     for d in dialogs:
         is_active = bool(active_id and d.id == active_id)
-        mark = "✅ " if is_active else ""
-        title = _display_title(d)
-
         kb.append([
             InlineKeyboardButton(
-                text=f"{mark}{d.id}: {title}",
+                text=("✅ Активный" if is_active else "Выбрать") + f" #{d.id}",
                 callback_data=f"{CB_OPEN}:{d.id}",
             )
         ])
@@ -125,7 +134,6 @@ def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔄 Обновить", callback_data=f"{CB_REFRESH}:0"),
     ])
     kb.append([InlineKeyboardButton("Закрыть", callback_data=f"{CB_CLOSE}:0")])
-
     return InlineKeyboardMarkup(kb)
 
 
@@ -158,10 +166,20 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
             await update.callback_query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
-    # Убираем список сверху (как вы просили раньше): оставляем только заголовок.
-    text = "<b>Диалоги (последние 5)</b>\n"
-    text += f"Активный: <b>{escape(str(active_id))}</b>" if active_id else "Активный: <i>не выбран</i>"
+    # ВАЖНО: список выводим в тексте (левое выравнивание гарантировано)
+    lines = ["<b>Диалоги (последние 5)</b>"]
+    lines.append(f"Активный: <b>{escape(str(active_id))}</b>" if active_id else "Активный: <i>не выбран</i>")
+    lines.append("")
 
+    for d in dialogs:
+        mark = "✅" if active_id and d.id == active_id else "•"
+        title = escape(_display_title(d))
+        created_s = escape(_fmt_dt(getattr(d, "created_at", None)))
+        updated_s = escape(_fmt_dt(getattr(d, "updated_at", None)))
+        lines.append(f"{mark} <b>{d.id}</b> — {title}")
+        lines.append(f"<i>   создан:</i> <code>{created_s}</code>   <i>изм.:</i> <code>{updated_s}</code>")
+
+    text = "\n".join(lines)
     kb = _build_keyboard(dialogs, active_id)
 
     if update.callback_query and edit:
@@ -199,7 +217,7 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == CB_NEW:
-        ds.new_dialog(update.effective_user.id, title="")
+        ds.new_dialog(update.effective_user.id, title="Диалог")
         await _render(update, context, edit=True)
         return
 
@@ -244,11 +262,7 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == CB_RENAME:
         context.user_data["rename_dialog_id"] = did
-        # без Markdown, чтобы не падало на символах
-        await q.message.reply_text(
-            "Введите новое имя диалога (только пользовательская часть).",
-            parse_mode=ParseMode.HTML,
-        )
+        await q.message.reply_text("Введите новое имя диалога (только пользовательская часть).")
         return STATE_RENAME
 
 
@@ -277,10 +291,11 @@ async def rename_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("rename_dialog_id", None)
         return ConversationHandler.END
 
-    repo.rename_dialog(int(did), raw)
-    context.user_data.pop("rename_dialog_id", None)
+    title_to_store = _ensure_mask_for_storage(d, raw)
+    repo.rename_dialog(int(did), title_to_store)
 
-    await update.message.reply_text("✏️ Название обновлено.")
+    context.user_data.pop("rename_dialog_id", None)
+    await update.message.reply_text(f"✅ Диалог переименован: {escape(title_to_store)}", parse_mode=ParseMode.HTML)
     await _render(update, context, edit=False)
     return ConversationHandler.END
 
