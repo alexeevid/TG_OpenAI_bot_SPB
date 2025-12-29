@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
+from sqlalchemy import select, desc
 
-from .models import Dialog, Message, User
+from .models import User, Dialog, Message
 
 
 class DialogsRepo:
@@ -46,12 +46,7 @@ class DialogsRepo:
 
     def list_dialogs(self, user_id: int, limit: int = 20) -> List[Dialog]:
         with self.sf() as s:
-            q = (
-                select(Dialog)
-                .where(Dialog.user_id == user_id)
-                .order_by(desc(Dialog.updated_at))
-                .limit(limit)
-            )
+            q = select(Dialog).where(Dialog.user_id == user_id).order_by(desc(Dialog.updated_at)).limit(limit)
             return list(s.execute(q).scalars().all())
 
     def get_dialog_for_user(self, dialog_id: int, user_id: int) -> Optional[Dialog]:
@@ -82,7 +77,6 @@ class DialogsRepo:
             return d
 
     def rename_dialog(self, dialog_id: int, title: str) -> Optional[Dialog]:
-        """Переименовать диалог (title может быть пустым)."""
         with self.sf() as s:
             d = s.get(Dialog, dialog_id)
             if not d:
@@ -93,13 +87,13 @@ class DialogsRepo:
             return d
 
     def delete_dialog(self, dialog_id: int) -> None:
-        """Удалить диалог и все его сообщения (cascade)."""
+        # Удаление диалога каскадом удалит messages благодаря cascade в модели
         with self.sf() as s:
             d = s.get(Dialog, dialog_id)
             if not d:
                 return
 
-            # Если у пользователя активный удаляемый диалог — сбрасываем активный
+            # сброс активного диалога, если удаляем активный
             u = s.get(User, d.user_id)
             if u and u.active_dialog_id == dialog_id:
                 u.active_dialog_id = None
@@ -112,10 +106,10 @@ class DialogsRepo:
         with self.sf() as s:
             m = Message(dialog_id=dialog_id, role=role, content=content)
             s.add(m)
-            # Touch dialog to update updated_at (onupdate should handle, но оставляем совместимость)
+            # Touch dialog to update updated_at
             d = s.get(Dialog, dialog_id)
             if d:
-                d.updated_at = d.updated_at  # no-op
+                d.updated_at = d.updated_at  # no-op, onupdate=func.now() сработает на UPDATE
             s.commit()
             s.refresh(m)
             return m
