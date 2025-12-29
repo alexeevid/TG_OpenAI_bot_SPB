@@ -75,7 +75,7 @@ def _truncate(s: str, n: int = 60) -> str:
 def _ensure_mask_for_storage(d, user_part: str) -> str:
     """
     Сохраняем title в БД строго как YYYY-MM-DD_<user_part>.
-    Если created_at отсутствует (старые данные) — сохраняем как есть.
+    Если created_at отсутствует — сохраняем просто user_part (без даты).
     """
     user_part = (user_part or "").strip()
     if not user_part:
@@ -85,7 +85,7 @@ def _ensure_mask_for_storage(d, user_part: str) -> str:
     if not prefix:
         return user_part[:80]
 
-    # Если пользователь уже ввёл с префиксом — не дублируем
+    # если уже "YYYY-MM-DD_..." — не дублируем
     if len(user_part) >= 11 and user_part[:10] == prefix and user_part[10:11] == "_":
         return user_part[:80]
 
@@ -94,14 +94,14 @@ def _ensure_mask_for_storage(d, user_part: str) -> str:
 
 def _display_title(d) -> str:
     """
-    Отображение имени:
+    Отображение:
     - если в БД уже хранится YYYY-MM-DD_... — показываем как есть
     - если created_at есть, но title без префикса — показываем с префиксом
     - если created_at нет — показываем title как есть
     """
     raw = (getattr(d, "title", "") or "").strip()
-
     prefix = _prefix_from_created(d)
+
     if prefix and raw:
         if len(raw) >= 11 and raw[:10] == prefix and raw[10:11] == "_":
             return _truncate(raw, 80)
@@ -114,19 +114,29 @@ def _display_title(d) -> str:
 
 
 def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
+    """
+    Вариант 1:
+    - Имена/даты только в тексте (слева)
+    - Под каждым диалогом — компактные кнопки [Выбрать] [✏️] [🗑]
+    """
     kb: List[List[InlineKeyboardButton]] = []
 
     for d in dialogs:
         is_active = bool(active_id and d.id == active_id)
+
         kb.append([
             InlineKeyboardButton(
-                text=("✅ Активный" if is_active else "Выбрать") + f" #{d.id}",
+                text=("✅ Активный" if is_active else "Выбрать"),
                 callback_data=f"{CB_OPEN}:{d.id}",
-            )
-        ])
-        kb.append([
-            InlineKeyboardButton("✏️ Переименовать", callback_data=f"{CB_RENAME}:{d.id}"),
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"{CB_DELETE}:{d.id}"),
+            ),
+            InlineKeyboardButton(
+                text="✏️",
+                callback_data=f"{CB_RENAME}:{d.id}",
+            ),
+            InlineKeyboardButton(
+                text="🗑",
+                callback_data=f"{CB_DELETE}:{d.id}",
+            ),
         ])
 
     kb.append([
@@ -166,7 +176,7 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
             await update.callback_query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
-    # ВАЖНО: список выводим в тексте (левое выравнивание гарантировано)
+    # Список слева — как вы хотите
     lines = ["<b>Диалоги (последние 5)</b>"]
     lines.append(f"Активный: <b>{escape(str(active_id))}</b>" if active_id else "Активный: <i>не выбран</i>")
     lines.append("")
@@ -176,10 +186,12 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
         title = escape(_display_title(d))
         created_s = escape(_fmt_dt(getattr(d, "created_at", None)))
         updated_s = escape(_fmt_dt(getattr(d, "updated_at", None)))
+
         lines.append(f"{mark} <b>{d.id}</b> — {title}")
         lines.append(f"<i>   создан:</i> <code>{created_s}</code>   <i>изм.:</i> <code>{updated_s}</code>")
+        lines.append("")  # визуальный разделитель
 
-    text = "\n".join(lines)
+    text = "\n".join(lines).rstrip()
     kb = _build_keyboard(dialogs, active_id)
 
     if update.callback_query and edit:
@@ -217,6 +229,7 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == CB_NEW:
+        # создаём диалог с базовым названием; префикс даты будет в отображении
         ds.new_dialog(update.effective_user.id, title="Диалог")
         await _render(update, context, edit=True)
         return
