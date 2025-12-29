@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
-import sqlalchemy
+import sqlalchemy  # 👈 Импортируем весь модуль
 from telegram.ext import Application
 
+# Настройки проекта
 from .settings import load_settings
 
 # Сервисы
@@ -40,31 +41,26 @@ from .handlers import (
     mode,
     dialogs,
     status,
-    # dialogs_menu  # REMOVED
 )
 
 async def _post_init(app: Application) -> None:
-    """
-    Публичные команды бота в Telegram UI.
-    По требованию: оставляем только одну команду управления диалогами (/dialogs),
-    убираем /menu из списка команд.
-    """
     try:
         await app.bot.delete_my_commands()
         await app.bot.set_my_commands([
             ("start", "Приветствие и инициализация"),
             ("help", "Справка по командам"),
-            ("reset", "Новый диалог"),
+            # Управление диалогами — только через /dialogs (без отдельного меню).
             ("dialogs", "Управление диалогами"),
-            ("model", "Выбрать модель"),
-            ("mode", "Режим ответа"),
+            ("model", "Выбрать модель: /model <название>"),
+            ("mode", "Режим ответа: concise|detailed|mcwilliams"),
             ("img", "Сгенерировать изображение"),
-            ("status", "Сводка по текущему диалогу"),
+            ("stats", "Статистика текущего диалога"),
             ("kb", "Поиск по базе знаний"),
             ("update", "Обновить базу знаний"),
             ("config", "Текущая конфигурация"),
             ("about", "О проекте"),
             ("feedback", "Оставить отзыв"),
+            ("status", "Сводка по текущему диалогу"),
         ])
     except Exception as e:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
@@ -92,7 +88,6 @@ def build_application() -> Application:
     session_factory, engine = make_session_factory(db_url)
     Base.metadata.create_all(bind=engine)
 
-    # Совместимость со старой схемой
     with engine.begin() as conn:
         conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
@@ -132,8 +127,8 @@ def build_application() -> Application:
     start.register(app)
     help.register(app)
 
-    # ВАЖНО: dialogs.register(app) должен быть до text.register(app),
-    # чтобы ConversationHandler (переименование) отрабатывал корректно.
+    # ВАЖНО: dialogs.register(app) должен быть ДО text.register(app),
+    # чтобы ConversationHandler переименования не конфликтовал с текстовым хендлером.
     dialogs.register(app)
 
     model.register(app)
@@ -142,8 +137,6 @@ def build_application() -> Application:
     voice.register(app)
     text.register(app)
     status.register(app)
-
-    # dialogs_menu.register(app)  # REMOVED
 
     return app
 
