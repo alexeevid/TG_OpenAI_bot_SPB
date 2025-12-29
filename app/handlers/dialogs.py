@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from telegram import (
@@ -25,7 +24,7 @@ from ..services.dialog_service import DialogService
 
 STATE_RENAME = 1
 
-PAGE_SIZE = 8  # компактно, чтобы не «обрезало» экран
+PAGE_SIZE = 8  # чтобы не “съедало” экран
 
 CB_PAGE = "dlg:page"
 CB_OPEN = "dlg:open"
@@ -38,24 +37,22 @@ CB_CLOSE = "dlg:close"
 CB_CANCEL = "dlg:cancel"
 
 
-def _short(s: str, n: int = 26) -> str:
+def _fmt_date_prefix(dt) -> str:
+    """YYYY-MM-DD по created_at; если dt нет — '0000-00-00'."""
+    try:
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return "0000-00-00"
+
+
+def _short(s: str, n: int = 42) -> str:
     s = (s or "").strip()
     if not s:
-        return "(без названия)"
+        return "Диалог"
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 
-def _fmt_dt(dt) -> str:
-    # dt — обычно naive datetime из БД
-    try:
-        return dt.strftime("%d.%m %H:%M")
-    except Exception:
-        return "-"
-
-
 def _parse_cb(data: str) -> Tuple[str, Optional[int]]:
-    # формат: prefix[:id]
-    # примеры: dlg:open:59, dlg:page:1
     parts = (data or "").split(":")
     if len(parts) >= 2 and parts[0] == "dlg":
         action = ":".join(parts[:2])  # dlg:open
@@ -69,26 +66,72 @@ def _parse_cb(data: str) -> Tuple[str, Optional[int]]:
     return data, None
 
 
+def _display_title(d) -> str:
+    """
+    UI-имя диалога: YYYY-MM-DD_<Название>.
+    Если title пустой — YYYY-MM-DD_Диалог
+    """
+    prefix = _fmt_date_prefix(getattr(d, "created_at", None))
+    base = _short(getattr(d, "title", "") or "", n=48)
+    return f"{prefix}_{base}"
+
+
+def _normalize_title_for_storage(d, user_input: str) -> str:
+    """
+    Хранение title: всегда YYYY-MM-DD_<имя>.
+    Если пользователь ввёл уже с префиксом даты — не дублируем.
+    """
+    prefix = _fmt_date_prefix(getattr(d, "created_at", None))
+    name = (user_input or "").strip()
+
+    # Разрешаем “очистить” имя: тогда будет YYYY-MM-DD_Диалог
+    if not name:
+        return ""
+
+    # Если пользователь сам ввёл YYYY-MM-DD_..., оставляем как есть
+    if len(name) >= 11 and name[:10] == prefix and name[10:11] == "_":
+        # но ограничим длину хранения
+        return name[:80]
+
+    # Иначе добавляем префикс
+    return f"{prefix}_{name}"[:80]
+
+
 def _build_keyboard(dialogs, active_id: Optional[int], page: int, pages: int) -> InlineKeyboardMarkup:
     kb: List[List[InlineKeyboardButton]] = []
 
     for d in dialogs:
-        mark = "✅ " if active_id and d.id == active_id else ""
-        title = _short(getattr(d, "title", "") or "")
-        kb.append(
-            [
-                InlineKeyboardButton(text=f"{mark}{d.id}: {title}", callback_data=f"{CB_OPEN}:{d.id}"),
-                InlineKeyboardButton(text="✏️", callback_data=f"{CB_RENAME}:{d.id}"),
-                InlineKeyboardButton(text="🗑", callback_data=f"{CB_DELETE}:{d.id}"),
-            ]
-        )
+        is_active = bool(active_id and d.id == active_id)
+        mark = "✅ " if is_active else ""
+        title = _display_title(d)
 
+        # 1-я строка: выбор диалога на всю ширину
+        kb.append([
+            InlineKeyboardButton(
+                text=f"{mark}{d.id}: {title}",
+                callback_data=f"{CB_OPEN}:{d.id}",
+            )
+        ])
+
+        # 2-я строка: действия
+        kb.append([
+            InlineKeyboardButton(text="✏️ Переименовать", callback_data=f"{CB_RENAME}:{d.id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"{CB_DELETE}:{d.id}"),
+        ])
+
+    # Навигация/действия снизу
     nav: List[InlineKeyboardButton] = []
     if pages > 1:
         nav.append(
             InlineKeyboardButton(
                 text="⏮" if page > 0 else "·",
                 callback_data=f"{CB_PAGE}:{page-1}" if page > 0 else f"{CB_REFRESH}:0",
+            )
+        )
+        nav.append(
+            InlineKeyboardButton(
+                text=f"{page+1}/{pages}",
+                callback_data=f"{CB_REFRESH}:0",
             )
         )
         nav.append(
@@ -120,13 +163,12 @@ async def _render_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
             await update.message.reply_text("⚠️ Сервис диалогов не настроен.")
         return
 
-    # Достаём пользователя и активный диалог через repo (чтобы иметь user_id)
     u = repo.ensure_user(str(update.effective_user.id))
     dialogs_all = repo.list_dialogs(u.id, limit=200)
 
     if not dialogs_all:
         if update.message:
-            await update.message.reply_text("Диалогов пока нет. Используйте ➕ Новый или /reset для создания.")
+            await update.message.reply_text("Диалогов пока нет. Нажмите ➕ Новый или используйте /reset.")
         return
 
     active = repo.get_active_dialog(u.id)
@@ -139,17 +181,11 @@ async def _render_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
     start = page * PAGE_SIZE
     dialogs = dialogs_all[start : start + PAGE_SIZE]
 
-    # Текст — компактный, но информативный
-    header = f"*Диалоги*  (стр. {page+1}/{pages})\n"
-    lines = []
-    for d in dialogs:
-        title = (getattr(d, "title", "") or "").strip() or "(без названия)"
-        mark = "✅" if active_id and d.id == active_id else "•"
-        lines.append(
-            f"{mark} *{d.id}* — {title}\n"
-            f"   _создан:_ `{_fmt_dt(getattr(d, 'created_at', None))}`  _изм.:_ `{_fmt_dt(getattr(d, 'updated_at', None))}`"
-        )
-    text = header + "\n".join(lines)
+    # ВАЖНО: убрали верхний дублирующий список — оставляем только заголовок
+    if active_id:
+        text = f"*Диалоги* (стр. {page+1}/{pages})\nАктивный: *{active_id}*"
+    else:
+        text = f"*Диалоги* (стр. {page+1}/{pages})\nАктивный: _не выбран_"
 
     kb = _build_keyboard(dialogs, active_id, page, pages)
 
@@ -160,7 +196,6 @@ async def _render_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE, *,
 
 
 async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Единственная команда управления диалогами
     await _render_dialogs(update, context, page=0, edit=False)
 
 
@@ -203,7 +238,6 @@ async def _cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _render_dialogs(update, context, page=int(context.user_data.get("dialogs_page", 0) or 0), edit=True)
         return
 
-    # Защита: доступ только к своим диалогам
     d = repo.get_dialog_for_user(dialog_id, u.id)
     if not d:
         await query.message.reply_text("⛔ Диалог не найден или недоступен.")
@@ -212,35 +246,38 @@ async def _cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == CB_OPEN:
         repo.set_active_dialog(u.id, dialog_id)
         await query.message.reply_text(f"⭐ Активный диалог: {dialog_id}")
-        await _render_dialogs(update, context, page=int(context.user_data.get('dialogs_page', 0) or 0), edit=True)
+        await _render_dialogs(update, context, page=int(context.user_data.get("dialogs_page", 0) or 0), edit=True)
         return
 
     if action == CB_DELETE:
-        # Подтверждение удаления
-        title = (d.title or "").strip() or "(без названия)"
+        title_ui = _display_title(d)
         kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(text="✅ Удалить", callback_data=f"{CB_DELETE_OK}:{dialog_id}"),
-                    InlineKeyboardButton(text="↩️ Отмена", callback_data=f"{CB_CANCEL}:0"),
-                ]
-            ]
+            [[
+                InlineKeyboardButton(text="✅ Удалить", callback_data=f"{CB_DELETE_OK}:{dialog_id}"),
+                InlineKeyboardButton(text="↩️ Отмена", callback_data=f"{CB_CANCEL}:0"),
+            ]]
         )
-        await query.message.reply_text(f"Удалить диалог *{dialog_id}* — {title}?", reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        await query.message.reply_text(
+            f"Удалить диалог *{dialog_id}*?\n_{title_ui}_",
+            reply_markup=kb,
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     if action == CB_DELETE_OK:
         repo.delete_dialog(dialog_id)
         await query.message.reply_text("🗑 Диалог удалён.")
-        # Если активный был удалён — сервис сам создаст новый при первом обращении, но меню покажем актуально
         await _render_dialogs(update, context, page=0, edit=True)
         return
 
     if action == CB_RENAME:
         context.user_data["rename_dialog_id"] = dialog_id
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(text="↩️ Отмена", callback_data=f"{CB_CANCEL}:0")]])
+        prefix = _fmt_date_prefix(getattr(d, "created_at", None))
         await query.message.reply_text(
-            f"Введите новое имя для диалога *{dialog_id}* (или отправьте пустое сообщение, чтобы очистить название).",
+            "Введите новое имя диалога.\n"
+            f"Формат будет сохранён как: `{prefix}_<имя>`\n"
+            "Можно отправить пустое сообщение, чтобы очистить пользовательскую часть названия.",
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -248,7 +285,6 @@ async def _cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _cb_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Универсальная отмена (и для inline, и для состояния)
     if update.callback_query:
         await update.callback_query.answer()
     context.user_data.pop("rename_dialog_id", None)
@@ -270,8 +306,8 @@ async def _rename_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not dialog_id:
         return ConversationHandler.END
 
-    title = (update.message.text or "").strip()
-    if len(title) > 80:
+    raw = (update.message.text or "").strip()
+    if len(raw) > 80:
         await update.message.reply_text("Название слишком длинное. Максимум 80 символов.")
         return STATE_RENAME
 
@@ -281,23 +317,27 @@ async def _rename_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Диалог не найден или недоступен.")
         return ConversationHandler.END
 
-    repo.rename_dialog(int(dialog_id), title)
-    context.user_data.pop("rename_dialog_id", None)
+    title_to_store = _normalize_title_for_storage(d, raw)
+    repo.rename_dialog(int(dialog_id), title_to_store)
 
+    context.user_data.pop("rename_dialog_id", None)
     await update.message.reply_text("✏️ Название обновлено.")
+
     page = int(context.user_data.get("dialogs_page", 0) or 0)
     await _render_dialogs(update, context, page=page, edit=False)
     return ConversationHandler.END
 
 
 def register(app: Application) -> None:
-    # 1) Единая команда управления диалогами
     app.add_handler(CommandHandler("dialogs", cmd_dialogs))
 
-    # 2) Callback-управление меню
-    app.add_handler(CallbackQueryHandler(_cb_dialogs, pattern=r"^dlg:(page|open|rename|delete|delete_ok|new|refresh|close):"))
+    # общий callback
+    app.add_handler(CallbackQueryHandler(
+        _cb_dialogs,
+        pattern=r"^dlg:(page|open|rename|delete|delete_ok|new|refresh|close):"
+    ))
 
-    # 3) Переименование — как диалоговое состояние (не конфликтует с text handler, если стоит раньше)
+    # rename flow
     rename_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(_cb_dialogs, pattern=r"^dlg:rename:\d+$")],
         states={STATE_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, _rename_receive)]},
@@ -307,5 +347,5 @@ def register(app: Application) -> None:
     )
     app.add_handler(rename_conv)
 
-    # Отмена для удаления/прочих действий (когда пользователь нажал отмену)
+    # cancel fallback
     app.add_handler(CallbackQueryHandler(_cb_cancel, pattern=r"^dlg:cancel:0$"))
