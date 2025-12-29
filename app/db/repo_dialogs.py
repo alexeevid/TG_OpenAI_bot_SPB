@@ -77,6 +77,7 @@ class DialogsRepo:
             return d
 
     def rename_dialog(self, dialog_id: int, title: str) -> Optional[Dialog]:
+        """Переименовать диалог."""
         with self.sf() as s:
             d = s.get(Dialog, dialog_id)
             if not d:
@@ -87,13 +88,13 @@ class DialogsRepo:
             return d
 
     def delete_dialog(self, dialog_id: int) -> None:
-        # Удаление диалога каскадом удалит messages благодаря cascade в модели
+        """Удалить диалог (сообщения удалятся каскадом)."""
         with self.sf() as s:
             d = s.get(Dialog, dialog_id)
             if not d:
                 return
 
-            # сброс активного диалога, если удаляем активный
+            # Если удаляем активный диалог пользователя — сбрасываем active_dialog_id.
             u = s.get(User, d.user_id)
             if u and u.active_dialog_id == dialog_id:
                 u.active_dialog_id = None
@@ -109,7 +110,7 @@ class DialogsRepo:
             # Touch dialog to update updated_at
             d = s.get(Dialog, dialog_id)
             if d:
-                d.updated_at = d.updated_at  # no-op, onupdate=func.now() сработает на UPDATE
+                d.updated_at = d.updated_at  # no-op, but forces ORM to consider update (onupdate handles)
             s.commit()
             s.refresh(m)
             return m
