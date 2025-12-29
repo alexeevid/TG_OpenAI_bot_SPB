@@ -41,6 +41,7 @@ from .handlers import (
     mode,
     dialogs,
     status,
+    errors,
 )
 
 async def _post_init(app: Application) -> None:
@@ -126,6 +127,7 @@ def build_application() -> Application:
 
     start.register(app)
     help.register(app)
+    errors.register(app)
 
     # ВАЖНО: dialogs.register(app) должен быть ДО text.register(app),
     # чтобы ConversationHandler переименования не конфликтовал с текстовым хендлером.
