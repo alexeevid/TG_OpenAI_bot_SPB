@@ -1,9 +1,9 @@
+# app/kb/parsers.py
 from __future__ import annotations
 
 import csv
 import io
 import os
-from typing import Optional
 
 from PIL import Image
 
@@ -27,6 +27,10 @@ def detect_ext(path: str) -> str:
     return (os.path.splitext(path)[1] or "").lower().strip(".")
 
 
+def is_image_ext(ext: str) -> bool:
+    return ext in {"png", "jpg", "jpeg", "webp"}
+
+
 def parse_text_bytes(data: bytes) -> str:
     for enc in ("utf-8", "utf-8-sig", "cp1251"):
         try:
@@ -38,7 +42,7 @@ def parse_text_bytes(data: bytes) -> str:
 
 def parse_pdf_bytes(data: bytes) -> str:
     if PdfReader is None:
-        raise RuntimeError("pypdf is not installed")
+        raise RuntimeError("Dependency missing: pypdf")
     reader = PdfReader(io.BytesIO(data))
     parts = []
     for page in reader.pages:
@@ -51,16 +55,15 @@ def parse_pdf_bytes(data: bytes) -> str:
 
 def parse_docx_bytes(data: bytes) -> str:
     if Document is None:
-        raise RuntimeError("python-docx is not installed")
+        raise RuntimeError("Dependency missing: python-docx")
     doc = Document(io.BytesIO(data))
     parts = []
     for p in doc.paragraphs:
         if p.text:
             parts.append(p.text)
-    # таблицы из DOCX
     for t in doc.tables:
         for row in t.rows:
-            parts.append("\t".join([c.text or "" for c in row.cells]))
+            parts.append("\t".join([(c.text or "") for c in row.cells]))
     return "\n".join(parts).strip()
 
 
@@ -76,7 +79,7 @@ def parse_csv_bytes(data: bytes) -> str:
 
 def parse_xlsx_bytes(data: bytes) -> str:
     if openpyxl is None:
-        raise RuntimeError("openpyxl is not installed")
+        raise RuntimeError("Dependency missing: openpyxl")
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     out = []
     for sheet in wb.worksheets:
@@ -86,24 +89,16 @@ def parse_xlsx_bytes(data: bytes) -> str:
                 continue
             vals = []
             for v in row:
-                if v is None:
-                    vals.append("")
-                else:
-                    vals.append(str(v))
+                vals.append("" if v is None else str(v))
             line = "\t".join(vals).strip()
             if line:
                 out.append(line)
     return "\n".join(out).strip()
 
 
-def is_image_ext(ext: str) -> bool:
-    return ext in {"png", "jpg", "jpeg", "webp"}
-
-
 def parse_image_bytes_best_effort(data: bytes) -> str:
     """
-    Без OCR — только метаданные/placeholder.
-    OCR/vision лучше подключать опционально через OpenAI Responses API (см. indexer/syncer).
+    Без OCR — только метаданные/placeholder (чтобы индексатор не падал).
     """
     try:
         im = Image.open(io.BytesIO(data))
