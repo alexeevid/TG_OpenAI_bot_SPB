@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import escape
+from math import ceil
 from typing import List, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -20,7 +21,9 @@ from ..services.authz_service import AuthzService
 from ..services.dialog_service import DialogService
 
 STATE_RENAME = 1
-SHOW_LIMIT = 5
+PAGE_SIZE = 5
+
+UD_PAGE_KEY = "dialogs_page"
 
 CB_OPEN = "dlg:open"
 CB_RENAME = "dlg:rename"
@@ -31,12 +34,13 @@ CB_REFRESH = "dlg:refresh"
 CB_CLOSE = "dlg:close"
 CB_CANCEL = "dlg:cancel"
 CB_NOOP = "dlg:noop"
+CB_PAGE = "dlg:page"  # dlg:page:<n>
 
 
 def _parse_cb(data: str) -> Tuple[str, Optional[int]]:
     parts = (data or "").split(":")
     if len(parts) >= 2 and parts[0] == "dlg":
-        action = ":".join(parts[:2])  # dlg:open
+        action = ":".join(parts[:2])
         did = None
         if len(parts) >= 3:
             try:
@@ -57,8 +61,6 @@ def _fmt_dt(dt) -> str:
 
 
 def _prefix_from_created_or_updated(d) -> Optional[str]:
-    # Маска требует дату создания; если created_at пустой (исторические данные),
-    # используем updated_at как fallback, чтобы не было пусто.
     dt = getattr(d, "created_at", None) or getattr(d, "updated_at", None)
     if not dt:
         return None
@@ -76,10 +78,6 @@ def _truncate(s: str, n: int = 60) -> str:
 
 
 def _display_title_mask(d) -> str:
-    """
-    Отображение в кнопке: YYYY-MM-DD_<Имя>
-    Если в БД title уже содержит YYYY-MM-DD_... — не дублируем.
-    """
     raw = (getattr(d, "title", "") or "").strip()
     prefix = _prefix_from_created_or_updated(d)
 
@@ -94,9 +92,6 @@ def _display_title_mask(d) -> str:
 
 
 def _ensure_mask_for_storage(d, user_part: str) -> str:
-    """
-    В БД храним строго YYYY-MM-DD_<user_part>, чтобы маска была постоянной.
-    """
     user_part = (user_part or "").strip()
     if not user_part:
         user_part = "Диалог"
@@ -111,7 +106,17 @@ def _ensure_mask_for_storage(d, user_part: str) -> str:
     return f"{prefix}_{user_part}"[:80]
 
 
-def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
+def _safe_page(n: int, pages_total: int) -> int:
+    if pages_total <= 0:
+        return 1
+    if n < 1:
+        return 1
+    if n > pages_total:
+        return pages_total
+    return n
+
+
+def _build_keyboard(dialogs, active_id: Optional[int], page: int, pages_total: int) -> InlineKeyboardMarkup:
     kb: List[List[InlineKeyboardButton]] = []
 
     for d in dialogs:
@@ -119,22 +124,26 @@ def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
         title = _display_title_mask(d)
         title_btn = f"✅ {d.id} — {title}" if is_active else f"{d.id} — {title}"
 
-        kb.append([
-            InlineKeyboardButton(
-                text=title_btn,
-                callback_data=f"{CB_OPEN}:{d.id}",
-            )
-        ])
+        kb.append([InlineKeyboardButton(text=title_btn, callback_data=f"{CB_OPEN}:{d.id}")])
 
         updated_s = _fmt_dt(getattr(d, "updated_at", None))
         kb.append([
-            InlineKeyboardButton(
-                text=f"изм.: {updated_s}",
-                callback_data=f"{CB_NOOP}:{d.id}",  # информационная кнопка
-            ),
+            InlineKeyboardButton(text=f"изм.: {updated_s}", callback_data=f"{CB_NOOP}:{d.id}"),
             InlineKeyboardButton("✏️", callback_data=f"{CB_RENAME}:{d.id}"),
             InlineKeyboardButton("🗑", callback_data=f"{CB_DELETE}:{d.id}"),
         ])
+
+    # Навигация страниц
+    nav_row: List[InlineKeyboardButton] = []
+    if pages_total > 1:
+        prev_p = page - 1
+        next_p = page + 1
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("◀️", callback_data=f"{CB_PAGE}:{prev_p}"))
+        nav_row.append(InlineKeyboardButton(f"{page}/{pages_total}", callback_data=f"{CB_NOOP}:0"))
+        if page < pages_total:
+            nav_row.append(InlineKeyboardButton("▶️", callback_data=f"{CB_PAGE}:{next_p}"))
+        kb.append(nav_row)
 
     kb.append([
         InlineKeyboardButton("➕ Новый", callback_data=f"{CB_NEW}:0"),
@@ -160,7 +169,16 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
         return
 
     u = repo.ensure_user(str(update.effective_user.id))
-    dialogs = repo.list_dialogs(u.id, limit=SHOW_LIMIT)  # строго 5 последних
+
+    total = repo.count_dialogs(u.id)
+    pages_total = max(1, ceil(total / PAGE_SIZE))
+
+    page = int(context.user_data.get(UD_PAGE_KEY, 1))
+    page = _safe_page(page, pages_total)
+    context.user_data[UD_PAGE_KEY] = page
+
+    offset = (page - 1) * PAGE_SIZE
+    dialogs = repo.list_dialogs_page(u.id, limit=PAGE_SIZE, offset=offset)
 
     active = repo.get_active_dialog(u.id)
     active_id = active.id if active else None
@@ -174,11 +192,11 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
             await update.callback_query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
-    # ТОЛЬКО заголовок (без второго списка)
-    text = "<b>Диалоги (последние 5)</b>\n"
-    text += f"Активный: <b>{escape(str(active_id))}</b>" if active_id else "Активный: <i>не выбран</i>"
+    text = "<b>Диалоги</b>\n"
+    text += f"Активный: <b>{escape(str(active_id))}</b>\n"
+    text += f"Страница: <b>{page}/{pages_total}</b>"
 
-    kb = _build_keyboard(dialogs, active_id)
+    kb = _build_keyboard(dialogs, active_id, page, pages_total)
 
     if update.callback_query and edit:
         await update.callback_query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -187,6 +205,8 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
 
 
 async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # при ручном вызове открываем 1-ю страницу (последние)
+    context.user_data[UD_PAGE_KEY] = 1
     await _render(update, context, edit=False)
 
 
@@ -207,7 +227,6 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = repo.ensure_user(str(update.effective_user.id))
 
     if action == CB_NOOP:
-        # информационная кнопка: ничего не делаем
         return
 
     if action == CB_CLOSE:
@@ -218,8 +237,16 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _render(update, context, edit=True)
         return
 
+    if action == CB_PAGE:
+        # did тут = номер страницы
+        page = int(did or 1)
+        context.user_data[UD_PAGE_KEY] = page
+        await _render(update, context, edit=True)
+        return
+
     if action == CB_NEW:
         ds.new_dialog(update.effective_user.id, title="Диалог")
+        context.user_data[UD_PAGE_KEY] = 1
         await _render(update, context, edit=True)
         return
 
@@ -306,7 +333,7 @@ def register(app: Application) -> None:
 
     app.add_handler(CallbackQueryHandler(
         cb_dialogs,
-        pattern=r"^dlg:(open|rename|delete|delete_ok|new|refresh|close|cancel|noop):"
+        pattern=r"^dlg:(open|rename|delete|delete_ok|new|refresh|close|cancel|noop|page):"
     ))
 
     rename_conv = ConversationHandler(
