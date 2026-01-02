@@ -72,33 +72,7 @@ def _truncate(s: str, n: int = 60) -> str:
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 
-def _ensure_mask_for_storage(d, user_part: str) -> str:
-    """
-    Сохраняем title в БД строго как YYYY-MM-DD_<user_part>.
-    Если created_at отсутствует — сохраняем просто user_part (без даты).
-    """
-    user_part = (user_part or "").strip()
-    if not user_part:
-        user_part = "Диалог"
-
-    prefix = _prefix_from_created(d)
-    if not prefix:
-        return user_part[:80]
-
-    # если уже "YYYY-MM-DD_..." — не дублируем
-    if len(user_part) >= 11 and user_part[:10] == prefix and user_part[10:11] == "_":
-        return user_part[:80]
-
-    return f"{prefix}_{user_part}"[:80]
-
-
 def _display_title(d) -> str:
-    """
-    Отображение:
-    - если в БД уже хранится YYYY-MM-DD_... — показываем как есть
-    - если created_at есть, но title без префикса — показываем с префиксом
-    - если created_at нет — показываем title как есть
-    """
     raw = (getattr(d, "title", "") or "").strip()
     prefix = _prefix_from_created(d)
 
@@ -113,30 +87,62 @@ def _display_title(d) -> str:
     return _truncate(raw, 80) if raw else "Диалог"
 
 
+def _ensure_mask_for_storage(d, user_part: str) -> str:
+    user_part = (user_part or "").strip()
+    if not user_part:
+        user_part = "Диалог"
+
+    prefix = _prefix_from_created(d)
+    if not prefix:
+        return user_part[:80]
+
+    if len(user_part) >= 11 and user_part[:10] == prefix and user_part[10:11] == "_":
+        return user_part[:80]
+
+    return f"{prefix}_{user_part}"[:80]
+
+
+def _merge_active_into_top(dialogs: List, active) -> List:
+    """
+    Всегда показываем активный диалог.
+    Если активный не в топе, добавляем его в начало, а список обрезаем до SHOW_LIMIT.
+    """
+    if not active:
+        return dialogs[:SHOW_LIMIT]
+
+    ids = {d.id for d in dialogs}
+    if active.id in ids:
+        return dialogs[:SHOW_LIMIT]
+
+    merged = [active] + dialogs
+    # уникализация по id с сохранением порядка
+    seen = set()
+    out = []
+    for d in merged:
+        if d.id in seen:
+            continue
+        seen.add(d.id)
+        out.append(d)
+        if len(out) >= SHOW_LIMIT:
+            break
+    return out
+
+
 def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
     """
     Вариант 1:
-    - Имена/даты только в тексте (слева)
-    - Под каждым диалогом — компактные кнопки [Выбрать] [✏️] [🗑]
+    - имена/даты слева в тексте
+    - кнопки компактные, но С ID, чтобы не было "пяти одинаковых Выбрать"
     """
     kb: List[List[InlineKeyboardButton]] = []
 
     for d in dialogs:
         is_active = bool(active_id and d.id == active_id)
-
+        select_text = f"{d.id}" + (" ✅" if is_active else "")
         kb.append([
-            InlineKeyboardButton(
-                text=("✅ Активный" if is_active else "Выбрать"),
-                callback_data=f"{CB_OPEN}:{d.id}",
-            ),
-            InlineKeyboardButton(
-                text="✏️",
-                callback_data=f"{CB_RENAME}:{d.id}",
-            ),
-            InlineKeyboardButton(
-                text="🗑",
-                callback_data=f"{CB_DELETE}:{d.id}",
-            ),
+            InlineKeyboardButton(select_text, callback_data=f"{CB_OPEN}:{d.id}"),
+            InlineKeyboardButton("✏️", callback_data=f"{CB_RENAME}:{d.id}"),
+            InlineKeyboardButton("🗑", callback_data=f"{CB_DELETE}:{d.id}"),
         ])
 
     kb.append([
@@ -162,10 +168,11 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
         return
 
     u = repo.ensure_user(str(update.effective_user.id))
-    dialogs = repo.list_dialogs(u.id, limit=SHOW_LIMIT)
-
     active = repo.get_active_dialog(u.id)
     active_id = active.id if active else None
+
+    dialogs = repo.list_dialogs(u.id, limit=20)  # берём чуть больше для корректного top-5
+    dialogs = _merge_active_into_top(dialogs, active)
 
     if not dialogs:
         text = "<b>Диалоги</b>\nДиалогов пока нет. Нажмите «➕ Новый»."
@@ -176,7 +183,6 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
             await update.callback_query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
-    # Список слева — как вы хотите
     lines = ["<b>Диалоги (последние 5)</b>"]
     lines.append(f"Активный: <b>{escape(str(active_id))}</b>" if active_id else "Активный: <i>не выбран</i>")
     lines.append("")
@@ -186,10 +192,9 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
         title = escape(_display_title(d))
         created_s = escape(_fmt_dt(getattr(d, "created_at", None)))
         updated_s = escape(_fmt_dt(getattr(d, "updated_at", None)))
-
         lines.append(f"{mark} <b>{d.id}</b> — {title}")
         lines.append(f"<i>   создан:</i> <code>{created_s}</code>   <i>изм.:</i> <code>{updated_s}</code>")
-        lines.append("")  # визуальный разделитель
+        lines.append("")
 
     text = "\n".join(lines).rstrip()
     kb = _build_keyboard(dialogs, active_id)
@@ -229,7 +234,6 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == CB_NEW:
-        # создаём диалог с базовым названием; префикс даты будет в отображении
         ds.new_dialog(update.effective_user.id, title="Диалог")
         await _render(update, context, edit=True)
         return
@@ -308,7 +312,7 @@ async def rename_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repo.rename_dialog(int(did), title_to_store)
 
     context.user_data.pop("rename_dialog_id", None)
-    await update.message.reply_text(f"✅ Диалог переименован: {escape(title_to_store)}", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"✅ Переименовано: {escape(title_to_store)}", parse_mode=ParseMode.HTML)
     await _render(update, context, edit=False)
     return ConversationHandler.END
 
