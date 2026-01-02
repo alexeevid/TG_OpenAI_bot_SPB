@@ -1,34 +1,34 @@
 from __future__ import annotations
 
+import base64
 import logging
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
-import openai
 from openai import OpenAI
 
 log = logging.getLogger(__name__)
 
 
 class OpenAIClient:
-    """Единый клиент OpenAI SDK (v1.x).
-
-    Поддерживает:
-    - Responses API (если доступно в установленной версии SDK)
-    - fallback на Chat Completions
-    - images.generate
-    - audio.transcriptions
-    - models.list (для динамического свитчера)
+    """Единый клиент OpenAI SDK (v1.x) для:
+    - генерации текста (Responses API с fallback на Chat Completions)
+    - эмбеддингов
+    - генерации изображений
+    - распознавания речи
+    - (опционально) извлечения текста из изображений через Responses API
     """
 
     def __init__(self, api_key: Optional[str] = None):
         self.client = OpenAI(api_key=api_key)
 
-    # -------- models --------
+    def is_enabled(self) -> bool:
+        return self.client is not None
+
     def list_models(self) -> List[str]:
         try:
             out = self.client.models.list()
-            ids = []
+            ids: List[str] = []
             for m in getattr(out, "data", []) or []:
                 mid = getattr(m, "id", None)
                 if mid:
@@ -38,9 +38,6 @@ class OpenAIClient:
             log.warning("OpenAI list_models failed: %s", e)
             return []
 
-    # -------- text generation --------
-    
-    # -------- text generation --------
     def generate_text(
         self,
         *,
@@ -50,15 +47,6 @@ class OpenAIClient:
         max_output_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> str:
-        """Generate assistant text.
-
-        Notes:
-        - For GPT‑5.* we prefer the Responses API (recommended by OpenAI).
-        - We map any `system` messages into the `instructions` field for Responses.
-        - If the selected model is not available on the key/account, we surface the API error.
-        """
-
-        # Split system instructions from conversational turns.
         sys_parts: List[str] = []
         turns: List[Dict[str, str]] = []
         for m in (messages or []):
@@ -71,18 +59,14 @@ class OpenAIClient:
                 if content_s.strip():
                     sys_parts.append(content_s.strip())
             else:
-                # Responses API supports role/content as strings (user/assistant).
                 turns.append({"role": role or "user", "content": content_s})
 
         instructions = "\n\n".join(sys_parts).strip() or None
 
         def _extract_output_text(resp: Any) -> str:
-            # SDKs expose output_text in newer versions.
             out_txt = getattr(resp, "output_text", None)
             if out_txt:
                 return str(out_txt).strip()
-
-            # Fallback: walk response.output[*].content[*].text
             out = getattr(resp, "output", None)
             if isinstance(out, list):
                 for item in out:
@@ -94,12 +78,10 @@ class OpenAIClient:
                                 return str(t).strip()
             return str(resp).strip()
 
-        # Prefer Responses API if available (and especially for GPT‑5.*).
         has_responses = hasattr(self.client, "responses") and hasattr(self.client.responses, "create")
-        prefer_responses = model.startswith("gpt-5") or model.startswith("o")
+        prefer_responses = model.startswith("gpt-5") or model.startswith("o") or model.startswith("gpt-4o")
 
-        if has_responses and (prefer_responses or True):
-            # We do a small retry loop to gracefully handle SDK/parameter mismatches.
+        if has_responses and prefer_responses:
             base_kwargs: Dict[str, Any] = {"model": model, "input": turns if turns else ""}
             if instructions:
                 base_kwargs["instructions"] = instructions
@@ -112,34 +94,20 @@ class OpenAIClient:
 
             attempts = [
                 base_kwargs,
-                # Retry with fewer optional args (some models/SDK versions reject certain params).
                 {k: v for k, v in base_kwargs.items() if k not in {"reasoning", "temperature"}},
                 {k: v for k, v in base_kwargs.items() if k not in {"reasoning", "temperature", "max_output_tokens"}},
             ]
-
             last_err: Exception | None = None
             for kw in attempts:
                 try:
                     resp = self.client.responses.create(**kw)
                     return _extract_output_text(resp)
-                except TypeError as e:
-                    # Older SDK signature mismatch.
-                    last_err = e
-                    continue
                 except Exception as e:
-                    # APIStatusError / BadRequestError etc.
                     last_err = e
                     continue
-
-            # If GPT‑5.* was selected, do NOT silently fall back to Chat Completions;
-            # surface the failure so upper layers can decide what to do.
-            if prefer_responses and last_err:
+            if last_err:
                 raise last_err
 
-            # Otherwise we can try Chat Completions as a fallback.
-            log.warning("Responses API failed, falling back to chat.completions: %s", last_err)
-
-        # Chat Completions fallback (works for gpt‑4o and earlier).
         resp = self.client.chat.completions.create(
             model=model,
             messages=messages,
@@ -147,18 +115,45 @@ class OpenAIClient:
         )
         return (resp.choices[0].message.content or "").strip()
 
-    # -------- images --------
+    def embeddings(self, texts: Sequence[str], model: str) -> List[List[float]]:
+        resp = self.client.embeddings.create(model=model, input=list(texts))
+        out: List[List[float]] = []
+        for item in resp.data:
+            out.append(list(item.embedding))
+        return out
+
+    def embed(self, texts: Sequence[str], model: str) -> List[List[float]]:
+        return self.embeddings(texts, model=model)
+
     def generate_image_url(self, *, model: str, prompt: str, size: str = "1024x1024") -> str:
         out = self.client.images.generate(model=model, prompt=prompt, size=size)
         return out.data[0].url
 
-    # -------- speech-to-text --------
+    def transcribe_file(self, fobj, model: str = "whisper-1") -> str:
+        """Распознавание речи. fobj — бинарный file-like (open(...,'rb'))."""
+        res = self.client.audio.transcriptions.create(model=model, file=fobj)
+        return (res.text or "").strip()
+
     def transcribe_bytes(self, audio_bytes: bytes, filename: str = "audio.ogg", model: str = "whisper-1") -> str:
         bio = BytesIO(audio_bytes)
         bio.name = filename
-        res = self.client.audio.transcriptions.create(model=model, file=bio)
-        return (res.text or "").strip()
+        return self.transcribe_file(bio, model=model)
 
-    def transcribe_file(self, fobj, model: str = "whisper-1") -> str:
-        res = self.client.audio.transcriptions.create(model=model, file=fobj)
-        return (res.text or "").strip()
+    def vision_extract_text(self, image_bytes: bytes, *, model: str = "gpt-4o-mini") -> str:
+        if not (hasattr(self.client, "responses") and hasattr(self.client.responses, "create")):
+            raise RuntimeError("Responses API is not available in installed OpenAI SDK")
+
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        resp = self.client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Извлеки текст с изображения. Если текста нет, кратко опиши содержание."},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
+                    ],
+                }
+            ],
+        )
+        return (getattr(resp, "output_text", None) or "").strip()

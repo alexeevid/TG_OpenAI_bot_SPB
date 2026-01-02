@@ -1,36 +1,31 @@
 from __future__ import annotations
 
 import logging
-import sqlalchemy  # 👈 Импортируем весь модуль
+import sqlalchemy
 from telegram.ext import Application
 
-# Настройки проекта
 from .settings import load_settings
-
-# Сервисы
-from .services.gen_service import GenService
-from .services.image_service import ImageService
-from .services.voice_service import VoiceService
-from .services.dialog_service import DialogService
-from .services.rag_service import RagService
-from .services.authz_service import AuthzService
-
-# Клиенты
 from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
-# База данных
 from .db.session import make_session_factory
+from .db.models import Base
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
-from .db.models import Base
 
-# База знаний
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
 from .kb.syncer import KBSyncer
 
-# Хендлеры
+from .services.dialog_service import DialogService
+from .services.rag_service import RagService
+from .services.gen_service import GenService
+from .services.voice_service import VoiceService
+from .services.image_service import ImageService
+from .services.authz_service import AuthzService
+from .services.search_service import SearchService
+from .clients.web_search_client import WebSearchClient
+
 from .handlers import (
     start,
     help,
@@ -42,7 +37,9 @@ from .handlers import (
     dialogs,
     status,
     errors,
+    kb as kb_handler,
 )
+
 
 async def _post_init(app: Application) -> None:
     try:
@@ -50,91 +47,107 @@ async def _post_init(app: Application) -> None:
         await app.bot.set_my_commands([
             ("start", "Приветствие и инициализация"),
             ("help", "Справка по командам"),
-            # Управление диалогами — только через /dialogs (без отдельного меню).
             ("dialogs", "Управление диалогами"),
             ("model", "Выбрать модель: /model <название>"),
             ("mode", "Режим ответа: concise|detailed|mcwilliams"),
             ("img", "Сгенерировать изображение"),
             ("stats", "Статистика текущего диалога"),
-            ("kb", "Поиск по базе знаний"),
-            ("update", "Обновить базу знаний"),
-            ("config", "Текущая конфигурация"),
-            ("about", "О проекте"),
-            ("feedback", "Оставить отзыв"),
+            ("kb", "Поиск/управление базой знаний"),
+            ("update", "Обновить (sync) базу знаний"),
             ("status", "Сводка по текущему диалогу"),
         ])
     except Exception as e:
         logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
 
+
+def _ensure_kb_schema(engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector"))
+    Base.metadata.create_all(bind=engine)
+
+    with engine.begin() as conn:
+        conn.execute(sqlalchemy.text(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name='kb_chunks' AND column_name='embedding'
+                ) THEN
+                    BEGIN
+                        CREATE INDEX IF NOT EXISTS ix_kb_chunks_embedding_ivfflat
+                        ON kb_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+                    EXCEPTION WHEN others THEN
+                        NULL;
+                    END;
+                END IF;
+            END $$;
+            """
+        ))
+
+
 def build_application() -> Application:
     cfg = load_settings()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     if not cfg.telegram_token:
         raise RuntimeError("telegram_token отсутствует в настройках")
-
-    app = Application.builder() \
-        .token(cfg.telegram_token) \
-        .post_init(_post_init) \
-        .build()
-
-    db_url = cfg.database_url
-    if not db_url:
+    if not cfg.database_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках")
 
-    session_factory, engine = make_session_factory(db_url)
-    Base.metadata.create_all(bind=engine)
+    app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
+
+    session_factory, engine = make_session_factory(cfg.database_url)
+
+    _ensure_kb_schema(engine)
 
     with engine.begin() as conn:
         conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
 
     repo_dialogs = DialogsRepo(session_factory)
-    ds = DialogService(repo_dialogs)
+    svc_dialog = DialogService(repo_dialogs)
 
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-    gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
+    svc_gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
+    svc_voice = VoiceService(openai_client=oai_client)
+    svc_image = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if cfg.enable_image_generation else None
+    svc_authz = AuthzService(cfg)
+    svc_search = SearchService(WebSearchClient(cfg.web_search_provider))
 
-    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if cfg.enable_image_generation else None
-    vs = VoiceService(openai_client=oai_client)
-
-    repo_kb = KBRepo(session_factory, getattr(cfg, "pgvector_dim", 3072))
+    dim = int(getattr(cfg, "pgvector_dim", 3072))
+    kb_repo = KBRepo(session_factory, dim)
     yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
     embedder = Embedder(oai_client, cfg.openai_embedding_model)
-    retriever = Retriever(repo_kb, oai_client, getattr(cfg, "pgvector_dim", 3072))
-    rag = RagService(retriever)
-    authz = AuthzService(cfg)
-    syncer = KBSyncer(yd, embedder, repo_kb, cfg)
+    retriever = Retriever(kb_repo, embedder, top_k_default=getattr(cfg, "max_kb_chunks", 6))
+    svc_rag = RagService(retriever)
+    svc_syncer = KBSyncer(yd, embedder, kb_repo, cfg, session_factory)
 
     app.bot_data.update({
         "settings": cfg,
-        "svc_dialog": ds,
-        "svc_gen": gen,
-        "svc_image": img,
-        "svc_voice": vs,
+        "svc_dialog": svc_dialog,
+        "svc_gen": svc_gen,
+        "svc_image": svc_image,
+        "svc_voice": svc_voice,
+        "svc_search": svc_search,
+        "svc_authz": svc_authz,
         "repo_dialogs": repo_dialogs,
-        "repo_kb": repo_kb,
-        "svc_rag": rag,
-        "svc_authz": authz,
+        "repo_kb": kb_repo,
+        "svc_rag": svc_rag,
         "yandex": yd,
         "embedder": embedder,
-        "svc_syncer": syncer,
+        "svc_syncer": svc_syncer,
     })
 
     start.register(app)
     help.register(app)
     errors.register(app)
-
-    # ВАЖНО: dialogs.register(app) должен быть ДО text.register(app),
-    # чтобы ConversationHandler переименования не конфликтовал с текстовым хендлером.
     dialogs.register(app)
-
     model.register(app)
     mode.register(app)
+    kb_handler.register(app)
     image.register(app)
     voice.register(app)
     text.register(app)
@@ -142,10 +155,7 @@ def build_application() -> Application:
 
     return app
 
+
 def run() -> None:
     app = build_application()
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=None,
-        stop_signals=None,
-    )
+    app.run_polling(drop_pending_updates=True, allowed_updates=None, stop_signals=None)
