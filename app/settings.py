@@ -251,3 +251,6 @@ ENABLE_WEB_SEARCH = cfg.enable_web_search
 WEB_SEARCH_PROVIDER = cfg.web_search_provider
 RATE_LIMIT_PER_MIN = cfg.rate_limit_per_min
 LOG_LEVEL = cfg.log_level
+# --- Compatibility alias for KB / RAG modules ---
+settings = cfg
+
