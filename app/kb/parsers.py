@@ -1,14 +1,12 @@
-# app/kb/parsers.py
 from __future__ import annotations
 
 import csv
 import io
 import os
-
 from PIL import Image
 
 try:
-    from docx import Document  # python-docx
+    from docx import Document
 except Exception:
     Document = None
 
@@ -42,66 +40,46 @@ def parse_text_bytes(data: bytes) -> str:
 
 def parse_pdf_bytes(data: bytes) -> str:
     if PdfReader is None:
-        raise RuntimeError("Dependency missing: pypdf")
+        raise RuntimeError("pypdf is not installed")
     reader = PdfReader(io.BytesIO(data))
     parts = []
     for page in reader.pages:
-        try:
-            parts.append(page.extract_text() or "")
-        except Exception:
-            parts.append("")
+        parts.append(page.extract_text() or "")
     return "\n".join(parts).strip()
 
 
 def parse_docx_bytes(data: bytes) -> str:
     if Document is None:
-        raise RuntimeError("Dependency missing: python-docx")
+        raise RuntimeError("python-docx is not installed")
     doc = Document(io.BytesIO(data))
-    parts = []
-    for p in doc.paragraphs:
-        if p.text:
-            parts.append(p.text)
+    parts = [p.text for p in doc.paragraphs if p.text]
     for t in doc.tables:
         for row in t.rows:
-            parts.append("\t".join([(c.text or "") for c in row.cells]))
+            parts.append("\t".join(c.text or "" for c in row.cells))
     return "\n".join(parts).strip()
 
 
 def parse_csv_bytes(data: bytes) -> str:
     text = parse_text_bytes(data)
-    buf = io.StringIO(text)
-    reader = csv.reader(buf)
-    lines = []
-    for row in reader:
-        lines.append("\t".join(row))
-    return "\n".join(lines).strip()
+    reader = csv.reader(io.StringIO(text))
+    return "\n".join("\t".join(row) for row in reader)
 
 
 def parse_xlsx_bytes(data: bytes) -> str:
     if openpyxl is None:
-        raise RuntimeError("Dependency missing: openpyxl")
+        raise RuntimeError("openpyxl is not installed")
     wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     out = []
     for sheet in wb.worksheets:
         out.append(f"[SHEET] {sheet.title}")
         for row in sheet.iter_rows(values_only=True):
-            if row is None:
-                continue
-            vals = []
-            for v in row:
-                vals.append("" if v is None else str(v))
-            line = "\t".join(vals).strip()
-            if line:
-                out.append(line)
-    return "\n".join(out).strip()
+            out.append("\t".join("" if v is None else str(v) for v in row))
+    return "\n".join(out)
 
 
 def parse_image_bytes_best_effort(data: bytes) -> str:
-    """
-    Без OCR — только метаданные/placeholder (чтобы индексатор не падал).
-    """
     try:
         im = Image.open(io.BytesIO(data))
         return f"[IMAGE] format={im.format} size={im.size[0]}x{im.size[1]}"
     except Exception:
-        return "[IMAGE] unable_to_parse"
+        return "[IMAGE]"
