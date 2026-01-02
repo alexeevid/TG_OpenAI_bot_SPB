@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, nullslast, func
-
 from .models import User, Dialog, Message
 
 
@@ -44,18 +43,19 @@ class DialogsRepo:
             s.refresh(d)
             return d
 
-    def list_dialogs(self, user_id: int, limit: int = 20) -> List[Dialog]:
-        """
-        Устойчивая сортировка даже если updated_at/created_at бывают NULL в реальной БД:
-        1) updated_at NULLS LAST
-        2) id DESC как стабильный тайбрейк
-        """
+    def count_dialogs(self, user_id: int) -> int:
+        with self.sf() as s:
+            q = select(func.count(Dialog.id)).where(Dialog.user_id == user_id)
+            return int(s.execute(q).scalar() or 0)
+
+    def list_dialogs_page(self, user_id: int, limit: int, offset: int) -> List[Dialog]:
         with self.sf() as s:
             q = (
                 select(Dialog)
                 .where(Dialog.user_id == user_id)
                 .order_by(nullslast(desc(Dialog.updated_at)), desc(Dialog.id))
                 .limit(limit)
+                .offset(offset)
             )
             return list(s.execute(q).scalars().all())
 
@@ -126,4 +126,6 @@ class DialogsRepo:
         with self.sf() as s:
             q = select(Message).where(Message.dialog_id == dialog_id).order_by(Message.id.desc()).limit(limit)
             rows = list(s.execute(q).scalars().all())
+
+
             return list(reversed(rows))
