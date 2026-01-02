@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, nullslast, func
 
 from .models import User, Dialog, Message
 
@@ -45,8 +45,18 @@ class DialogsRepo:
             return d
 
     def list_dialogs(self, user_id: int, limit: int = 20) -> List[Dialog]:
+        """
+        Устойчивая сортировка даже если updated_at/created_at бывают NULL в реальной БД:
+        1) updated_at NULLS LAST
+        2) id DESC как стабильный тайбрейк
+        """
         with self.sf() as s:
-            q = select(Dialog).where(Dialog.user_id == user_id).order_by(desc(Dialog.updated_at)).limit(limit)
+            q = (
+                select(Dialog)
+                .where(Dialog.user_id == user_id)
+                .order_by(nullslast(desc(Dialog.updated_at)), desc(Dialog.id))
+                .limit(limit)
+            )
             return list(s.execute(q).scalars().all())
 
     def get_dialog_for_user(self, dialog_id: int, user_id: int) -> Optional[Dialog]:
@@ -77,7 +87,6 @@ class DialogsRepo:
             return d
 
     def rename_dialog(self, dialog_id: int, title: str) -> Optional[Dialog]:
-        """Переименовать диалог."""
         with self.sf() as s:
             d = s.get(Dialog, dialog_id)
             if not d:
@@ -88,17 +97,13 @@ class DialogsRepo:
             return d
 
     def delete_dialog(self, dialog_id: int) -> None:
-        """Удалить диалог (сообщения удалятся каскадом)."""
         with self.sf() as s:
             d = s.get(Dialog, dialog_id)
             if not d:
                 return
-
-            # Если удаляем активный диалог пользователя — сбрасываем active_dialog_id.
             u = s.get(User, d.user_id)
             if u and u.active_dialog_id == dialog_id:
                 u.active_dialog_id = None
-
             s.delete(d)
             s.commit()
 
@@ -107,10 +112,12 @@ class DialogsRepo:
         with self.sf() as s:
             m = Message(dialog_id=dialog_id, role=role, content=content)
             s.add(m)
-            # Touch dialog to update updated_at
+
+            # Реально обновляем updated_at (а не "no-op")
             d = s.get(Dialog, dialog_id)
             if d:
-                d.updated_at = d.updated_at  # no-op, but forces ORM to consider update (onupdate handles)
+                d.updated_at = func.now()
+
             s.commit()
             s.refresh(m)
             return m
