@@ -30,12 +30,13 @@ CB_NEW = "dlg:new"
 CB_REFRESH = "dlg:refresh"
 CB_CLOSE = "dlg:close"
 CB_CANCEL = "dlg:cancel"
+CB_NOOP = "dlg:noop"
 
 
 def _parse_cb(data: str) -> Tuple[str, Optional[int]]:
     parts = (data or "").split(":")
     if len(parts) >= 2 and parts[0] == "dlg":
-        action = ":".join(parts[:2])
+        action = ":".join(parts[:2])  # dlg:open
         did = None
         if len(parts) >= 3:
             try:
@@ -55,8 +56,10 @@ def _fmt_dt(dt) -> str:
         return "—"
 
 
-def _prefix_from_created(d) -> Optional[str]:
-    dt = getattr(d, "created_at", None)
+def _prefix_from_created_or_updated(d) -> Optional[str]:
+    # Маска требует дату создания; если created_at пустой (исторические данные),
+    # используем updated_at как fallback, чтобы не было пусто.
+    dt = getattr(d, "created_at", None) or getattr(d, "updated_at", None)
     if not dt:
         return None
     try:
@@ -72,27 +75,33 @@ def _truncate(s: str, n: int = 60) -> str:
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 
-def _display_title(d) -> str:
+def _display_title_mask(d) -> str:
+    """
+    Отображение в кнопке: YYYY-MM-DD_<Имя>
+    Если в БД title уже содержит YYYY-MM-DD_... — не дублируем.
+    """
     raw = (getattr(d, "title", "") or "").strip()
-    prefix = _prefix_from_created(d)
+    prefix = _prefix_from_created_or_updated(d)
 
-    if prefix and raw:
-        if len(raw) >= 11 and raw[:10] == prefix and raw[10:11] == "_":
-            return _truncate(raw, 80)
-        return f"{prefix}_{_truncate(raw, 60)}"
+    if not prefix:
+        return _truncate(raw, 80) if raw else "Диалог"
 
-    if prefix and not raw:
-        return f"{prefix}_Диалог"
+    if raw and len(raw) >= 11 and raw[:10] == prefix and raw[10:11] == "_":
+        return _truncate(raw, 80)
 
-    return _truncate(raw, 80) if raw else "Диалог"
+    name = _truncate(raw, 60) if raw else "Диалог"
+    return f"{prefix}_{name}"
 
 
 def _ensure_mask_for_storage(d, user_part: str) -> str:
+    """
+    В БД храним строго YYYY-MM-DD_<user_part>, чтобы маска была постоянной.
+    """
     user_part = (user_part or "").strip()
     if not user_part:
         user_part = "Диалог"
 
-    prefix = _prefix_from_created(d)
+    prefix = _prefix_from_created_or_updated(d)
     if not prefix:
         return user_part[:80]
 
@@ -102,45 +111,27 @@ def _ensure_mask_for_storage(d, user_part: str) -> str:
     return f"{prefix}_{user_part}"[:80]
 
 
-def _merge_active_into_top(dialogs: List, active) -> List:
-    """
-    Всегда показываем активный диалог.
-    Если активный не в топе, добавляем его в начало, а список обрезаем до SHOW_LIMIT.
-    """
-    if not active:
-        return dialogs[:SHOW_LIMIT]
-
-    ids = {d.id for d in dialogs}
-    if active.id in ids:
-        return dialogs[:SHOW_LIMIT]
-
-    merged = [active] + dialogs
-    # уникализация по id с сохранением порядка
-    seen = set()
-    out = []
-    for d in merged:
-        if d.id in seen:
-            continue
-        seen.add(d.id)
-        out.append(d)
-        if len(out) >= SHOW_LIMIT:
-            break
-    return out
-
-
 def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
-    """
-    Вариант 1:
-    - имена/даты слева в тексте
-    - кнопки компактные, но С ID, чтобы не было "пяти одинаковых Выбрать"
-    """
     kb: List[List[InlineKeyboardButton]] = []
 
     for d in dialogs:
         is_active = bool(active_id and d.id == active_id)
-        select_text = f"{d.id}" + (" ✅" if is_active else "")
+        title = _display_title_mask(d)
+        title_btn = f"✅ {d.id} — {title}" if is_active else f"{d.id} — {title}"
+
         kb.append([
-            InlineKeyboardButton(select_text, callback_data=f"{CB_OPEN}:{d.id}"),
+            InlineKeyboardButton(
+                text=title_btn,
+                callback_data=f"{CB_OPEN}:{d.id}",
+            )
+        ])
+
+        updated_s = _fmt_dt(getattr(d, "updated_at", None))
+        kb.append([
+            InlineKeyboardButton(
+                text=f"изм.: {updated_s}",
+                callback_data=f"{CB_NOOP}:{d.id}",  # информационная кнопка
+            ),
             InlineKeyboardButton("✏️", callback_data=f"{CB_RENAME}:{d.id}"),
             InlineKeyboardButton("🗑", callback_data=f"{CB_DELETE}:{d.id}"),
         ])
@@ -150,6 +141,7 @@ def _build_keyboard(dialogs, active_id: Optional[int]) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔄 Обновить", callback_data=f"{CB_REFRESH}:0"),
     ])
     kb.append([InlineKeyboardButton("Закрыть", callback_data=f"{CB_CLOSE}:0")])
+
     return InlineKeyboardMarkup(kb)
 
 
@@ -168,11 +160,10 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
         return
 
     u = repo.ensure_user(str(update.effective_user.id))
+    dialogs = repo.list_dialogs(u.id, limit=SHOW_LIMIT)  # строго 5 последних
+
     active = repo.get_active_dialog(u.id)
     active_id = active.id if active else None
-
-    dialogs = repo.list_dialogs(u.id, limit=20)  # берём чуть больше для корректного top-5
-    dialogs = _merge_active_into_top(dialogs, active)
 
     if not dialogs:
         text = "<b>Диалоги</b>\nДиалогов пока нет. Нажмите «➕ Новый»."
@@ -183,20 +174,10 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
             await update.callback_query.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
         return
 
-    lines = ["<b>Диалоги (последние 5)</b>"]
-    lines.append(f"Активный: <b>{escape(str(active_id))}</b>" if active_id else "Активный: <i>не выбран</i>")
-    lines.append("")
+    # ТОЛЬКО заголовок (без второго списка)
+    text = "<b>Диалоги (последние 5)</b>\n"
+    text += f"Активный: <b>{escape(str(active_id))}</b>" if active_id else "Активный: <i>не выбран</i>"
 
-    for d in dialogs:
-        mark = "✅" if active_id and d.id == active_id else "•"
-        title = escape(_display_title(d))
-        created_s = escape(_fmt_dt(getattr(d, "created_at", None)))
-        updated_s = escape(_fmt_dt(getattr(d, "updated_at", None)))
-        lines.append(f"{mark} <b>{d.id}</b> — {title}")
-        lines.append(f"<i>   создан:</i> <code>{created_s}</code>   <i>изм.:</i> <code>{updated_s}</code>")
-        lines.append("")
-
-    text = "\n".join(lines).rstrip()
     kb = _build_keyboard(dialogs, active_id)
 
     if update.callback_query and edit:
@@ -224,6 +205,10 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     action, did = _parse_cb(q.data or "")
     u = repo.ensure_user(str(update.effective_user.id))
+
+    if action == CB_NOOP:
+        # информационная кнопка: ничего не делаем
+        return
 
     if action == CB_CLOSE:
         await q.message.edit_reply_markup(reply_markup=None)
@@ -254,12 +239,11 @@ async def cb_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == CB_OPEN:
         repo.set_active_dialog(u.id, did)
-        await q.message.reply_text(f"⭐ Активный диалог: {did}")
         await _render(update, context, edit=True)
         return
 
     if action == CB_DELETE:
-        title_ui = escape(_display_title(d))
+        title_ui = escape(_display_title_mask(d))
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Удалить", callback_data=f"{CB_DELETE_OK}:{did}"),
             InlineKeyboardButton("↩️ Отмена", callback_data=f"{CB_CANCEL}:0"),
@@ -312,7 +296,7 @@ async def rename_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     repo.rename_dialog(int(did), title_to_store)
 
     context.user_data.pop("rename_dialog_id", None)
-    await update.message.reply_text(f"✅ Переименовано: {escape(title_to_store)}", parse_mode=ParseMode.HTML)
+    await update.message.reply_text("✅ Переименовано.")
     await _render(update, context, edit=False)
     return ConversationHandler.END
 
@@ -322,7 +306,7 @@ def register(app: Application) -> None:
 
     app.add_handler(CallbackQueryHandler(
         cb_dialogs,
-        pattern=r"^dlg:(open|rename|delete|delete_ok|new|refresh|close|cancel):"
+        pattern=r"^dlg:(open|rename|delete|delete_ok|new|refresh|close|cancel|noop):"
     ))
 
     rename_conv = ConversationHandler(
