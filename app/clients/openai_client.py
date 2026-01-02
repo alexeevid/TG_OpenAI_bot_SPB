@@ -1,43 +1,89 @@
 from __future__ import annotations
 
-import base64
 import logging
+import time
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import openai
 from openai import OpenAI
 
 log = logging.getLogger(__name__)
 
 
 class OpenAIClient:
-    """Единый клиент OpenAI SDK (v1.x) для:
-    - генерации текста (Responses API с fallback на Chat Completions)
-    - эмбеддингов
-    - генерации изображений
-    - распознавания речи
-    - (опционально) извлечения текста из изображений через Responses API
+    """
+    OpenAI API client wrapper.
+
+    In this project we use:
+    - text generation (Responses API when available, fallback to Chat Completions)
+    - image generation
+    - audio transcription
+    - embeddings (for KB/RAG)
     """
 
     def __init__(self, api_key: Optional[str] = None):
         self.client = OpenAI(api_key=api_key)
 
-    def is_enabled(self) -> bool:
-        return self.client is not None
-
+    # -------- models --------
     def list_models(self) -> List[str]:
         try:
             out = self.client.models.list()
-            ids: List[str] = []
+            ids = []
             for m in getattr(out, "data", []) or []:
                 mid = getattr(m, "id", None)
                 if mid:
                     ids.append(str(mid))
             return sorted(set(ids))
         except Exception as e:
-            log.warning("OpenAI list_models failed: %s", e)
+            log.warning("Failed to list models: %s", e)
             return []
 
+    # -------- embeddings (KB/RAG) --------
+    def embeddings(self, texts: Sequence[str], model: str) -> List[List[float]]:
+        """
+        Return embeddings for each text.
+        """
+        if not texts:
+            return []
+
+        # Basic retries for transient errors / rate limits.
+        last_err: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                resp = self.client.embeddings.create(
+                    model=model,
+                    input=list(texts),
+                )
+                return [d.embedding for d in resp.data]
+            except Exception as e:
+                last_err = e
+                # simple backoff
+                time.sleep(0.5 * attempt)
+
+        raise last_err or RuntimeError("embeddings() failed")
+
+    def embed(self, texts: Sequence[str], model: Optional[str] = None) -> List[List[float]]:
+        """
+        Compatibility alias for KB code that calls `openai_client.embed(texts)`.
+
+        If model is None, we try to get it from app.settings.cfg (project settings).
+        """
+        if model is None:
+            try:
+                # local import to avoid circular deps at import time
+                from app.settings import cfg  # type: ignore
+                model = getattr(cfg, "OPENAI_EMBEDDING_MODEL", None)
+            except Exception:
+                model = None
+
+        if not model:
+            # safe default (matches your KB defaults)
+            model = "text-embedding-3-large"
+
+        return self.embeddings(texts, model=model)
+
+    # -------- text generation --------
     def generate_text(
         self,
         *,
@@ -47,6 +93,14 @@ class OpenAIClient:
         max_output_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> str:
+        """Generate assistant text.
+
+        Notes:
+        - For GPT-5.* we prefer the Responses API (recommended by OpenAI).
+        - We map any `system` messages into the `instructions` field for Responses.
+        - If the selected model is not available on the key/account, we surface the API error.
+        """
+        # Split system instructions from conversational turns.
         sys_parts: List[str] = []
         turns: List[Dict[str, str]] = []
         for m in (messages or []):
@@ -67,6 +121,7 @@ class OpenAIClient:
             out_txt = getattr(resp, "output_text", None)
             if out_txt:
                 return str(out_txt).strip()
+
             out = getattr(resp, "output", None)
             if isinstance(out, list):
                 for item in out:
@@ -79,81 +134,76 @@ class OpenAIClient:
             return str(resp).strip()
 
         has_responses = hasattr(self.client, "responses") and hasattr(self.client.responses, "create")
-        prefer_responses = model.startswith("gpt-5") or model.startswith("o") or model.startswith("gpt-4o")
+        prefer_responses = model.startswith("gpt-5") or model.startswith("o")
 
-        if has_responses and prefer_responses:
-            base_kwargs: Dict[str, Any] = {"model": model, "input": turns if turns else ""}
-            if instructions:
-                base_kwargs["instructions"] = instructions
-            if temperature is not None:
-                base_kwargs["temperature"] = float(temperature)
-            if max_output_tokens:
-                base_kwargs["max_output_tokens"] = int(max_output_tokens)
-            if reasoning_effort:
-                base_kwargs["reasoning"] = {"effort": reasoning_effort}
-
-            attempts = [
-                base_kwargs,
-                {k: v for k, v in base_kwargs.items() if k not in {"reasoning", "temperature"}},
-                {k: v for k, v in base_kwargs.items() if k not in {"reasoning", "temperature", "max_output_tokens"}},
-            ]
-            last_err: Exception | None = None
-            for kw in attempts:
+        if has_responses and (prefer_responses or True):
+            last_err: Optional[Exception] = None
+            for attempt in range(1, 4):
                 try:
-                    resp = self.client.responses.create(**kw)
+                    kwargs: Dict[str, Any] = {
+                        "model": model,
+                        "input": turns,
+                    }
+                    if instructions:
+                        kwargs["instructions"] = instructions
+                    if temperature is not None:
+                        kwargs["temperature"] = float(temperature)
+                    if max_output_tokens is not None:
+                        kwargs["max_output_tokens"] = int(max_output_tokens)
+                    if reasoning_effort:
+                        kwargs["reasoning"] = {"effort": reasoning_effort}
+
+                    resp = self.client.responses.create(**kwargs)
                     return _extract_output_text(resp)
                 except Exception as e:
                     last_err = e
-                    continue
-            if last_err:
-                raise last_err
+                    time.sleep(0.5 * attempt)
+            raise last_err or RuntimeError("responses.create() failed")
 
-        resp = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=float(temperature),
-        )
-        return (resp.choices[0].message.content or "").strip()
+        # Fallback: Chat Completions API
+        last_err2: Optional[Exception] = None
+        for attempt in range(1, 4):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,  # keep original messages
+                    temperature=float(temperature),
+                    max_tokens=int(max_output_tokens) if max_output_tokens is not None else None,
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception as e:
+                last_err2 = e
+                time.sleep(0.5 * attempt)
+        raise last_err2 or RuntimeError("chat.completions.create() failed")
 
-    def embeddings(self, texts: Sequence[str], model: str) -> List[List[float]]:
-        resp = self.client.embeddings.create(model=model, input=list(texts))
-        out: List[List[float]] = []
-        for item in resp.data:
-            out.append(list(item.embedding))
-        return out
+    # -------- (internal helper; kept for backward compatibility) --------
+    def _extract_output_text(self, resp: Any) -> str:
+        out_txt = getattr(resp, "output_text", None)
+        if out_txt:
+            return str(out_txt).strip()
+        return str(resp).strip()
 
-    def embed(self, texts: Sequence[str], model: str) -> List[List[float]]:
-        return self.embeddings(texts, model=model)
+    # -------- images --------
+    def generate_image_url(self, *, prompt: str, model: str = "gpt-image-1", size: str = "1024x1024") -> str:
+        resp = self.client.images.generate(model=model, prompt=prompt, size=size)
+        data = getattr(resp, "data", None) or []
+        if not data:
+            raise RuntimeError("No image data returned")
+        url = getattr(data[0], "url", None)
+        if not url:
+            raise RuntimeError("No image URL returned")
+        return str(url)
 
-    def generate_image_url(self, *, model: str, prompt: str, size: str = "1024x1024") -> str:
-        out = self.client.images.generate(model=model, prompt=prompt, size=size)
-        return out.data[0].url
-
-    def transcribe_file(self, fobj, model: str = "whisper-1") -> str:
-        """Распознавание речи. fobj — бинарный file-like (open(...,'rb'))."""
-        res = self.client.audio.transcriptions.create(model=model, file=fobj)
-        return (res.text or "").strip()
-
-    def transcribe_bytes(self, audio_bytes: bytes, filename: str = "audio.ogg", model: str = "whisper-1") -> str:
+    # -------- audio transcription --------
+    def transcribe_bytes(self, *, audio_bytes: bytes, filename: str, model: str = "whisper-1") -> str:
         bio = BytesIO(audio_bytes)
         bio.name = filename
-        return self.transcribe_file(bio, model=model)
+        resp = self.client.audio.transcriptions.create(model=model, file=bio)
+        return str(getattr(resp, "text", "")).strip()
 
-    def vision_extract_text(self, image_bytes: bytes, *, model: str = "gpt-4o-mini") -> str:
-        if not (hasattr(self.client, "responses") and hasattr(self.client.responses, "create")):
-            raise RuntimeError("Responses API is not available in installed OpenAI SDK")
-
-        b64 = base64.b64encode(image_bytes).decode("ascii")
-        resp = self.client.responses.create(
-            model=model,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Извлеки текст с изображения. Если текста нет, кратко опиши содержание."},
-                        {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
-                    ],
-                }
-            ],
-        )
-        return (getattr(resp, "output_text", None) or "").strip()
+    def transcribe_file(self, *, file_path: str, model: str = "whisper-1") -> str:
+        with open(file_path, "rb") as f:
+            bio = BytesIO(f.read())
+        bio.name = file_path.split("/")[-1]
+        resp = self.client.audio.transcriptions.create(model=model, file=bio)
+        return str(getattr(resp, "text", "")).strip()
