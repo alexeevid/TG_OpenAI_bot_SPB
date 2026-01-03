@@ -1,8 +1,9 @@
+# app/services/rag_service.py
 from __future__ import annotations
 
 from ..kb.retriever import Retriever
-from ..services.dialog_kb_service import DialogKBService
 from ..core.types import RetrievedChunk
+from ..services.dialog_kb_service import DialogKBService
 
 
 class RagService:
@@ -11,7 +12,7 @@ class RagService:
         self._dkb = dialog_kb
 
     def retrieve(self, query: str, dialog_id: int, top_k: int = 6) -> list[RetrievedChunk]:
-        if not self._dkb.is_rag_enabled(dialog_id):
+        if not self._dkb.rag_enabled(dialog_id):
             return []
         allowed = self._dkb.allowed_document_ids(dialog_id)
         if not allowed:
