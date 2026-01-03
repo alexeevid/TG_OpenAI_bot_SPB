@@ -5,149 +5,164 @@ import sqlalchemy
 from telegram.ext import Application
 
 from .settings import load_settings
+
+from .db.session import make_session_factory, Base
+from .db.repo_dialogs import DialogsRepo
+from .db.repo_kb import KBRepo
+from .db.repo_dialog_kb import DialogKBRepo
+
 from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
-from .db.session import make_session_factory
-from .db.models import Base
-from .db.repo_dialogs import DialogsRepo
-from .db.repo_kb import KBRepo
-
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
-from .kb.syncer import KBSyncer
 
 from .services.dialog_service import DialogService
-from .services.rag_service import RagService
+from .services.dialog_kb_service import DialogKBService
 from .services.gen_service import GenService
+from .services.rag_service import RagService
 from .services.voice_service import VoiceService
 from .services.image_service import ImageService
-from .services.authz_service import AuthzService
 from .services.search_service import SearchService
-from .clients.web_search_client import WebSearchClient
+from .services.authz_service import AuthzService
 
 from .handlers import (
-    start,
-    help,
-    voice,
-    text,
-    image,
-    model,
-    mode,
-    dialogs,
-    status,
-    errors,
-    kb as kb_handler,
+    start, help as help_h, dialogs, model, mode, kb, image, voice, text, status, errors
 )
 
 
-async def _post_init(app: Application) -> None:
-    try:
-        await app.bot.delete_my_commands()
-        await app.bot.set_my_commands([
-            ("start", "Приветствие и инициализация"),
-            ("help", "Справка по командам"),
-            ("dialogs", "Управление диалогами"),
-            ("model", "Выбрать модель: /model <название>"),
-            ("mode", "Режим ответа: concise|detailed|mcwilliams"),
-            ("img", "Сгенерировать изображение"),
-            ("stats", "Статистика текущего диалога"),
-            ("kb", "Поиск/управление базой знаний"),
-            ("update", "Обновить (sync) базу знаний"),
-            ("status", "Сводка по текущему диалогу"),
-        ])
-    except Exception as e:
-        logging.getLogger(__name__).warning("set_my_commands failed: %s", e)
+log = logging.getLogger(__name__)
 
 
-def _ensure_kb_schema(engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector"))
+def _post_init(app: Application) -> None:
+    # место для post_init, если нужно
+    return
+
+
+def _ensure_schema(engine) -> None:
+    """
+    Railway-friendly schema bootstrap: create tables + minimal ALTERs.
+    Без консоли, без alembic — как у вас уже принято.
+    """
     Base.metadata.create_all(bind=engine)
 
     with engine.begin() as conn:
-        conn.execute(sqlalchemy.text(
-            """
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_name='kb_chunks' AND column_name='embedding'
-                ) THEN
-                    BEGIN
-                        CREATE INDEX IF NOT EXISTS ix_kb_chunks_embedding_ivfflat
-                        ON kb_chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-                    EXCEPTION WHEN others THEN
-                        NULL;
-                    END;
-                END IF;
-            END $$;
-            """
-        ))
+        # dialogs.settings (на случай старых БД)
+        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
+        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
+
+        # kb_documents extensions
+        conn.execute(sqlalchemy.text("ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS resource_id VARCHAR"))
+        conn.execute(sqlalchemy.text("ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS md5 VARCHAR"))
+        conn.execute(sqlalchemy.text("ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS size BIGINT"))
+        conn.execute(sqlalchemy.text("ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS modified_at TIMESTAMP"))
+        conn.execute(sqlalchemy.text("ALTER TABLE kb_documents ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
+
+        conn.execute(sqlalchemy.text("CREATE UNIQUE INDEX IF NOT EXISTS ix_kb_documents_resource_id ON kb_documents (resource_id)"))
+
+        # dialog_kb_documents table
+        conn.execute(sqlalchemy.text("""
+            CREATE TABLE IF NOT EXISTS dialog_kb_documents (
+                id SERIAL PRIMARY KEY,
+                dialog_id INTEGER NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
+                document_id INTEGER NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+                is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_dialog_kb_documents_dialog_doc UNIQUE(dialog_id, document_id)
+            );
+        """))
+        conn.execute(sqlalchemy.text("CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_dialog_id ON dialog_kb_documents (dialog_id)"))
+        conn.execute(sqlalchemy.text("CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_document_id ON dialog_kb_documents (document_id)"))
+
+        # dialog_kb_secrets table
+        conn.execute(sqlalchemy.text("""
+            CREATE TABLE IF NOT EXISTS dialog_kb_secrets (
+                id SERIAL PRIMARY KEY,
+                dialog_id INTEGER NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
+                document_id INTEGER NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+                pdf_password TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_dialog_kb_secrets_dialog_doc UNIQUE(dialog_id, document_id)
+            );
+        """))
+        conn.execute(sqlalchemy.text("CREATE INDEX IF NOT EXISTS ix_dialog_kb_secrets_dialog_id ON dialog_kb_secrets (dialog_id)"))
 
 
 def build_application() -> Application:
     cfg = load_settings()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
 
     if not cfg.telegram_token:
         raise RuntimeError("telegram_token отсутствует в настройках")
-    if not cfg.database_url:
+
+    app = Application.builder() \
+        .token(cfg.telegram_token) \
+        .post_init(_post_init) \
+        .build()
+
+    db_url = cfg.database_url
+    if not db_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках")
 
-    app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
+    session_factory, engine = make_session_factory(db_url)
+    _ensure_schema(engine)
 
-    session_factory, engine = make_session_factory(cfg.database_url)
-
-    _ensure_kb_schema(engine)
-
-    with engine.begin() as conn:
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
-
+    # --- repos ---
     repo_dialogs = DialogsRepo(session_factory)
-    svc_dialog = DialogService(repo_dialogs)
+    kb_repo = KBRepo(session_factory, dim=3072)
+    dialog_kb_repo = DialogKBRepo(session_factory)
 
-    oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-    svc_gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
-    svc_voice = VoiceService(openai_client=oai_client)
-    svc_image = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if cfg.enable_image_generation else None
-    svc_authz = AuthzService(cfg)
-    svc_search = SearchService(WebSearchClient(cfg.web_search_provider))
+    # --- clients ---
+    openai = OpenAIClient(api_key=cfg.openai_api_key) if getattr(cfg, "openai_api_key", None) else OpenAIClient()
+    yd = YandexDiskClient(token=cfg.yandex_token, root_path=getattr(cfg, "yandex_root_path", ""))
 
-    dim = int(getattr(cfg, "pgvector_dim", 3072))
-    kb_repo = KBRepo(session_factory, dim)
-    yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
-    embedder = Embedder(oai_client, cfg.openai_embedding_model)
-    retriever = Retriever(kb_repo, embedder, top_k_default=getattr(cfg, "max_kb_chunks", 6))
-    svc_rag = RagService(retriever)
-    svc_syncer = KBSyncer(yd, embedder, kb_repo, cfg, session_factory)
+    # --- services ---
+    ds = DialogService(repo_dialogs)
+    dkb = DialogKBService(dialog_kb_repo, kb_repo)
 
-    app.bot_data.update({
-        "settings": cfg,
-        "svc_dialog": svc_dialog,
-        "svc_gen": svc_gen,
-        "svc_image": svc_image,
-        "svc_voice": svc_voice,
-        "svc_search": svc_search,
-        "svc_authz": svc_authz,
-        "repo_dialogs": repo_dialogs,
-        "repo_kb": kb_repo,
-        "svc_rag": svc_rag,
-        "yandex": yd,
-        "embedder": embedder,
-        "svc_syncer": svc_syncer,
-    })
+    embedder = Embedder(openai=openai, model="text-embedding-3-large")
+    retriever = Retriever(kb_repo=kb_repo, openai=openai, dim=3072)
+    rag = RagService(retriever=retriever, dialog_kb=dkb)
 
-    start.register(app)
-    help.register(app)
+    gen = GenService(openai=openai)
+    voice_svc = VoiceService(openai=openai)
+    image_svc = ImageService(openai=openai)
+    search_svc = SearchService(WebSearchClient())
+    authz = AuthzService(repo_dialogs)
+
+    # Note: kb syncer (svc_kb_syncer) подключите здесь, если у вас есть стабильный syncer.
+    # Сейчас оставляем только “встроенную” логику. Админские команды в kb.py будут предупреждать, если syncer не настроен.
+
+    # --- bot_data ---
+    app.bot_data["settings"] = cfg
+    app.bot_data["svc_dialog"] = ds
+    app.bot_data["svc_dialog_kb"] = dkb
+    app.bot_data["svc_rag"] = rag
+    app.bot_data["svc_gen"] = gen
+    app.bot_data["svc_voice"] = voice_svc
+    app.bot_data["svc_image"] = image_svc
+    app.bot_data["svc_search"] = search_svc
+    app.bot_data["svc_authz"] = authz
+
+    app.bot_data["repo_dialogs"] = repo_dialogs
+    app.bot_data["kb_repo"] = kb_repo
+    app.bot_data["openai"] = openai
+    app.bot_data["yandex"] = yd
+    app.bot_data["retriever"] = retriever
+    app.bot_data["embedder"] = embedder
+
+    # --- handlers ---
     errors.register(app)
+    start.register(app)
+    help_h.register(app)
     dialogs.register(app)
     model.register(app)
     mode.register(app)
-    kb_handler.register(app)
+    kb.register(app)
     image.register(app)
     voice.register(app)
     text.register(app)
@@ -158,4 +173,8 @@ def build_application() -> Application:
 
 def run() -> None:
     app = build_application()
-    app.run_polling(drop_pending_updates=True, allowed_updates=None, stop_signals=None)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=None,
+        stop_signals=None,
+    )
