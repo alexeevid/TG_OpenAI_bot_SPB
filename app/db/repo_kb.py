@@ -1,12 +1,11 @@
+# app/db/repo_kb.py
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from json import dumps, loads
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sqltext
-
-from .models import KBDocument
 
 
 class KBRepo:
@@ -14,107 +13,164 @@ class KBRepo:
         self.sf = sf
         self.dim = dim
 
-    def upsert_document(
+    # --- documents ---
+    def list_documents_total(self) -> int:
+        with self.sf() as s:
+            row = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents")).first()
+        return int(row[0]) if row else 0
+
+    def catalog(
         self,
         *,
-        path: str,
-        title: str | None = None,
-        resource_id: str | None = None,
-        md5: str | None = None,
-        size: int | None = None,
-        modified_at=None,
-        is_active: bool = True,
-    ) -> int:
+        page: int = 1,
+        page_size: int = 10,
+        search: str = "",
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        Возвращает (items, total_count).
+        """
+        page = max(1, int(page))
+        page_size = min(20, max(5, int(page_size)))
+        q = (search or "").strip()
+
+        where = ""
+        params: Dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+        if q:
+            where = "WHERE (COALESCE(title,'') ILIKE :q OR path ILIKE :q)"
+            params["q"] = f"%{q}%"
+
+        with self.sf() as s:  # type: Session
+            total = s.execute(sqltext(f"SELECT COUNT(*) FROM kb_documents {where}"), params).first()
+            rows = s.execute(
+                sqltext(
+                    f"""
+                    SELECT id, title, path
+                    FROM kb_documents
+                    {where}
+                    ORDER BY id DESC
+                    LIMIT :limit OFFSET :offset
+                    """
+                ),
+                params,
+            ).all()
+
+            # chunks count per doc (batched)
+            ids = [int(r[0]) for r in rows]
+            chunks_map: Dict[int, int] = {}
+            if ids:
+                cr = s.execute(
+                    sqltext(
+                        """
+                        SELECT document_id, COUNT(*)
+                        FROM kb_chunks
+                        WHERE document_id = ANY(:ids)
+                        GROUP BY document_id
+                        """
+                    ),
+                    {"ids": ids},
+                ).all()
+                chunks_map = {int(a): int(b) for a, b in cr}
+
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            did = int(r[0])
+            items.append(
+                {
+                    "id": did,
+                    "title": r[1],
+                    "path": r[2],
+                    "chunks": int(chunks_map.get(did, 0)),
+                }
+            )
+
+        return items, int(total[0]) if total else 0
+
+    def get_document_brief(self, document_id: int) -> Optional[Dict[str, Any]]:
+        with self.sf() as s:
+            row = s.execute(
+                sqltext("SELECT id, title, path FROM kb_documents WHERE id=:id"),
+                {"id": document_id},
+            ).first()
+            if not row:
+                return None
+            c = s.execute(
+                sqltext("SELECT COUNT(*) FROM kb_chunks WHERE document_id=:id"),
+                {"id": document_id},
+            ).first()
+        return {"id": int(row[0]), "title": row[1], "path": row[2], "chunks": int(c[0]) if c else 0}
+
+    # --- stats ---
+    def stats_global(self) -> Dict[str, Any]:
+        with self.sf() as s:
+            docs = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents")).first()
+            chunks = s.execute(sqltext("SELECT COUNT(*) FROM kb_chunks")).first()
+            top = s.execute(
+                sqltext(
+                    """
+                    SELECT d.id, COALESCE(d.title,''), d.path, COUNT(c.id) AS cnt
+                    FROM kb_documents d
+                    LEFT JOIN kb_chunks c ON c.document_id = d.id
+                    GROUP BY d.id
+                    ORDER BY cnt DESC
+                    LIMIT 10
+                    """
+                )
+            ).all()
+
+        return {
+            "documents": int(docs[0]) if docs else 0,
+            "chunks": int(chunks[0]) if chunks else 0,
+            "top_docs": [
+                {"id": int(r[0]), "title": r[1], "path": r[2], "chunks": int(r[3])} for r in top
+            ],
+        }
+
+    def stats_for_document_ids(self, document_ids: List[int]) -> Dict[str, Any]:
+        if not document_ids:
+            return {"documents": 0, "chunks": 0}
+        with self.sf() as s:
+            docs = s.execute(
+                sqltext("SELECT COUNT(*) FROM kb_documents WHERE id = ANY(:ids)"),
+                {"ids": document_ids},
+            ).first()
+            chunks = s.execute(
+                sqltext("SELECT COUNT(*) FROM kb_chunks WHERE document_id = ANY(:ids)"),
+                {"ids": document_ids},
+            ).first()
+        return {
+            "documents": int(docs[0]) if docs else 0,
+            "chunks": int(chunks[0]) if chunks else 0,
+        }
+
+    # --- chunks management (used by your syncer) ---
+    def upsert_document(self, path: str, title: str | None):
+        from .models import KBDocument  # keep existing contract
         with self.sf() as s:  # type: Session
             doc = s.query(KBDocument).filter_by(path=path).first()
-            if not doc and resource_id:
-                doc = s.query(KBDocument).filter_by(resource_id=resource_id).first()
-
             if not doc:
-                doc = KBDocument(
-                    path=path,
-                    title=title,
-                    resource_id=resource_id,
-                    md5=md5,
-                    size=size,
-                    modified_at=modified_at,
-                    is_active=is_active,
-                )
+                doc = KBDocument(path=path, title=title)
                 s.add(doc)
                 s.commit()
                 s.refresh(doc)
                 return int(doc.id)
-
-            # update
-            doc.path = path
             if title is not None:
                 doc.title = title
-            if resource_id is not None:
-                doc.resource_id = resource_id
-            if md5 is not None:
-                doc.md5 = md5
-            if size is not None:
-                doc.size = size
-            if modified_at is not None:
-                doc.modified_at = modified_at
-            doc.is_active = bool(is_active)
-
             s.commit()
             s.refresh(doc)
             return int(doc.id)
-
-    def set_document_active(self, document_id: int, is_active: bool) -> None:
-        with self.sf() as s:
-            doc = s.get(KBDocument, document_id)
-            if not doc:
-                return
-            doc.is_active = bool(is_active)
-            s.commit()
-
-    def get_document_by_ref(self, ref: str) -> Optional[KBDocument]:
-        """
-        ref может быть:
-        - числом (id)
-        - resource_id
-        - path (полный)
-        """
-        ref = (ref or "").strip()
-        if not ref:
-            return None
-
-        with self.sf() as s:
-            if ref.isdigit():
-                return s.get(KBDocument, int(ref))
-
-            doc = s.query(KBDocument).filter_by(resource_id=ref).first()
-            if doc:
-                return doc
-
-            return s.query(KBDocument).filter_by(path=ref).first()
-
-    def list_documents(self, only_active: bool = True) -> list[KBDocument]:
-        with self.sf() as s:
-            q = s.query(KBDocument)
-            if only_active:
-                q = q.filter_by(is_active=True)
-            return q.order_by(KBDocument.updated_at.desc()).all()
 
     def delete_chunks_by_document_id(self, document_id: int) -> None:
         with self.sf() as s:
             s.execute(sqltext("DELETE FROM kb_chunks WHERE document_id = :id"), {"id": document_id})
             s.commit()
 
-    def insert_chunks_bulk(self, rows: Sequence[tuple[int, int, str, list[float]]]) -> None:
-        """
-        rows: (document_id, chunk_order, text, embedding_list)
-        embedding хранится как JSON-строка в kb_chunks.embedding
-        """
+    def insert_chunks_bulk(self, rows: Sequence[Tuple[int, int, str, list[float]]]) -> None:
         payload = []
         for (doc_id, order, text, emb) in rows:
             payload.append(
                 {
-                    "document_id": doc_id,
-                    "chunk_order": order,
+                    "document_id": int(doc_id),
+                    "chunk_order": int(order),
                     "text": text,
                     "embedding": dumps(emb),
                 }
@@ -132,32 +188,32 @@ class KBRepo:
             )
             s.commit()
 
+    # --- retrieval ---
     def search_by_embedding(
         self,
         query_emb: list[float],
         top_k: int,
-        allowed_document_ids: Optional[list[int]] = None,
+        allowed_document_ids: Optional[List[int]] = None,
     ) -> List[Tuple[int, str, float, int]]:
         """
-        Возвращает: (chunk_id, text, distance, document_id)
-
-        distance — условная “дистанция” (меньше = лучше), как у вас в text.py.
+        Возвращает (chunk_id, chunk_text, distance, document_id)
+        distance: меньше = лучше
         """
-        # Подтянем только нужные чанки
-        if allowed_document_ids:
-            with self.sf() as s:
+        top_k = max(1, min(20, int(top_k)))
+
+        with self.sf() as s:
+            if allowed_document_ids:
                 rows = s.execute(
                     sqltext(
                         """
                         SELECT id, text, embedding, document_id
                         FROM kb_chunks
-                        WHERE document_id = ANY(:doc_ids)
+                        WHERE document_id = ANY(:ids)
                         """
                     ),
-                    {"doc_ids": allowed_document_ids},
+                    {"ids": allowed_document_ids},
                 ).all()
-        else:
-            with self.sf() as s:
+            else:
                 rows = s.execute(sqltext("SELECT id, text, embedding, document_id FROM kb_chunks")).all()
 
         def cos_sim(a, b):
@@ -167,12 +223,12 @@ class KBRepo:
             db = math.sqrt(sum(y * y for y in b))
             return num / (da * db + 1e-9)
 
-        scored: list[tuple[int, str, float, int]] = []
+        scored: List[Tuple[int, str, float, int]] = []
         for r in rows:
             emb = loads(r[2])
             score = cos_sim(query_emb, emb)  # больше = ближе
-            distance = 1.0 - score
-            scored.append((int(r[0]), str(r[1]), float(distance), int(r[3])))
+            distance = 1.0 - float(score)
+            scored.append((int(r[0]), str(r[1]), distance, int(r[3])))
 
         scored.sort(key=lambda x: x[2])
         return scored[:top_k]
