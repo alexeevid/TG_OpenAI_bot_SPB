@@ -1,143 +1,186 @@
+# app/db/repo_dialog_kb.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
-
-from .models import Dialog, KBDocument, DialogKBDocument, DialogKBSecret
+from sqlalchemy import text as sqltext
 
 
 class DialogKBRepo:
+    """
+    DB-layer для:
+    - kb_mode (AUTO/ON/OFF) в dialogs.settings (JSONB)
+    - dialog_kb_documents (dialog_id, document_id, is_enabled)
+    - dialog_kb_secrets (dialog_id, document_id, pdf_password)
+    """
+
     def __init__(self, sf):
         self.sf = sf
 
-    # --- kb_mode in Dialog.settings ---
+    # --- mode in dialogs.settings ---
     def get_kb_mode(self, dialog_id: int) -> str:
         with self.sf() as s:  # type: Session
-            d = s.get(Dialog, dialog_id)
-            if not d:
+            row = s.execute(
+                sqltext("SELECT settings FROM dialogs WHERE id=:id"),
+                {"id": dialog_id},
+            ).first()
+            if not row:
                 return "AUTO"
-            settings = d.settings or {}
+            settings = row[0] or {}
             if not isinstance(settings, dict):
                 return "AUTO"
-            mode = (settings.get("kb_mode") or "AUTO").upper()
+            mode = str(settings.get("kb_mode") or "AUTO").upper()
             return mode if mode in ("AUTO", "ON", "OFF") else "AUTO"
 
-    def set_kb_mode(self, dialog_id: int, mode: str) -> None:
-        mode = (mode or "AUTO").upper()
+    def set_kb_mode(self, dialog_id: int, mode: str) -> str:
+        mode = str(mode or "AUTO").upper()
         if mode not in ("AUTO", "ON", "OFF"):
             mode = "AUTO"
 
         with self.sf() as s:
-            d = s.get(Dialog, dialog_id)
-            if not d:
-                return
-            base = d.settings or {}
-            if not isinstance(base, dict):
-                base = {}
-            base["kb_mode"] = mode
-            d.settings = base
+            row = s.execute(
+                sqltext("SELECT settings FROM dialogs WHERE id=:id"),
+                {"id": dialog_id},
+            ).first()
+            settings = (row[0] if row else None) or {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings["kb_mode"] = mode
+
+            s.execute(
+                sqltext("UPDATE dialogs SET settings=:st WHERE id=:id"),
+                {"st": settings, "id": dialog_id},
+            )
             s.commit()
+        return mode
 
     # --- attachments ---
     def list_attached(self, dialog_id: int) -> List[Dict[str, Any]]:
         with self.sf() as s:
-            rows = (
-                s.query(DialogKBDocument, KBDocument)
-                .join(KBDocument, KBDocument.id == DialogKBDocument.document_id)
-                .filter(DialogKBDocument.dialog_id == dialog_id)
-                .order_by(DialogKBDocument.created_at.desc())
-                .all()
+            rows = s.execute(
+                sqltext(
+                    """
+                    SELECT dkd.document_id, dkd.is_enabled,
+                           kd.path, kd.title
+                    FROM dialog_kb_documents dkd
+                    JOIN kb_documents kd ON kd.id = dkd.document_id
+                    WHERE dkd.dialog_id = :did
+                    ORDER BY dkd.document_id ASC
+                    """
+                ),
+                {"did": dialog_id},
+            ).all()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "document_id": int(r[0]),
+                    "is_enabled": bool(r[1]),
+                    "path": r[2],
+                    "title": r[3],
+                }
             )
-            out: List[Dict[str, Any]] = []
-            for link, doc in rows:
-                out.append(
-                    {
-                        "document_id": int(doc.id),
-                        "path": doc.path,
-                        "title": doc.title,
-                        "resource_id": doc.resource_id,
-                        "is_active": bool(doc.is_active),
-                        "is_enabled": bool(link.is_enabled),
-                    }
-                )
-            return out
+        return out
 
     def attach(self, dialog_id: int, document_id: int) -> None:
         with self.sf() as s:
-            existing = (
-                s.query(DialogKBDocument)
-                .filter(and_(DialogKBDocument.dialog_id == dialog_id, DialogKBDocument.document_id == document_id))
-                .first()
+            s.execute(
+                sqltext(
+                    """
+                    INSERT INTO dialog_kb_documents (dialog_id, document_id, is_enabled)
+                    VALUES (:did, :doc, TRUE)
+                    ON CONFLICT (dialog_id, document_id)
+                    DO UPDATE SET is_enabled = TRUE
+                    """
+                ),
+                {"did": dialog_id, "doc": document_id},
             )
-            if existing:
-                existing.is_enabled = True
-                s.commit()
-                return
-            s.add(DialogKBDocument(dialog_id=dialog_id, document_id=document_id, is_enabled=True))
             s.commit()
 
     def detach(self, dialog_id: int, document_id: int) -> None:
         with self.sf() as s:
-            row = (
-                s.query(DialogKBDocument)
-                .filter(and_(DialogKBDocument.dialog_id == dialog_id, DialogKBDocument.document_id == document_id))
-                .first()
+            s.execute(
+                sqltext(
+                    "DELETE FROM dialog_kb_documents WHERE dialog_id=:did AND document_id=:doc"
+                ),
+                {"did": dialog_id, "doc": document_id},
             )
-            if not row:
-                return
-            s.delete(row)
             s.commit()
 
-    def enable(self, dialog_id: int, document_id: int, enabled: bool) -> None:
+    def set_enabled(self, dialog_id: int, document_id: int, enabled: bool) -> None:
         with self.sf() as s:
-            row = (
-                s.query(DialogKBDocument)
-                .filter(and_(DialogKBDocument.dialog_id == dialog_id, DialogKBDocument.document_id == document_id))
-                .first()
+            s.execute(
+                sqltext(
+                    """
+                    UPDATE dialog_kb_documents
+                    SET is_enabled=:en
+                    WHERE dialog_id=:did AND document_id=:doc
+                    """
+                ),
+                {"did": dialog_id, "doc": document_id, "en": bool(enabled)},
             )
-            if not row:
-                return
-            row.is_enabled = bool(enabled)
             s.commit()
+
+    def is_attached(self, dialog_id: int, document_id: int) -> bool:
+        with self.sf() as s:
+            row = s.execute(
+                sqltext(
+                    """
+                    SELECT 1
+                    FROM dialog_kb_documents
+                    WHERE dialog_id=:did AND document_id=:doc
+                    """
+                ),
+                {"did": dialog_id, "doc": document_id},
+            ).first()
+            return bool(row)
 
     def get_allowed_document_ids(self, dialog_id: int) -> List[int]:
         with self.sf() as s:
-            rows = (
-                s.query(DialogKBDocument.document_id)
-                .join(KBDocument, KBDocument.id == DialogKBDocument.document_id)
-                .filter(DialogKBDocument.dialog_id == dialog_id)
-                .filter(DialogKBDocument.is_enabled.is_(True))
-                .filter(KBDocument.is_active.is_(True))
-                .all()
-            )
-            return [int(r[0]) for r in rows]
+            rows = s.execute(
+                sqltext(
+                    """
+                    SELECT document_id
+                    FROM dialog_kb_documents
+                    WHERE dialog_id=:did AND is_enabled=TRUE
+                    ORDER BY document_id ASC
+                    """
+                ),
+                {"did": dialog_id},
+            ).all()
+        return [int(r[0]) for r in rows]
 
-    # --- secrets (pdf passwords) ---
+    # --- secrets (PDF passwords per dialog) ---
     def set_pdf_password(self, dialog_id: int, document_id: int, password: str) -> None:
         password = (password or "").strip()
         if not password:
             return
-
         with self.sf() as s:
-            row = (
-                s.query(DialogKBSecret)
-                .filter(and_(DialogKBSecret.dialog_id == dialog_id, DialogKBSecret.document_id == document_id))
-                .first()
+            s.execute(
+                sqltext(
+                    """
+                    INSERT INTO dialog_kb_secrets (dialog_id, document_id, pdf_password)
+                    VALUES (:did, :doc, :pwd)
+                    ON CONFLICT (dialog_id, document_id)
+                    DO UPDATE SET pdf_password=EXCLUDED.pdf_password, updated_at=NOW()
+                    """
+                ),
+                {"did": dialog_id, "doc": document_id, "pwd": password},
             )
-            if row:
-                row.pdf_password = password
-                s.commit()
-                return
-            s.add(DialogKBSecret(dialog_id=dialog_id, document_id=document_id, pdf_password=password))
             s.commit()
 
     def get_pdf_password(self, dialog_id: int, document_id: int) -> Optional[str]:
         with self.sf() as s:
-            row = (
-                s.query(DialogKBSecret)
-                .filter(and_(DialogKBSecret.dialog_id == dialog_id, DialogKBSecret.document_id == document_id))
-                .first()
-            )
-            return row.pdf_password if row else None
+            row = s.execute(
+                sqltext(
+                    """
+                    SELECT pdf_password
+                    FROM dialog_kb_secrets
+                    WHERE dialog_id=:did AND document_id=:doc
+                    """
+                ),
+                {"did": dialog_id, "doc": document_id},
+            ).first()
+        return str(row[0]) if row else None
