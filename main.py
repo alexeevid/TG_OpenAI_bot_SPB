@@ -66,6 +66,10 @@ def _ensure_schema(engine) -> None:
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR"))
         conn.execute(sqlalchemy.text("UPDATE users SET role='user' WHERE role IS NULL"))
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
+        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
+        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
+        conn.execute(sqlalchemy.text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
+
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
         # для совместимости с ветками/патчами, где модель User содержит updated_at
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
