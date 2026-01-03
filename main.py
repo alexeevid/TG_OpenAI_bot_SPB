@@ -1,89 +1,51 @@
+# app/main.py
 from __future__ import annotations
 
 import logging
+import os
+
 import sqlalchemy
-from telegram.ext import Application
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
-from .settings import load_settings
-
-from .clients.openai_client import OpenAIClient
-from .clients.yandex_disk_client import YandexDiskClient
-
-from .db.session import make_session_factory
-from .db.models import Base
-from .db.repo_dialogs import DialogsRepo
-from .db.repo_kb import KBRepo
-from .db.repo_dialog_kb import DialogKBRepo
-
-from .kb.embedder import Embedder
-from .kb.retriever import Retriever
-from .kb.syncer import KBSyncer
-
-from .services.dialog_service import DialogService
-from .services.dialog_kb_service import DialogKBService
-from .services.gen_service import GenService
-from .services.rag_service import RagService
-from .services.voice_service import VoiceService
-from .services.image_service import ImageService
-from .services.authz_service import AuthzService
-
-from .handlers import start, help, errors, dialogs, model, mode, image, voice, text, status, kb, admin
-from .handlers import kb_ui
+from .config import get_settings
+from .db.session import get_engine
+from .handlers import (
+    admin,
+    dialogs,
+    help as help_handler,
+    image,
+    kb,
+    model,
+    mode,
+    reset,
+    stats,
+    status,
+    text,
+    voice,
+)
 
 log = logging.getLogger(__name__)
 
 
-async def _post_init(app: Application) -> None:
-    try:
-        await app.bot.set_my_commands([
-            ("start", "Старт"),
-            ("help", "Помощь"),
-            ("dialogs", "Управление диалогами"),
-            ("model", "Выбрать модель: /model <название>"),
-            ("mode", "Режим ответа: concise|detailed|mcwilliams"),
-            ("img", "Сгенерировать изображение"),
-            ("stats", "Статистика текущего диалога"),
-            ("kb", "База знаний: /kb"),
-            ("status", "Сводка по текущему диалогу"),
-            ("whoami", "Показать роль/доступ"),
-            ("reset", "Сбросить текущий диалог"),
-        ])
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
-
-
-def _ensure_schema(engine) -> None:
+def _ensure_dialog_kb_schema(engine) -> None:
     """
-    Railway-friendly bootstrap: если у вас нет консоли/alembic,
-    таблицы и недостающие колонки создаём/добавляем на старте.
-
-    Это безопасно: используются только IF NOT EXISTS.
+    Railway-friendly bootstrap: создаём нужные таблицы без alembic/консоли.
     """
     with engine.begin() as conn:
-        # users
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_id VARCHAR"))
-        conn.execute(sqlalchemy.text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_tg_id ON users (tg_id)"))
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR"))
-        conn.execute(sqlalchemy.text("UPDATE users SET role='user' WHERE role IS NULL"))
+        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
+
+        # FIX: модели ожидают updated_at, но в старой схеме (001_initial) этих колонок нет
         conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
         conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
         conn.execute(sqlalchemy.text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
 
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
-        # для совместимости с ветками/патчами, где модель User содержит updated_at
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-
-        # dialogs
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS title VARCHAR DEFAULT ''"))
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-
-        # messages
-        conn.execute(sqlalchemy.text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()"))
-
-        # dialog<->kb mapping (диалоговая БЗ)
         conn.execute(sqlalchemy.text("""
             CREATE TABLE IF NOT EXISTS dialog_kb_documents (
                 dialog_id INTEGER NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
@@ -93,8 +55,12 @@ def _ensure_schema(engine) -> None:
                 CONSTRAINT uq_dialog_kb_documents UNIQUE(dialog_id, document_id)
             );
         """))
-        conn.execute(sqlalchemy.text("CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_dialog_id ON dialog_kb_documents (dialog_id)"))
-        conn.execute(sqlalchemy.text("CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_document_id ON dialog_kb_documents (document_id)"))
+        conn.execute(sqlalchemy.text(
+            "CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_dialog_id ON dialog_kb_documents (dialog_id)"
+        ))
+        conn.execute(sqlalchemy.text(
+            "CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_document_id ON dialog_kb_documents (document_id)"
+        ))
 
         # pdf secrets per dialog (forward compat)
         conn.execute(sqlalchemy.text("""
@@ -109,96 +75,63 @@ def _ensure_schema(engine) -> None:
 
 
 def build_application() -> Application:
-    cfg = load_settings()
+    """
+    Собираем PTB Application, регистрируем хендлеры, подключаем БД.
+    """
+    settings = get_settings()
 
+    # logging
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    if not cfg.telegram_token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN отсутствует в настройках")
+    # DB engine
+    engine = get_engine(settings.DATABASE_URL)
+    _ensure_dialog_kb_schema(engine)
 
-    app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
+    app = Application.builder().token(settings.TELEGRAM_TOKEN).build()
 
-    if not cfg.database_url:
-        raise RuntimeError("DATABASE_URL отсутствует в настройках")
+    # Commands
+    app.add_handler(CommandHandler("start", help_handler.start_handler))
+    app.add_handler(CommandHandler("help", help_handler.help_handler))
+    app.add_handler(CommandHandler("reset", reset.reset_handler))
+    app.add_handler(CommandHandler("stats", stats.stats_handler))
+    app.add_handler(CommandHandler("kb", kb.kb_handler))
+    app.add_handler(CommandHandler("model", model.model_handler))
+    app.add_handler(CommandHandler("dialogs", dialogs.dialogs_handler))
+    app.add_handler(CommandHandler("dialog", dialogs.dialog_open_handler))
+    app.add_handler(CommandHandler("status", status.status_handler))
 
-    session_factory, engine = make_session_factory(cfg.database_url)
-    Base.metadata.create_all(bind=engine)
-    _ensure_schema(engine)
+    # Admin / KB sync
+    app.add_handler(CommandHandler("kb_sync", admin.kb_sync_handler))
+    app.add_handler(CommandHandler("kb_reindex", admin.kb_reindex_handler))
 
-    # repos
-    repo_dialogs = DialogsRepo(session_factory)
-    repo_kb = KBRepo(session_factory, getattr(cfg, "pgvector_dim", 3072))
-    repo_dialog_kb = DialogKBRepo(session_factory)
+    # Callback queries
+    app.add_handler(CallbackQueryHandler(model.model_callback_handler, pattern=r"^model:"))
+    app.add_handler(CallbackQueryHandler(mode.mode_callback_handler, pattern=r"^mode:"))
+    app.add_handler(CallbackQueryHandler(dialogs.dialogs_callback_handler, pattern=r"^dlg:"))
+    app.add_handler(CallbackQueryHandler(kb.kb_callback_handler, pattern=r"^kb:"))
 
-    # services
-    ds = DialogService(repo_dialogs)
-    authz = AuthzService(cfg)
-
-    oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-    gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
-    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if getattr(cfg, "enable_image_generation", False) else None
-    vs = VoiceService(openai_client=oai_client)
-
-    yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
-    embedder = Embedder(oai_client, cfg.openai_embedding_model)
-    retriever = Retriever(repo_kb, oai_client, getattr(cfg, "pgvector_dim", 3072))
-
-    dialog_kb = DialogKBService(repo_dialog_kb, repo_kb)
-    rag = RagService(retriever, dialog_kb)
-
-    syncer = KBSyncer(yd, embedder, repo_kb, cfg)
-
-    app.bot_data.update({
-        "settings": cfg,
-        "repo_dialogs": repo_dialogs,
-        "repo_kb": repo_kb,
-
-        "svc_dialog": ds,
-        "svc_authz": authz,
-        "svc_gen": gen,
-        "svc_image": img,
-        "svc_voice": vs,
-
-        "svc_dialog_kb": dialog_kb,
-        "svc_rag": rag,
-
-        "yandex": yd,
-        "embedder": embedder,
-        "svc_syncer": syncer,
-    })
-
-    # handlers
-    start.register(app)
-    help.register(app)
-    errors.register(app)
-
-    # dialogs BEFORE text
-    dialogs.register(app)
-
-    model.register(app)
-    mode.register(app)
-    image.register(app)
-    voice.register(app)
-    text.register(app)
-    status.register(app)
-
-    # admin/basic
-    admin.register(app)
-
-    # KB + UI callbacks
-    kb.register(app)
-    kb_ui.register(app)
+    # Messages
+    app.add_handler(MessageHandler(filters.VOICE, voice.voice_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, image.photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text.text_handler))
 
     return app
 
 
 def run() -> None:
+    """
+    Точка входа: run_polling.
+    PTB ожидает coroutine. Здесь обязателен async + await.
+    """
     app = build_application()
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=None,
-        stop_signals=None,
-    )
+
+    # Важно: в Railway/Render/Heroku нельзя запускать два инстанса polling одновременно
+    # иначе будет 409 Conflict (getUpdates).
+    app.run_polling(allowed_updates=Application.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    run()
