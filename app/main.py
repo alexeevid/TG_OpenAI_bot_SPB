@@ -34,9 +34,12 @@ from .handlers import kb_ui  # inline UI callbacks
 log = logging.getLogger(__name__)
 
 
-def _post_init(app: Application) -> None:
+async def _post_init(app: Application) -> None:
+    """
+    PTB ожидает coroutine. Здесь обязателен async + await.
+    """
     try:
-        app.bot.set_my_commands([
+        await app.bot.set_my_commands([
             ("start", "Старт"),
             ("help", "Помощь"),
             ("dialogs", "Управление диалогами"),
@@ -127,7 +130,7 @@ def build_application() -> Application:
     dialog_kb = DialogKBService(repo_dialog_kb, repo_kb)
     rag = RagService(retriever, dialog_kb)
 
-    # ✅ FIX: syncer needs session_factory
+    # syncer (админские /kb sync/scan/status)
     syncer = KBSyncer(yd, embedder, repo_kb, cfg, session_factory)
 
     # --- bot_data ---
