@@ -29,8 +29,7 @@ from .services.image_service import ImageService
 from .services.authz_service import AuthzService
 
 from .handlers import start, help, errors, dialogs, model, mode, image, voice, text, status, kb
-from .handlers import kb_ui  # NEW
-
+from .handlers import kb_ui  # inline UI callbacks
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +116,7 @@ def build_application() -> Application:
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
     gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
 
-    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if cfg.enable_image_generation else None
+    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if getattr(cfg, "enable_image_generation", False) else None
     vs = VoiceService(openai_client=oai_client)
 
     # KB core
@@ -128,8 +127,8 @@ def build_application() -> Application:
     dialog_kb = DialogKBService(repo_dialog_kb, repo_kb)
     rag = RagService(retriever, dialog_kb)
 
-    # syncer (если нужен админский /kb sync)
-    syncer = KBSyncer(yd, embedder, repo_kb, cfg)
+    # ✅ FIX: syncer needs session_factory
+    syncer = KBSyncer(yd, embedder, repo_kb, cfg, session_factory)
 
     # --- bot_data ---
     app.bot_data.update({
@@ -156,12 +155,12 @@ def build_application() -> Application:
     help.register(app)
     errors.register(app)
 
-    dialogs.register(app)  # важно до text
+    dialogs.register(app)
     model.register(app)
     mode.register(app)
 
-    kb.register(app)       # NEW
-    kb_ui.register(app)    # NEW (callback UI)
+    kb.register(app)
+    kb_ui.register(app)
 
     image.register(app)
     voice.register(app)
