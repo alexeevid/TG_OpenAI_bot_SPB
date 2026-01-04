@@ -14,56 +14,58 @@ from ..core.types import RetrievedChunk
 log = logging.getLogger(__name__)
 
 
-def _system_prompt(mode: str | None) -> str:
-    base = "Ты ассистент в Telegram-боте. Отвечай по-русски, структурировано и по делу."
-    if mode == "concise":
-        return base + " Отвечай кратко, максимум 6-10 строк, без лишних вступлений."
-    if mode == "mcwilliams":
-        return base + " Используй стиль Мак-Вильямс: наблюдения, гипотезы, осторожные формулировки, без категоричности."
-    return base + " Давай примеры и рекомендации, если уместно."
-
-
-def _format_kb_context(chunks: List[RetrievedChunk]) -> str:
-    """
-    Best practice: краткие выдержки + источники.
-    Сильно не раздуваем prompt.
-    """
+def _format_kb_context(results: List[RetrievedChunk]) -> str:
     lines = []
-    for i, c in enumerate(chunks, start=1):
-        txt = (c.text or "").strip().replace("\n", " ")
-        if len(txt) > 380:
-            txt = txt[:380] + "..."
-        src = ""
-        if c.document_title or c.document_path:
-            label = (c.document_title or c.document_path or "").strip()
-            src = f" (источник: {label})"
-        lines.append(f"{i}. {txt}{src}")
+    for r in results:
+        src = r.meta.get("source", "")
+        page = r.meta.get("page", "")
+        score = r.score
+        chunk = (r.text or "").strip()
+        if len(chunk) > 800:
+            chunk = chunk[:800] + "…"
+        lines.append(f"- Источник: {src} стр.{page} (score={score:.3f})\n  {chunk}")
     return "\n".join(lines)
 
 
 async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    ds: DialogService = context.bot_data.get("svc_dialog")
-    gen: GenService = context.bot_data.get("svc_gen")
-    if not ds or not gen or not update.effective_user:
-        await update.message.reply_text("⚠️ Сервисы не настроены.")
+    az: AuthzService = context.bot_data.get("svc_authz")
+    if az and update.effective_user and not az.is_allowed(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Доступ запрещен.")
         return
 
-    d = ds.get_active_dialog(update.effective_user.id)
+    ds: DialogService = context.bot_data.get("svc_dialog")
+    gs: GenService = context.bot_data.get("svc_gen")
+    rag: RagService = context.bot_data.get("svc_rag")
+    cfg = context.bot_data.get("settings")
+
+    if not ds or not gs or not cfg or not update.effective_user:
+        await update.effective_message.reply_text("⚠️ Сервисы не настроены.")
+        return
+
+    d = ds.ensure_active_dialog(update.effective_user.id)
     settings = ds.get_active_settings(update.effective_user.id)
-    model = settings.get("text_model") or getattr(context.bot_data.get("settings"), "text_model", None)
+
+    model = settings.get("text_model") or cfg.text_model
     mode = settings.get("mode") or "detailed"
 
-    sys = _system_prompt(mode)
+    # system prompt
+    sys = (
+        "Ты — профессиональный ассистент. "
+        "Отвечай на русском, структурировано и предметно. "
+        "Если пользователь просит ссылки/цитаты — приводи их. "
+    )
+    if mode == "short":
+        sys += "Пиши максимально кратко, только по сути."
+    elif mode == "detailed":
+        sys += "Пиши развёрнуто, с чек-листами и шагами."
 
-    # ---- FAIL-SAFE KB ----
-    rag: RagService = context.bot_data.get("svc_rag")
+    # RAG from KB
     results: List[RetrievedChunk] = []
     if rag:
         try:
-            results = rag.retrieve(text, dialog_id=d.id, top_k=4)
+            results = rag.search_in_active_dialog(d.id, text, k=6)
         except Exception as e:
-            # критично: KB не должна валить основной ответ
-            log.exception("RAG retrieve failed (ignored): %s", e)
+            log.exception("RAG search failed: %s", e)
             results = []
 
     if results:
@@ -79,60 +81,37 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     history_rows = ds.history(d.id, limit=24)
     history: List[Dict[str, str]] = [
         {"role": m.role, "content": m.content}
-        for m in history_rows if m.role in ("user", "assistant")
+        for m in history_rows if m
     ]
 
-    ds.add_user_message(d.id, text)
-
     try:
-        answer = await gen.chat(text, history=history, model=model, system_prompt=sys)
+        answer = await gs.generate_text(
+            model=model,
+            system=sys,
+            history=history,
+            user_text=text,
+        )
     except Exception as e:
         log.exception("GEN failed: %s", e)
-        await update.message.reply_text("⚠️ Ошибка генерации... Попробуйте /model и выберите другую модель.")
+        await update.effective_message.reply_text("⚠️ Ошибка генерации.")
         return
 
-    ds.add_assistant_message(d.id, answer)
+    ds.add_message(d.id, role="user", content=text)
+    ds.add_message(d.id, role="assistant", content=answer)
 
-    # Опционально: если KB использовалась — добавить короткий блок источников
-    if results:
-        src_lines = []
-        seen = set()
-        for c in results:
-            key = (c.document_id, c.document_title, c.document_path)
-            if key in seen:
-                continue
-            seen.add(key)
-            label = (c.document_title or c.document_path or "").strip()
-            if label:
-                src_lines.append(f"- {label}")
-        if src_lines:
-            answer = answer + "\n\nИсточники (БЗ):\n" + "\n".join(src_lines[:6])
-
-    await update.message.reply_text(answer)
+    await update.effective_message.reply_text(answer)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user:
-        az: AuthzService = context.bot_data.get("svc_authz")
-        if az and not az.is_allowed(update.effective_user.id):
-            await update.message.reply_text("⛔ Доступ запрещен.")
-            return
-
-    if not update.message or not update.message.text:
+    msg = update.effective_message
+    if not msg or not getattr(update, "message", None):
         return
-
-    # Обработка переименования диалога (сохраняем вашу текущую логику)
-    if "rename_dialog_id" in context.user_data:
-        new_name = update.message.text.strip()
-        dialog_id = context.user_data.pop("rename_dialog_id")
-        repo = context.bot_data.get("repo_dialogs")
-        if repo:
-            repo.rename_dialog(dialog_id, new_name)
-            await update.message.reply_text(f"✅ Диалог переименован в: {new_name}")
+    text = (update.message.text or "").strip()
+    if not text:
         return
-
-    await process_text(update, context, update.message.text.strip())
+    await process_text(update, context, text)
 
 
 def register(app: Application) -> None:
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # Catch-all для текста должен идти с низким приоритетом, чтобы не “съедать” состояния ConversationHandler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=10)
