@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import logging
-import os
 
-import sqlalchemy
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -14,7 +12,6 @@ from telegram.ext import (
 )
 
 from .config import get_settings
-from .db.session import get_engine
 from .handlers import (
     admin,
     dialogs,
@@ -33,62 +30,22 @@ from .handlers import (
 log = logging.getLogger(__name__)
 
 
-def _ensure_dialog_kb_schema(engine) -> None:
-    """
-    Railway-friendly bootstrap: создаём нужные таблицы без alembic/консоли.
-    """
-    with engine.begin() as conn:
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS settings JSONB"))
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS active_dialog_id INTEGER"))
-
-        # FIX: модели ожидают updated_at, но в старой схеме (001_initial) этих колонок нет
-        conn.execute(sqlalchemy.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
-        conn.execute(sqlalchemy.text("ALTER TABLE dialogs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
-        conn.execute(sqlalchemy.text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"))
-
-        conn.execute(sqlalchemy.text("""
-            CREATE TABLE IF NOT EXISTS dialog_kb_documents (
-                dialog_id INTEGER NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
-                document_id INTEGER NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
-                is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                CONSTRAINT uq_dialog_kb_documents UNIQUE(dialog_id, document_id)
-            );
-        """))
-        conn.execute(sqlalchemy.text(
-            "CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_dialog_id ON dialog_kb_documents (dialog_id)"
-        ))
-        conn.execute(sqlalchemy.text(
-            "CREATE INDEX IF NOT EXISTS ix_dialog_kb_documents_document_id ON dialog_kb_documents (document_id)"
-        ))
-
-        # pdf secrets per dialog (forward compat)
-        conn.execute(sqlalchemy.text("""
-            CREATE TABLE IF NOT EXISTS dialog_kb_secrets (
-                dialog_id INTEGER NOT NULL REFERENCES dialogs(id) ON DELETE CASCADE,
-                document_id INTEGER NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
-                pdf_password TEXT NOT NULL,
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                CONSTRAINT uq_dialog_kb_secrets UNIQUE(dialog_id, document_id)
-            );
-        """))
+def _configure_logging(log_level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
 
 def build_application() -> Application:
     """
-    Собираем PTB Application, регистрируем хендлеры, подключаем БД.
+    Собираем PTB Application и регистрируем хендлеры.
+
+    Важно: схема БД НЕ создаётся здесь. Схема управляется Alembic-миграциями
+    (в Railway/Docker: python -m alembic upgrade head перед запуском бота).
     """
     settings = get_settings()
-
-    # logging
-    logging.basicConfig(
-        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-    # DB engine
-    engine = get_engine(settings.DATABASE_URL)
-    _ensure_dialog_kb_schema(engine)
+    _configure_logging(settings.LOG_LEVEL)
 
     app = Application.builder().token(settings.TELEGRAM_TOKEN).build()
 
@@ -123,14 +80,14 @@ def build_application() -> Application:
 
 def run() -> None:
     """
-    Точка входа: run_polling.
-    PTB ожидает coroutine. Здесь обязателен async + await.
+    Точка входа: run_polling (long-running процесс).
+
+    Важно: в Railway нельзя запускать два инстанса polling одновременно,
+    иначе будет 409 Conflict (getUpdates).
     """
     app = build_application()
-
-    # Важно: в Railway/Render/Heroku нельзя запускать два инстанса polling одновременно
-    # иначе будет 409 Conflict (getUpdates).
     app.run_polling(allowed_updates=Application.ALL_TYPES)
+
 
 if __name__ == "__main__":
     run()
