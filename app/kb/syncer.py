@@ -15,149 +15,148 @@ from app.kb.parsers import (
     parse_docx_bytes,
     parse_image_bytes_best_effort,
     parse_pdf_bytes,
-    parse_text_bytes,
+    parse_txt_bytes,
     parse_xlsx_bytes,
 )
 
 log = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class SyncResult:
-    scanned: int
-    indexed: int
-    skipped: int
-    errors: int
+    scanned: int = 0
+    indexed: int = 0
+    skipped: int = 0
+    errors: int = 0
 
 
 class KbSyncer:
-    """Synchronize KB documents from Yandex.Disk into Postgres.
+    """
+    Синхронизация базы знаний (Яндекс.Диск -> kb_documents + kb_chunks).
 
-    Design intent:
-    - metadata is stored in kb_documents
-    - chunks+embeddings are stored in kb_chunks (pgvector)
-    - encrypted PDFs are not indexed by batch sync (require password, handled separately)
+    Best practice:
+    - Единственный реестр документов: kb_documents
+    - Delete-propagation: файлы, исчезнувшие с Диска, становятся is_active=false
+    - Индексация делается через KbIndexer (эмбеддинги -> pgvector)
+    - Пароли PDF НЕ храним глобально: только per-dialog (dialog_kb_secrets) — это решается отдельно
     """
 
-    def __init__(self, yandex_client, db, openai_client, cfg: Optional[Settings] = None):
+    def __init__(self, settings: Settings, repo: KBRepo, indexer: KbIndexer, yandex_client: Any):
+        self._cfg = settings
+        self._repo = repo
+        self._indexer = indexer
         self._y = yandex_client
-        self._cfg = cfg or Settings()
-        # KBRepo expects session factory + dim
-        self._repo = KBRepo(db, dim=self._cfg.embedding_dim)
 
-        from app.kb.embedder import Embedder
-        embedder = Embedder(openai_client=openai_client, model=self._cfg.openai_embedding_model)
-        self._indexer = KbIndexer(
-            kb_repo=self._repo,
-            embedder=embedder,
-            chunk_size=self._cfg.chunk_size,
-            overlap=self._cfg.chunk_overlap,
-        )
+    def _parse_to_text(self, filename: str, data: bytes) -> str:
+        ext = detect_ext(filename)
 
-    def sync(self) -> Dict[str, Any]:
-        files = self._y.list_kb_files_metadata()
-        scanned = len(files)
-        indexed = 0
-        skipped = 0
-        errors = 0
+        if ext in ("txt", "md", "log"):
+            return parse_txt_bytes(data)
 
-        # Mark all documents as inactive first; reactivate on scan (delete propagation)
+        if ext in ("pdf",):
+            return parse_pdf_bytes(data)
+
+        if ext in ("docx",):
+            return parse_docx_bytes(data)
+
+        if ext in ("xlsx", "xls"):
+            return parse_xlsx_bytes(data)
+
+        if ext in ("csv",):
+            return parse_csv_bytes(data)
+
+        if is_image_ext(ext):
+            # best effort: иногда из изображений есть смысл извлечь хоть что-то
+            return parse_image_bytes_best_effort(data)
+
+        # неизвестный формат -> пусто (пропускаем)
+        return ""
+
+    def run(self) -> SyncResult:
+        """
+        Полный проход:
+        1) Получаем список файлов БЗ с Я.Диска (metadata)
+        2) Помечаем все документы is_active=false
+        3) Для каждого файла:
+           - upsert kb_documents (is_active=true + метаданные)
+           - если md5/modified изменился — перегенерируем chunks+embeddings
+        """
+        res = SyncResult()
+
+        files = self._y.list_kb_files_metadata()  # must return list[dict]
+        res.scanned = len(files)
+
+        # Delete propagation: по умолчанию всё "неактивно", оживляем по факту скана
         try:
             self._repo.mark_all_documents_inactive()
-        except Exception:
-            # if table empty/no permissions, do not fail hard
-            pass
+        except Exception as e:
+            log.warning("mark_all_documents_inactive failed (continue): %s", e)
 
         for f in files:
             try:
-                rid = (f.get("resource_id") or "").strip()
-                path = (f.get("path") or "").strip()
+                path = f.get("path") or f.get("full_path") or ""
                 if not path:
+                    res.skipped += 1
                     continue
 
-                title = path.rsplit("/", 1)[-1]
+                title = f.get("name") or f.get("title") or path.split("/")[-1]
+                resource_id = f.get("resource_id")
+                mime_type = f.get("mime_type")
                 md5 = f.get("md5")
                 size = f.get("size")
-                modified = f.get("modified")
-                modified_at = None
-                if isinstance(modified, str):
-                    # ISO 8601 (Yandex) e.g. 2025-01-01T10:20:30+00:00
+                modified_at = f.get("modified_at")
+
+                # modified_at может быть str -> datetime; repo обычно умеет сам, но подстрахуемся
+                if isinstance(modified_at, str):
                     try:
-                        modified_at = datetime.fromisoformat(modified.replace("Z", "+00:00")).replace(tzinfo=None)
+                        modified_at = datetime.fromisoformat(modified_at.replace("Z", "+00:00"))
                     except Exception:
                         modified_at = None
 
-                # upsert metadata and reactivate
-                doc_id = self._repo.upsert_document(
+                doc = self._repo.upsert_document(
                     path=path,
                     title=title,
-                    resource_id=rid or None,
+                    resource_id=resource_id,
+                    mime_type=mime_type,
                     md5=md5,
                     size=size,
                     modified_at=modified_at,
                     is_active=True,
-                    status="new",
-                    last_error=None,
                 )
 
-                # Determine if we need reindex
-                if not self._repo.document_needs_reindex(doc_id, md5=md5, modified_at=modified_at, size=size):
-                    skipped += 1
-                    self._repo.set_document_status(doc_id, status="indexed", last_error=None)
+                # решаем, нужно ли переиндексировать
+                needs_reindex = self._repo.document_needs_reindex(doc_id=doc.id, md5=md5, modified_at=modified_at)
+                if not needs_reindex:
+                    res.skipped += 1
                     continue
 
-                ext = detect_ext(path)
-                blob = self._y.download(path)
+                # скачиваем контент
+                data: bytes = self._y.download_bytes(path)
+                text = self._parse_to_text(title, data).strip()
 
-                if not blob:
-                    errors += 1
-                    self._repo.set_document_status(doc_id, status="error", last_error="empty_download")
+                # если PDF запаролен — парсер обычно бросит исключение/вернёт пусто
+                # repo фиксирует флаг pdf_password_required, чтобы UI мог запросить пароль в диалоге
+                if not text:
+                    self._repo.set_pdf_password_required(doc.id, True)
+                    res.skipped += 1
                     continue
 
-                # Parse content
-                text: str = ""
-                if ext in (".txt", ".md"):
-                    text = parse_text_bytes(blob)
-                elif ext in (".docx",):
-                    text = parse_docx_bytes(blob)
-                elif ext in (".xlsx",):
-                    text = parse_xlsx_bytes(blob)
-                elif ext in (".pptx",):
-                    text = parse_pptx_bytes(blob)
-                elif ext in (".csv",):
-                    text = parse_csv_bytes(blob)
-                elif ext in (".pdf",):
-                    parsed = parse_pdf_bytes(blob, password=None)
-                    if parsed.get("needs_password"):
-                        errors += 1
-                        self._repo.set_document_status(doc_id, status="error", last_error="pdf_password_required")
-                        continue
-                    text = parsed.get("text") or ""
-                elif is_image_ext(ext):
-                    text = parse_image_bytes_best_effort(blob)
-                else:
-                    # unknown type
-                    skipped += 1
-                    self._repo.set_document_status(doc_id, status="skipped", last_error=f"unsupported_ext:{ext}")
-                    continue
+                self._repo.set_pdf_password_required(doc.id, False)
 
-                if not text.strip():
-                    skipped += 1
-                    self._repo.set_document_status(doc_id, status="skipped", last_error="empty_text")
-                    continue
-
-                cnt = self._indexer.reindex_document(doc_id, text)
-                indexed += 1 if cnt > 0 else 0
-                self._repo.set_document_indexed(doc_id)
+                # индексируем
+                self._indexer.reindex_document(doc_id=doc.id, document_text=text)
+                res.indexed += 1
 
             except Exception as e:
-                errors += 1
-                log.exception("KB sync error: %s", e)
-                try:
-                    # best-effort: mark last processed doc as error
-                    if "doc_id" in locals():
-                        self._repo.set_document_status(int(doc_id), status="error", last_error=str(e)[:1500])
-                except Exception:
-                    pass
+                log.exception("KB sync failed for file=%s: %s", f, e)
+                res.errors += 1
 
-        return SyncResult(scanned=scanned, indexed=indexed, skipped=skipped, errors=errors).__dict__
+        return res
+
+
+# ------------------------------------------------------------
+# Backward compatibility / stable public API name
+# ------------------------------------------------------------
+# app.main импортирует KBSyncer, а часть модулей может использовать KbSyncer.
+# Держим оба имени, чтобы правки в одном месте не аффектили остальное.
+KBSyncer = KbSyncer
