@@ -45,7 +45,6 @@ class KbIndexer:
     - публичный метод reindex_document поддерживает оба контракта:
       * reindex_document(document_id=..., text=...)
       * reindex_document(doc_id=..., document_text=...)
-    - не ломается при частичной отладке Syncer/Repo.
     """
 
     def __init__(self, kb_repo: KBRepo, embedder: Embedder, chunk_size: int, overlap: int):
@@ -62,16 +61,14 @@ class KbIndexer:
         doc_id: int | None = None,
         document_text: str | None = None,
     ) -> int:
-        # нормализуем входные параметры (оба варианта поддерживаем)
-        did = int(document_id if document_id is not None else doc_id or 0)
-        txt = text if text is not None else (document_text or "")
-
+        did = int(document_id if document_id is not None else (doc_id or 0))
         if did <= 0:
             raise ValueError("reindex_document: document_id/doc_id is required")
+
+        txt = text if text is not None else (document_text or "")
         txt = (txt or "").strip()
 
         chunks = split_text(txt, self._chunk_size, self._overlap)
-
         if not chunks:
             self._repo.delete_chunks_by_document_id(did)
             return 0
