@@ -1,36 +1,34 @@
-from logging.config import fileConfig
+from __future__ import annotations
+
 import os
+import logging
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.db.session import Base
-from app.db import models  # noqa: F401  (важно: импорт моделей для регистрации metadata)
+from app.db import models  # noqa: F401  # важно: регистрация моделей
 
 
-# Alembic Config object, which provides access to the values within the .ini file in use.
+# Alembic Config object (читает alembic.ini)
 config = context.config
 
-# Configure Python logging.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Ваш alembic.ini минимальный и не содержит logging-sections,
+# поэтому fileConfig(config.config_file_name) использовать нельзя.
+# Делаем безопасную базовую настройку логов.
+logging.basicConfig(level=logging.INFO)
 
-# ----
-# IMPORTANT: Railway передаёт креды БД через env (DATABASE_URL).
-# Alembic.ini не должен пытаться интерполировать %(DATABASE_URL)s — это ломает configparser.
-# Подставляем URL программно.
-# ----
+# Подставляем DATABASE_URL из окружения Railway
 db_url = os.getenv("DATABASE_URL")
 if not db_url:
     raise RuntimeError("DATABASE_URL is not set (Railway Variables).")
 
-# Если вдруг в окружении окажется старый формат с +psycopg (не ваш кейс, но безопасно),
-# можно мягко нормализовать под psycopg2-binary:
-# db_url = db_url.replace("postgresql+psycopg://", "postgresql://")
+# Нормализация на всякий случай (у вас psycopg2-binary)
+db_url = db_url.replace("postgresql+psycopg://", "postgresql://")
 
 config.set_main_option("sqlalchemy.url", db_url)
 
-# Metadata for 'autogenerate' support.
+# Metadata для autogenerate
 target_metadata = Base.metadata
 
 
@@ -44,7 +42,6 @@ def run_migrations_offline() -> None:
         compare_type=True,
         dialect_opts={"paramstyle": "named"},
     )
-
     with context.begin_transaction():
         context.run_migrations()
 
@@ -67,7 +64,6 @@ def run_migrations_online() -> None:
             target_metadata=target_metadata,
             compare_type=True,
         )
-
         with context.begin_transaction():
             context.run_migrations()
 
