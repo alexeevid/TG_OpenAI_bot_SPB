@@ -23,16 +23,33 @@ class KBRepo:
             row = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE")).first()
             return int(row[0]) if row else 0
 
-    def catalog(self, page: int = 1, page_size: int = 20) -> Tuple[List[Dict[str, Any]], int]:
+    def catalog(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        search: str | None = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), 200))
         off = (page - 1) * page_size
 
+        q = (search or "").strip()
+        where = "WHERE d.is_active=TRUE"
+        params: Dict[str, Any] = {"off": off, "lim": page_size}
+        if q:
+            where += " AND (d.title ILIKE :q OR d.path ILIKE :q)"
+            params["q"] = f"%{q}%"
+
         with self.sf() as s:
-            total = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE")).first()
+            total_row = s.execute(
+                sqltext(f"SELECT COUNT(*) FROM kb_documents d {where}"),
+                params if q else None,
+            ).first()
+            total = int(total_row[0]) if total_row else 0
+
             rows = s.execute(
                 sqltext(
-                    """
+                    f"""
                     SELECT
                         d.id,
                         COALESCE(d.title, '') AS title,
@@ -43,14 +60,14 @@ class KBRepo:
                         COUNT(c.id) AS chunks
                     FROM kb_documents d
                     LEFT JOIN kb_chunks c ON c.document_id = d.id
-                    WHERE d.is_active=TRUE
+                    {where}
                     GROUP BY d.id
                     ORDER BY d.path ASC
                     OFFSET :off LIMIT :lim
                     """
                 ),
-                {"off": off, "lim": page_size},
-            ).all()
+                params,
+            )
 
         items: List[Dict[str, Any]] = []
         for r in rows:
@@ -65,7 +82,7 @@ class KBRepo:
                     "chunks": int(r[6]),
                 }
             )
-        return items, int(total[0]) if total else 0
+        return items, total
 
     def get_document_brief(self, document_id: int) -> Optional[Dict[str, Any]]:
         with self.sf() as s:
@@ -84,7 +101,7 @@ class KBRepo:
             top = s.execute(
                 sqltext(
                     """
-                    SELECT d.id, COALESCE(d.title,''), d.path, COUNT(c.id) AS cnt
+                    SELECT d.path, COUNT(c.id) AS cnt
                     FROM kb_documents d
                     LEFT JOIN kb_chunks c ON c.document_id = d.id
                     WHERE d.is_active=TRUE
@@ -93,32 +110,34 @@ class KBRepo:
                     LIMIT 10
                     """
                 )
-            ).all()
-
+            ).fetchall()
         return {
             "documents": int(docs[0]) if docs else 0,
             "chunks": int(chunks[0]) if chunks else 0,
-            "top_docs": [
-                {"id": int(r[0]), "title": r[1], "path": r[2], "chunks": int(r[3])} for r in top
-            ],
+            "top_documents": [{"path": r[0], "chunks": int(r[1])} for r in top],
         }
 
-    def stats_for_document_ids(self, document_ids: List[int]) -> Dict[str, Any]:
-        if not document_ids:
-            return {"documents": 0, "chunks": 0}
+    def stats_for_document_ids(self, document_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+        ids = [int(x) for x in document_ids]
+        if not ids:
+            return {}
         with self.sf() as s:
-            docs = s.execute(
-                sqltext("SELECT COUNT(*) FROM kb_documents WHERE id = ANY(:ids)"),
-                {"ids": document_ids},
-            ).first()
-            chunks = s.execute(
-                sqltext("SELECT COUNT(*) FROM kb_chunks WHERE document_id = ANY(:ids)"),
-                {"ids": document_ids},
-            ).first()
-        return {
-            "documents": int(docs[0]) if docs else 0,
-            "chunks": int(chunks[0]) if chunks else 0,
-        }
+            rows = s.execute(
+                sqltext(
+                    """
+                    SELECT d.id, d.path, COUNT(c.id) AS cnt
+                    FROM kb_documents d
+                    LEFT JOIN kb_chunks c ON c.document_id=d.id
+                    WHERE d.id = ANY(:ids)
+                    GROUP BY d.id
+                    """
+                ),
+                {"ids": ids},
+            ).fetchall()
+        out: Dict[int, Dict[str, Any]] = {}
+        for r in rows:
+            out[int(r[0])] = {"id": int(r[0]), "path": r[1], "chunks": int(r[2])}
+        return out
 
     def upsert_document(
         self,
@@ -152,23 +171,18 @@ class KBRepo:
                 doc.size = int(size)
             if modified_at is not None:
                 doc.modified_at = modified_at
-
             doc.is_active = bool(is_active)
-
             if status is not None:
                 doc.status = status
-                if status == "indexed":
-                    doc.indexed_at = sa.func.now()
             if last_error is not None:
                 doc.last_error = last_error
 
             s.commit()
-            s.refresh(doc)
             return int(doc.id)
 
     def mark_all_documents_inactive(self) -> None:
         with self.sf() as s:
-            s.execute(sqltext("UPDATE kb_documents SET is_active=FALSE WHERE is_active=TRUE"))
+            s.execute(sqltext("UPDATE kb_documents SET is_active=FALSE"))
             s.commit()
 
     def document_needs_reindex(
@@ -183,8 +197,7 @@ class KBRepo:
             row = s.execute(
                 sqltext(
                     """
-                    SELECT md5, modified_at, size,
-                           (SELECT COUNT(*) FROM kb_chunks WHERE document_id = :id) AS chunks
+                    SELECT md5, modified_at, size, indexed_at
                     FROM kb_documents
                     WHERE id=:id
                     """
@@ -193,37 +206,31 @@ class KBRepo:
             ).first()
             if not row:
                 return True
+            old_md5, old_modified, old_size, indexed_at = row
 
-            db_md5, db_mod, db_size, chunks = row[0], row[1], row[2], row[3]
-            if not chunks or int(chunks) == 0:
-                return True
+        # if never indexed -> yes
+        if indexed_at is None:
+            return True
 
-            if md5 and db_md5 and str(md5) != str(db_md5):
-                return True
-            if size is not None and db_size is not None and int(size) != int(db_size):
-                return True
-            if modified_at is not None and db_mod is not None:
-                try:
-                    if modified_at != db_mod:
-                        return True
-                except Exception:
-                    pass
-            return False
+        if md5 and old_md5 and md5 != old_md5:
+            return True
+        if size is not None and old_size is not None and int(size) != int(old_size):
+            return True
+        if modified_at is not None and old_modified is not None and modified_at != old_modified:
+            return True
+        return False
 
-    def set_document_status(self, document_id: int, *, status: str, last_error: str | None) -> None:
+    def set_document_status(self, document_id: int, *, status: str, last_error: str | None = None) -> None:
         with self.sf() as s:
             s.execute(
                 sqltext(
                     """
                     UPDATE kb_documents
-                    SET status=:st,
-                        last_error=:err,
-                        indexed_at=CASE WHEN :st='indexed' THEN NOW() ELSE indexed_at END,
-                        updated_at=NOW()
+                    SET status=:status, last_error=:err
                     WHERE id=:id
                     """
                 ),
-                {"id": int(document_id), "st": status, "err": last_error},
+                {"id": int(document_id), "status": status, "err": last_error},
             )
             s.commit()
 
@@ -233,10 +240,7 @@ class KBRepo:
                 sqltext(
                     """
                     UPDATE kb_documents
-                    SET status='indexed',
-                        indexed_at=NOW(),
-                        last_error=NULL,
-                        updated_at=NOW()
+                    SET indexed_at=NOW(), status='indexed', last_error=NULL
                     WHERE id=:id
                     """
                 ),
@@ -245,71 +249,65 @@ class KBRepo:
             s.commit()
 
     # ----------------------------
-    # Chunks
+    # Chunks / embeddings
     # ----------------------------
     def delete_chunks_by_document_id(self, document_id: int) -> None:
         with self.sf() as s:
-            s.execute(
-                sqltext("DELETE FROM kb_chunks WHERE document_id=:id"),
-                {"id": int(document_id)},
-            )
+            s.execute(sqltext("DELETE FROM kb_chunks WHERE document_id=:id"), {"id": int(document_id)})
             s.commit()
 
     def insert_chunks_bulk(self, rows: Sequence[Tuple[int, int, str, list[float]]]) -> None:
-        payload = []
-        for (doc_id, order, text, emb) in rows:
-            payload.append(
-                {
-                    "document_id": int(doc_id),
-                    "chunk_order": int(order),
-                    "text": text,
-                    "embedding": emb,
-                }
-            )
-
         with self.sf() as s:
             s.execute(
                 sqltext(
                     """
-                    INSERT INTO kb_chunks (document_id, chunk_order, text, embedding)
+                    INSERT INTO kb_chunks(document_id, chunk_order, text, embedding)
                     VALUES (:document_id, :chunk_order, :text, :embedding)
                     """
                 ),
-                payload,
+                [
+                    {
+                        "document_id": int(did),
+                        "chunk_order": int(order),
+                        "text": text,
+                        "embedding": emb,
+                    }
+                    for (did, order, text, emb) in rows
+                ],
             )
             s.commit()
 
-    # ----------------------------
-    # Retrieval
-    # ----------------------------
-    def search_by_embedding(
-        self,
-        query_emb: list[float],
-        top_k: int,
-        allowed_document_ids: Optional[List[int]] = None,
-    ) -> List[Tuple[int, str, float, int]]:
-        params: Dict[str, Any] = {"q": query_emb, "k": int(top_k)}
-        where = "1=1"
-        if allowed_document_ids:
-            where += " AND c.document_id = ANY(:doc_ids)"
-            params["doc_ids"] = allowed_document_ids
-
-        sql = f"""
-            SELECT
-                c.id,
-                c.text,
-                (1 - (c.embedding <=> :q)) AS similarity,
-                c.document_id
-            FROM kb_chunks c
-            WHERE {where}
-            ORDER BY c.embedding <=> :q
-            LIMIT :k
-        """
+    def search_by_embedding(self, query_vector: list[float], *, limit: int = 6, document_ids: Sequence[int] | None = None):
+        params: Dict[str, Any] = {"q": query_vector, "lim": int(limit)}
+        where = ""
+        if document_ids:
+            params["ids"] = [int(x) for x in document_ids]
+            where = "WHERE document_id = ANY(:ids)"
 
         with self.sf() as s:
-            rows = s.execute(sqltext(sql), params).all()
+            rows = s.execute(
+                sqltext(
+                    f"""
+                    SELECT id, document_id, chunk_order, text,
+                           1 - (embedding <=> :q) AS score
+                    FROM kb_chunks
+                    {where}
+                    ORDER BY embedding <=> :q
+                    LIMIT :lim
+                    """
+                ),
+                params,
+            ).fetchall()
 
-        out: List[Tuple[int, str, float, int]] = []
+        out = []
         for r in rows:
-            out.append((int(r[0]), str(r[1]), float(r[2]), int(r[3])))
+            out.append(
+                {
+                    "chunk_id": int(r[0]),
+                    "document_id": int(r[1]),
+                    "chunk_order": int(r[2]),
+                    "text": r[3],
+                    "score": float(r[4]),
+                }
+            )
         return out
