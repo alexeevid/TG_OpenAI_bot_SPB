@@ -132,7 +132,5 @@ def run() -> None:
     # иначе будет 409 Conflict (getUpdates).
     app.run_polling(allowed_updates=Application.ALL_TYPES)
 
-
 if __name__ == "__main__":
     run()
-
