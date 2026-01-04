@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List
 
+from app.settings import Settings
 from app.db.repo_kb import KBRepo
 from app.kb.indexer import KbIndexer
 from app.kb.parsers import (
@@ -31,17 +32,20 @@ class SyncResult:
 
 class KbSyncer:
     """
-    Синхронизация БЗ (Яндекс.Диск -> kb_documents + kb_chunks).
+    Синхронизация базы знаний (Яндекс.Диск -> kb_documents + kb_chunks).
 
-    ВАЖНО: этот syncer согласован с реальными контрактами текущего KBRepo и YandexDiskClient в вашем архиве:
+    Контракт согласован с текущим KBRepo / YandexDiskClient в этом репозитории:
     - KBRepo.upsert_document(...) -> int (document_id)
     - KBRepo.document_needs_reindex(document_id, md5, modified_at, size)
-    - KBRepo.set_document_status(...)
-    - KBRepo.set_document_indexed(...)
+    - KBRepo.set_document_status(document_id, status, last_error)
+    - KBRepo.set_document_indexed(document_id)
+    - KBRepo.mark_all_documents_inactive()
+    - YandexDiskClient.list_kb_files_metadata() -> List[Dict]
     - YandexDiskClient.download(path) -> bytes
     """
 
-    def __init__(self, repo: KBRepo, indexer: KbIndexer, yandex_client: Any):
+    def __init__(self, settings: Settings, repo: KBRepo, indexer: KbIndexer, yandex_client: Any):
+        self._cfg = settings
         self._repo = repo
         self._indexer = indexer
         self._y = yandex_client
@@ -75,7 +79,7 @@ class KbSyncer:
         files: List[Dict[str, Any]] = self._y.list_kb_files_metadata()
         res.scanned = len(files)
 
-        # delete-propagation: всё делаем inactive, затем активируем найденные
+        # Delete-propagation: всё делаем inactive, затем активируем найденные.
         try:
             self._repo.mark_all_documents_inactive()
         except Exception as e:
@@ -100,6 +104,7 @@ class KbSyncer:
                 except Exception:
                     modified_at = None
 
+            document_id: int | None = None
             try:
                 document_id = self._repo.upsert_document(
                     path=path,
@@ -123,12 +128,10 @@ class KbSyncer:
                     res.skipped += 1
                     continue
 
-                # качаем контент (в вашем клиенте метод называется download)
                 data: bytes = self._y.download(path)
                 text = self._parse_to_text(title, data).strip()
 
                 if not text:
-                    # не вводим выдуманные поля. Фиксируем статус и ошибку.
                     self._repo.set_document_status(
                         document_id=document_id,
                         status="skipped",
@@ -139,19 +142,15 @@ class KbSyncer:
 
                 n = self._indexer.reindex_document(document_id=document_id, text=text)
                 self._repo.set_document_indexed(document_id=document_id)
+
+                log.info("KB indexed %s chunks for %s", n, path)
                 res.indexed += 1
-                log.info("KB indexed: %s chunks for %s", n, path)
 
             except Exception as e:
                 log.exception("KB sync failed for path=%s: %s", path, e)
                 try:
-                    # мягко фиксируем ошибку, но не валим весь sync
-                    if "document_id" in locals() and document_id:
-                        self._repo.set_document_status(
-                            document_id=document_id,
-                            status="error",
-                            last_error=str(e),
-                        )
+                    if document_id:
+                        self._repo.set_document_status(document_id=document_id, status="error", last_error=str(e))
                 except Exception:
                     pass
                 res.errors += 1
@@ -159,5 +158,5 @@ class KbSyncer:
         return res
 
 
-# стабильное публичное имя (в app.main импортируется KBSyncer)
+# stable public API name
 KBSyncer = KbSyncer
