@@ -1,4 +1,3 @@
-# app/main.py
 from __future__ import annotations
 
 import logging
@@ -39,10 +38,11 @@ def _configure_logging(log_level: str) -> None:
 
 def build_application() -> Application:
     """
-    Собираем PTB Application и регистрируем хендлеры.
+    Собираем PTB Application.
 
-    Важно: схема БД НЕ создаётся здесь. Схема управляется Alembic-миграциями
-    (в Railway/Docker: python -m alembic upgrade head перед запуском бота).
+    ВАЖНО:
+    - НИКАКИХ ALTER / CREATE TABLE здесь нет
+    - Схема БД управляется ТОЛЬКО Alembic
     """
     settings = get_settings()
     _configure_logging(settings.LOG_LEVEL)
@@ -79,12 +79,6 @@ def build_application() -> Application:
 
 
 def run() -> None:
-    """
-    Точка входа: run_polling (long-running процесс).
-
-    Важно: в Railway нельзя запускать два инстанса polling одновременно,
-    иначе будет 409 Conflict (getUpdates).
-    """
     app = build_application()
     app.run_polling(allowed_updates=Application.ALL_TYPES)
 
