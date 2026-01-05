@@ -1,7 +1,7 @@
 from alembic import op
 
-revision = "007_resize_kb_chunks_embedding"
-down_revision = "006_add_kb_chunks_embedding"
+revision = "007_kb_emb_dim"
+down_revision = "006_kb_chunks_emb"
 branch_labels = None
 depends_on = None
 
