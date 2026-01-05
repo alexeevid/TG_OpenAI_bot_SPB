@@ -6,4 +6,5 @@ RUN pip install --no-cache-dir --upgrade pip
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . ./
-CMD ["sh","-lc","python -m alembic -c alembic.ini stamp head && python run_local.py"]
+CMD ["sh","-lc","python -m alembic -c alembic.ini stamp 002_add_users_cols && python run_local.py"]
+
