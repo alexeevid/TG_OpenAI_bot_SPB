@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import sqlalchemy
 from telegram.ext import Application
 
 from .settings import load_settings
@@ -11,7 +10,6 @@ from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
 from .db.session import make_session_factory
-from .db.models import Base
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
 from .db.repo_dialog_kb import DialogKBRepo
@@ -35,58 +33,74 @@ log = logging.getLogger(__name__)
 
 
 async def _post_init(app: Application) -> None:
-    """
-    PTB ожидает coroutine. Здесь обязателен async + await.
-    """
+    """PTB ожидает coroutine. Здесь обязателен async + await."""
     try:
-        await app.bot.set_my_commands([
-            ("start", "Старт"),
-            ("help", "Помощь"),
-            ("dialogs", "Управление диалогами"),
-            ("model", "Выбрать модель"),
-            ("mode", "Режим ответа"),
-            ("kb", "База знаний (диалоговая)"),
-            ("status", "Сводка по диалогу"),
-        ])
+        await app.bot.set_my_commands(
+            [
+                ("start", "Старт"),
+                ("help", "Помощь"),
+                ("dialogs", "Управление диалогами"),
+                ("model", "Выбрать модель"),
+                ("mode", "Режим ответа"),
+                ("kb", "База знаний (диалоговая)"),
+                ("status", "Сводка по диалогу"),
+            ]
+        )
     except Exception as e:
         log.warning("set_my_commands failed: %s", e)
 
 
-
-def _ensure_dialog_kb_schema(engine) -> None:
-    """Schema is managed by Alembic.
-
-    This function is kept for backward compatibility but intentionally does nothing.
+def _resolve_embedding_dim(cfg) -> int:
     """
-    return
+    Единая точка определения размерности embeddings.
+
+    Приоритет:
+    1) cfg.embedding_dim (property в Settings)
+    2) cfg.pgvector_dim (если где-то используется)
+    3) дефолт 3072 (text-embedding-3-large)
+    """
+    dim = getattr(cfg, "embedding_dim", None)
+    if isinstance(dim, int) and dim > 0:
+        return dim
+
+    dim = getattr(cfg, "pgvector_dim", None)
+    if isinstance(dim, int) and dim > 0:
+        return dim
+
+    return 3072
 
 
 def build_application() -> Application:
     cfg = load_settings()
 
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=getattr(logging, (getattr(cfg, "log_level", "INFO") or "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
     if not cfg.telegram_token:
         raise RuntimeError("telegram_token отсутствует в настройках")
 
-    app = Application.builder() \
-        .token(cfg.telegram_token) \
-        .post_init(_post_init) \
+    app = (
+        Application.builder()
+        .token(cfg.telegram_token)
+        .post_init(_post_init)
         .build()
+    )
 
     db_url = cfg.database_url
     if not db_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках")
 
-    session_factory, engine = make_session_factory(db_url)
+    session_factory, _engine = make_session_factory(db_url)
     # Schema is managed by Alembic (see Docker CMD).
 
     # --- repos ---
     repo_dialogs = DialogsRepo(session_factory)
-    repo_kb = KBRepo(session_factory, cfg.embedding_dim)
+
+    embedding_dim = _resolve_embedding_dim(cfg)
+    repo_kb = KBRepo(session_factory, embedding_dim)
+
     repo_dialog_kb = DialogKBRepo(session_factory)
 
     # --- services ---
@@ -96,13 +110,19 @@ def build_application() -> Application:
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
     gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
 
-    img = ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model) if getattr(cfg, "enable_image_generation", False) else None
+    img = (
+        ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model)
+        if getattr(cfg, "enable_image_generation", False)
+        else None
+    )
+
     vs = VoiceService(openai_client=oai_client)
 
     # KB core
     yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
+
     embedder = Embedder(oai_client, cfg.openai_embedding_model)
-    retriever = Retriever(repo_kb, oai_client, getattr(cfg, "pgvector_dim", 3072))
+    retriever = Retriever(repo_kb, oai_client, embedding_dim)
 
     dialog_kb = DialogKBService(repo_dialog_kb, repo_kb)
     rag = RagService(retriever, dialog_kb)
@@ -111,24 +131,23 @@ def build_application() -> Application:
     syncer = KBSyncer(yd, embedder, repo_kb, cfg, session_factory)
 
     # --- bot_data ---
-    app.bot_data.update({
-        "settings": cfg,
-        "repo_dialogs": repo_dialogs,
-        "repo_kb": repo_kb,
-
-        "svc_dialog": ds,
-        "svc_authz": authz,
-        "svc_gen": gen,
-        "svc_voice": vs,
-        "svc_image": img,
-
-        "svc_dialog_kb": dialog_kb,
-        "svc_rag": rag,
-
-        "yandex": yd,
-        "embedder": embedder,
-        "svc_syncer": syncer,
-    })
+    app.bot_data.update(
+        {
+            "settings": cfg,
+            "repo_dialogs": repo_dialogs,
+            "repo_kb": repo_kb,
+            "svc_dialog": ds,
+            "svc_authz": authz,
+            "svc_gen": gen,
+            "svc_voice": vs,
+            "svc_image": img,
+            "svc_dialog_kb": dialog_kb,
+            "svc_rag": rag,
+            "yandex": yd,
+            "embedder": embedder,
+            "svc_syncer": syncer,
+        }
+    )
 
     # --- handlers ---
     start.register(app)
