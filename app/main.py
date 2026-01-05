@@ -95,43 +95,15 @@ def _resolve_embedding_dim(cfg) -> int:
 
 
 def _build_kb_indexer(*, repo_kb: KBRepo, embedder: Embedder, cfg) -> KbIndexer:
-    """
-    Собирает индексатор KB.
-    В разных ветках у KbIndexer часто плавают имена аргументов — делаем безопасный фоллбек.
-    """
     chunk_size = getattr(cfg, "chunk_size", 900)
     overlap = getattr(cfg, "chunk_overlap", 150)
 
-    # Попытка №1 — "новый" контракт
-    try:
-        return KbIndexer(
-            kb_repo=repo_kb,
-            embedder=embedder,
-            chunk_size=chunk_size,
-            overlap=overlap,
-        )
-    except TypeError:
-        pass
-
-    # Попытка №2 — альтернативные имена
-    try:
-        return KbIndexer(
-            repo=repo_kb,
-            embedder=embedder,
-            chunk_size=chunk_size,
-            overlap=overlap,
-        )
-    except TypeError:
-        pass
-
-    # Попытка №3 — overlap может называться chunk_overlap
     return KbIndexer(
-        kb_repo=repo_kb,
-        embedder=embedder,
-        chunk_size=chunk_size,
-        chunk_overlap=overlap,
+        repo_kb,
+        embedder,
+        chunk_size,
+        overlap,
     )
-
 
 def build_application() -> Application:
     cfg = load_settings()
