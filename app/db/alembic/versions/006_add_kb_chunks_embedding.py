@@ -1,8 +1,8 @@
 from alembic import op
 import sqlalchemy as sa
 
-revision = "006_add_kb_chunks_embedding"
-down_revision = "005_add_kb_chunks_updated_at"
+revision = "006_kb_chunks_emb"
+down_revision = "005_kb_chunks_upd"
 branch_labels = None
 depends_on = None
 
