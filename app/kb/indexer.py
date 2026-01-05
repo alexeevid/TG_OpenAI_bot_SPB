@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 from app.db.repo_kb import KBRepo
-from app.kb.embedder import Embedder
 
 
 @dataclass(frozen=True)
@@ -41,17 +40,30 @@ def split_text(text: str, chunk_size: int, overlap: int) -> List[Chunk]:
 
 class KbIndexer:
     """
-    Устойчивый индексатор:
-    - публичный метод reindex_document поддерживает оба контракта:
-      * reindex_document(document_id=..., text=...)
-      * reindex_document(doc_id=..., document_text=...)
+    Устойчивый индексатор БЗ.
+
+    Поддерживает разные версии Embedder:
+    - embed(texts)
+    - embed_texts(texts)
+    - embed_documents(texts)
     """
 
-    def __init__(self, kb_repo: KBRepo, embedder: Embedder, chunk_size: int, overlap: int):
+    def __init__(self, kb_repo: KBRepo, embedder, chunk_size: int, overlap: int):
         self._repo = kb_repo
         self._embedder = embedder
         self._chunk_size = int(chunk_size)
         self._overlap = int(overlap)
+
+    def _embed(self, texts: List[str]) -> List[list[float]]:
+        if hasattr(self._embedder, "embed"):
+            return self._embedder.embed(texts)
+        if hasattr(self._embedder, "embed_texts"):
+            return self._embedder.embed_texts(texts)
+        if hasattr(self._embedder, "embed_documents"):
+            return self._embedder.embed_documents(texts)
+        raise AttributeError(
+            "Embedder has no supported method: expected one of embed / embed_texts / embed_documents"
+        )
 
     def reindex_document(
         self,
@@ -73,7 +85,7 @@ class KbIndexer:
             self._repo.delete_chunks_by_document_id(did)
             return 0
 
-        embeddings = self._embedder.embed([c.text for c in chunks])
+        embeddings = self._embed(chunks=[c.text for c in chunks])  # type: ignore
 
         rows: List[Tuple[int, int, str, list[float]]] = []
         for c, emb in zip(chunks, embeddings):
