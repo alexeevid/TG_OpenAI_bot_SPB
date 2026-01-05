@@ -3,7 +3,7 @@ import sqlalchemy as sa
 
 # ВАЖНО: после создания файла поменяешь down_revision (см. ниже)
 revision = "20260105_add_users_cols"
-down_revision = None
+down_revision = "001_initial"
 branch_labels = None
 depends_on = None
 
