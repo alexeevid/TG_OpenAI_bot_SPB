@@ -1,11 +1,14 @@
 from alembic import op
+import sqlalchemy as sa
 
-# НЕ МЕНЯЙ revision/down_revision, если они уже “в цепочке” у тебя на проде.
-# Оставь как в текущем файле и просто перепиши upgrade()/downgrade().
-# Ниже я показываю только функции — вставь их в существующий файл.
+revision = "004_dialog_kb_fix"
+down_revision = "003_dialogs_cols"
+branch_labels = None
+depends_on = None
+
 
 def upgrade() -> None:
-    # Таблица связи диалог ↔ документ БЗ
+    # Если в проекте реально используются эти таблицы:
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS dialog_kb_documents (
@@ -19,7 +22,6 @@ def upgrade() -> None:
         """
     )
 
-    # Таблица секретов (пароли PDF) в рамках диалога
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS dialog_kb_secrets (
