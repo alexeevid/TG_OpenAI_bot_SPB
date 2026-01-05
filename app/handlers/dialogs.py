@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from html import escape
 from math import ceil
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
@@ -21,7 +21,6 @@ def _display_title_mask(d) -> str:
     title = (getattr(d, "title", None) or "").strip()
     if title:
         return title[:64]
-    # fallback
     return f"Диалог #{getattr(d, 'id', '?')}"
 
 
@@ -68,7 +67,6 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
 
     offset = (page - 1) * page_size
     items = repo.list_dialogs_page(u.id, limit=page_size, offset=offset)
-
 
     kb_items: List[Tuple[int, str]] = [(d.id, _display_title_mask(d)) for d in items]
     markup = _build_keyboard(kb_items, page, pages_total)
@@ -169,6 +167,14 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 def build_handlers() -> List:
     return [
         CommandHandler("dialogs", cmd_dialogs),
-        CallbackQueryHandler(on_cb, pattern=r"^(dlg:|noop$)"),
+        CallbackQueryHandler(on_cb, pattern=r"^(dlg:.*|noop)$"),
         CommandHandler("rename", cmd_rename),
     ]
+
+
+def register(app) -> None:
+    """
+    Совместимость с main.py: dialogs.register(app)
+    """
+    for h in build_handlers():
+        app.add_handler(h)
