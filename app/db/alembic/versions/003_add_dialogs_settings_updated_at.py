@@ -1,7 +1,7 @@
 from alembic import op
 import sqlalchemy as sa
 
-revision = "003_add_dialogs_settings_updated_at"
+revision = "003_dialogs_cols"
 down_revision = "002_add_users_cols"
 branch_labels = None
 depends_on = None
