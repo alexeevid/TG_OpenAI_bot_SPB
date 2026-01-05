@@ -1,16 +1,17 @@
-"""Project settings (compat + best-practice defaults).
+"""
+Project settings (compat + best-practice defaults).
 
 Goals:
 - Preserve existing contract: from app.settings import load_settings
 - Provide backward-compatible attribute names used across codebase (telegram_token, text_model, etc.)
-- Cover Railway env vars (see screenshot) with safe defaults
+- Cover Railway env vars with safe defaults
 - Avoid repeated AttributeError cascades by providing commonly used flags (enable_image_generation, etc.)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass, field
 from typing import Optional, Set, List
 
 
@@ -74,8 +75,8 @@ class Settings:
 
     # Admin / access
     admin_chat_id: Optional[int] = None
-    admin_user_ids: Set[int] = None  # type: ignore[assignment]
-    allowed_user_ids: Set[int] = None  # type: ignore[assignment]
+    admin_user_ids: Set[int] = field(default_factory=set)
+    allowed_user_ids: Set[int] = field(default_factory=set)
 
     # Language / UX
     bot_language: str = "ru"
@@ -113,7 +114,7 @@ class Settings:
     # Misc
     rate_limit_per_min: int = 60
     log_level: str = "INFO"
-    denylist_models: List[str] = None  # type: ignore[assignment]
+    denylist_models: List[str] = field(default_factory=list)
 
     # ---- Backward-compatible aliases used by existing code ----
     @property
@@ -136,27 +137,29 @@ class Settings:
     def image_model(self) -> str:
         return self.openai_image_model
 
-@property
-def embedding_dim(self) -> int:
-    # OpenAI embedding model dims (stable defaults)
-    m = (self.openai_embedding_model or "").lower()
-    if "text-embedding-3-large" in m:
-        return 3072
-    if "text-embedding-3-small" in m:
-        return 1536
-    # fallback to 1536 (most common)
-    return 1536
+    @property
+    def embedding_dim(self) -> int:
+        # OpenAI embedding model dims (stable defaults)
+        m = (self.openai_embedding_model or "").lower()
 
+        # Known OpenAI embeddings
+        if "text-embedding-3-large" in m:
+            return 3072
+        if "text-embedding-3-small" in m:
+            return 1536
+
+        # Common fallback
+        return 1536
 
 
 def load_settings() -> Settings:
-    # Core
+    # Core (support multiple env var names)
     telegram_bot_token = (_getenv("TELEGRAM_BOT_TOKEN", "") or _getenv("BOT_TOKEN", "") or "")
     openai_api_key = _getenv("OPENAI_API_KEY", "") or ""
     database_url = _getenv("DATABASE_URL", "") or _getenv("POSTGRES_DSN", "") or ""
 
     # Admin / access
-    admin_chat_id = None
+    admin_chat_id: Optional[int] = None
     admin_chat_id_raw = _getenv("ADMIN_CHAT_ID")
     if admin_chat_id_raw:
         try:
@@ -171,10 +174,19 @@ def load_settings() -> Settings:
     bot_language = (_getenv("BOT_LANGUAGE", "ru") or "ru").lower()
 
     # Models (allow overrides from multiple env variable names)
-    openai_text_model = (_getenv("OPENAI_TEXT_MODEL") or _getenv("OPENAI_MODEL") or _getenv("TEXT_MODEL") or "gpt-4.5-turbo")
-    openai_image_model = (_getenv("OPENAI_IMAGE_MODEL") or _getenv("IMAGE_MODEL") or "gpt-image-1")
-    openai_embedding_model = (_getenv("OPENAI_EMBEDDING_MODEL") or _getenv("EMBEDDING_MODEL") or "text-embedding-3-large")
-    openai_transcribe_model = (_getenv("OPENAI_TRANSCRIBE_MODEL") or _getenv("TRANSCRIBE_MODEL") or "whisper-1")
+    openai_text_model = (
+        _getenv("OPENAI_TEXT_MODEL")
+        or _getenv("OPENAI_MODEL")
+        or _getenv("TEXT_MODEL")
+        or "gpt-4.5-turbo"
+    )
+    openai_image_model = _getenv("OPENAI_IMAGE_MODEL") or _getenv("IMAGE_MODEL") or "gpt-image-1"
+    openai_embedding_model = (
+        _getenv("OPENAI_EMBEDDING_MODEL") or _getenv("EMBEDDING_MODEL") or "text-embedding-3-large"
+    )
+    openai_transcribe_model = (
+        _getenv("OPENAI_TRANSCRIBE_MODEL") or _getenv("TRANSCRIBE_MODEL") or "whisper-1"
+    )
 
     openai_temperature = _getenv_float("OPENAI_TEMPERATURE", 0.2)
     max_context_tokens = _getenv_int("MAX_CONTEXT_TOKENS", 8000)
@@ -242,6 +254,7 @@ def load_settings() -> Settings:
 
 _SETTINGS: Optional[Settings] = None
 
+
 def get_settings() -> Settings:
     global _SETTINGS
     if _SETTINGS is None:
@@ -263,6 +276,6 @@ ENABLE_WEB_SEARCH = cfg.enable_web_search
 WEB_SEARCH_PROVIDER = cfg.web_search_provider
 RATE_LIMIT_PER_MIN = cfg.rate_limit_per_min
 LOG_LEVEL = cfg.log_level
+
 # --- Compatibility alias for KB / RAG modules ---
 settings = cfg
-
