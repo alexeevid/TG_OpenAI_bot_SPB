@@ -16,6 +16,7 @@ from .db.repo_dialog_kb import DialogKBRepo
 
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
+from .kb.indexer import KbIndexer
 from .kb.syncer import KBSyncer
 
 from .services.dialog_service import DialogService
@@ -68,6 +69,24 @@ def _resolve_embedding_dim(cfg) -> int:
         return dim
 
     return 3072
+
+
+def _build_kb_indexer(*, repo_kb: KBRepo, embedder: Embedder, cfg) -> KbIndexer:
+    """
+    Собирает индексатор KB в одном месте.
+    Достаём параметры безопасно, чтобы не ловить AttributeError.
+    """
+    chunk_size = getattr(cfg, "chunk_size", 900)
+    overlap = getattr(cfg, "chunk_overlap", 150)
+
+    # В некоторых версиях KbIndexer может ожидать slightly другие имена аргументов.
+    # Используем именованные аргументы как "контракт" в коде.
+    return KbIndexer(
+        kb_repo=repo_kb,
+        embedder=embedder,
+        chunk_size=chunk_size,
+        overlap=overlap,
+    )
 
 
 def build_application() -> Application:
@@ -127,8 +146,9 @@ def build_application() -> Application:
     dialog_kb = DialogKBService(repo_dialog_kb, repo_kb)
     rag = RagService(retriever, dialog_kb)
 
-    # syncer (админские /kb sync/scan/status)
-    syncer = KBSyncer(yd, embedder, repo_kb, cfg, session_factory)
+    # indexer + syncer (админские /kb sync/scan/status)
+    indexer = _build_kb_indexer(repo_kb=repo_kb, embedder=embedder, cfg=cfg)
+    syncer = KBSyncer(cfg, repo_kb, indexer, yd)
 
     # --- bot_data ---
     app.bot_data.update(
