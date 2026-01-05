@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, nullslast, func
 from .models import User, Dialog, Message
-
+from app.db.models import User, Dialog
 
 class DialogsRepo:
     def __init__(self, sf):
@@ -14,12 +14,50 @@ class DialogsRepo:
     # ---------- users ----------
     def ensure_user(self, tg_id: str) -> User:
         with self.sf() as s:  # type: Session
-            u = s.execute(select(User).where(User.tg_id == str(tg_id))).scalars().first()
+            u = (
+                s.execute(
+                    select(User).where(User.tg_id == str(tg_id))
+                )
+                .scalars()
+                .first()
+            )
+    
             if not u:
                 u = User(tg_id=str(tg_id), role="user")
                 s.add(u)
                 s.commit()
                 s.refresh(u)
+    
+            # --- UX-fix: гарантируем активный диалог ---
+            if u.active_dialog_id is None:
+                # Проверяем, есть ли уже диалоги
+                dialog = (
+                    s.execute(
+                        select(Dialog)
+                        .where(Dialog.user_id == u.id)
+                        .order_by(Dialog.id.asc())
+                    )
+                    .scalars()
+                    .first()
+                )
+    
+                # Если диалога нет — создаём
+                if not dialog:
+                    dialog = Dialog(
+                        user_id=u.id,
+                        title="Диалог 1",
+                        settings={},
+                    )
+                    s.add(dialog)
+                    s.commit()
+                    s.refresh(dialog)
+    
+                # Назначаем активный диалог
+                u.active_dialog_id = dialog.id
+                s.add(u)
+                s.commit()
+                s.refresh(u)
+    
             return u
 
     def get_user(self, tg_id: str) -> Optional[User]:
