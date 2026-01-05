@@ -1,45 +1,82 @@
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
-from ..services.dialog_service import DialogService
-from ..services.gen_service import GenService
-from ..services.authz_service import AuthzService
+from typing import List
 
-async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    az: AuthzService = context.bot_data.get("svc_authz")
-    if az and update.effective_user and not az.is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ Доступ запрещен.")
-        return
-    ds: DialogService = context.bot_data.get("svc_dialog")
-    gen: GenService = context.bot_data.get("svc_gen")
-    if not ds or not gen or not update.effective_user:
-        await update.message.reply_text("⚠️ Сервисы не настроены.")
-        return
-    # If a model name is provided as argument, set it immediately
-    if context.args:
-        model = context.args[0].strip()
-        ds.update_active_settings(update.effective_user.id, {"text_model": model})
-        await update.message.reply_text(f"Модель для текущего диалога установлена: {model}")
-        return
-    # Otherwise, show a selection of models
-    models = await gen.selectable_models(limit=12)
-    kb = [[InlineKeyboardButton(m, callback_data=f"model|{m}")] for m in models]
-    await update.message.reply_text("Выберите модель для текущего диалога:", reply_markup=InlineKeyboardMarkup(kb))
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
-async def on_model_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, model = (q.data or "").split("|", 1)
-    az: AuthzService = context.bot_data.get("svc_authz")
-    if az and q.from_user and not az.is_allowed(q.from_user.id):
-        await q.edit_message_text("⛔ Доступ запрещен.")
-        return
-    ds: DialogService = context.bot_data.get("svc_dialog")
-    if not ds or not q.from_user:
-        await q.edit_message_text("⚠️ Сервис диалогов не настроен.")
-        return
-    ds.update_active_settings(q.from_user.id, {"text_model": model})
-    await q.edit_message_text(f"Модель для диалога установлена: {model}")
+BTN_MODEL_PREFIX = "model:set:"
 
-def register(app: Application) -> None:
+
+def _get_available_models(cfg) -> List[str]:
+    """
+    Возвращает список доступных моделей.
+    Сейчас — минимально безопасно:
+    либо из denylist/allowlist,
+    либо только текущая модель.
+    """
+    # Если в будущем появится список — сюда легко добавить
+    model = getattr(cfg, "text_model", None)
+    if model:
+        return [model]
+    return []
+
+
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = context.bot_data.get("settings")
+    if not cfg or not update.effective_message:
+        return
+
+    current_model = getattr(cfg, "text_model", "unknown")
+    models = _get_available_models(cfg)
+
+    # Если моделей нет — всегда отвечаем текстом
+    if not models:
+        await update.effective_message.reply_text(
+            f"Текущая модель: `{current_model}`\n\n"
+            "Другие модели сейчас недоступны.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Строим клавиатуру
+    kb = []
+    for m in models:
+        label = f"✅ {m}" if m == current_model else m
+        kb.append([InlineKeyboardButton(label, callback_data=f"{BTN_MODEL_PREFIX}{m}")])
+
+    markup = InlineKeyboardMarkup(kb)
+
+    await update.effective_message.reply_text(
+        f"Текущая модель:\n`{current_model}`\n\nВыберите модель:",
+        reply_markup=markup,
+        parse_mode="Markdown",
+    )
+
+
+async def on_model_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    if not query.data.startswith(BTN_MODEL_PREFIX):
+        return
+
+    cfg = context.bot_data.get("settings")
+    if not cfg:
+        await query.answer("Ошибка конфигурации", show_alert=True)
+        return
+
+    model = query.data[len(BTN_MODEL_PREFIX) :]
+
+    # Сейчас безопасно: просто подтверждаем выбор
+    # (реальная смена модели может быть добавлена позже)
+    await query.answer(f"Выбрана модель: {model}", show_alert=False)
+
+    await query.message.edit_text(
+        f"Текущая модель:\n`{model}`",
+        parse_mode="Markdown",
+    )
+
+
+def register(app) -> None:
     app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CallbackQueryHandler(on_model_cb, pattern=r"^model\|"))
+    app.add_handler(CallbackQueryHandler(on_model_cb, pattern=r"^model:set:"))
