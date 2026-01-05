@@ -51,6 +51,29 @@ async def _post_init(app: Application) -> None:
         log.warning("set_my_commands failed: %s", e)
 
 
+def _setup_logging(cfg) -> None:
+    """
+    Управляемое логирование:
+    - общий уровень берём из cfg.log_level
+    - шумные либы приглушаем до WARNING
+    """
+    level_name = (getattr(cfg, "log_level", "INFO") or "INFO").upper()
+    root_level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=root_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # Снижаем шум, чтобы DEBUG был полезен
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
+
+    log.info("Logging initialized: level=%s", level_name)
+
+
 def _resolve_embedding_dim(cfg) -> int:
     """
     Единая точка определения размерности embeddings.
@@ -73,32 +96,59 @@ def _resolve_embedding_dim(cfg) -> int:
 
 def _build_kb_indexer(*, repo_kb: KBRepo, embedder: Embedder, cfg) -> KbIndexer:
     """
-    Собирает индексатор KB в одном месте.
-    Достаём параметры безопасно, чтобы не ловить AttributeError.
+    Собирает индексатор KB.
+    В разных ветках у KbIndexer часто плавают имена аргументов — делаем безопасный фоллбек.
     """
     chunk_size = getattr(cfg, "chunk_size", 900)
     overlap = getattr(cfg, "chunk_overlap", 150)
 
-    # В некоторых версиях KbIndexer может ожидать slightly другие имена аргументов.
-    # Используем именованные аргументы как "контракт" в коде.
+    # Попытка №1 — "новый" контракт
+    try:
+        return KbIndexer(
+            kb_repo=repo_kb,
+            embedder=embedder,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+    except TypeError:
+        pass
+
+    # Попытка №2 — альтернативные имена
+    try:
+        return KbIndexer(
+            repo=repo_kb,
+            embedder=embedder,
+            chunk_size=chunk_size,
+            overlap=overlap,
+        )
+    except TypeError:
+        pass
+
+    # Попытка №3 — overlap может называться chunk_overlap
     return KbIndexer(
         kb_repo=repo_kb,
         embedder=embedder,
         chunk_size=chunk_size,
-        overlap=overlap,
+        chunk_overlap=overlap,
     )
 
 
 def build_application() -> Application:
     cfg = load_settings()
-
-    logging.basicConfig(
-        level=getattr(logging, (getattr(cfg, "log_level", "INFO") or "INFO").upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _setup_logging(cfg)
 
     if not cfg.telegram_token:
         raise RuntimeError("telegram_token отсутствует в настройках")
+
+    if not cfg.database_url:
+        raise RuntimeError("DATABASE_URL отсутствует в настройках")
+
+    log.info(
+        "Startup config: image=%s web=%s provider=%s",
+        bool(getattr(cfg, "enable_image_generation", False)),
+        bool(getattr(cfg, "enable_web_search", False)),
+        getattr(cfg, "web_search_provider", "disabled"),
+    )
 
     app = (
         Application.builder()
@@ -107,11 +157,7 @@ def build_application() -> Application:
         .build()
     )
 
-    db_url = cfg.database_url
-    if not db_url:
-        raise RuntimeError("DATABASE_URL отсутствует в настройках")
-
-    session_factory, _engine = make_session_factory(db_url)
+    session_factory, _engine = make_session_factory(cfg.database_url)
     # Schema is managed by Alembic (see Docker CMD).
 
     # --- repos ---
@@ -134,7 +180,6 @@ def build_application() -> Application:
         if getattr(cfg, "enable_image_generation", False)
         else None
     )
-
     vs = VoiceService(openai_client=oai_client)
 
     # KB core
@@ -156,6 +201,10 @@ def build_application() -> Application:
             "settings": cfg,
             "repo_dialogs": repo_dialogs,
             "repo_kb": repo_kb,
+            "repo_dialog_kb": repo_dialog_kb,
+            "oai_client": oai_client,
+            "retriever": retriever,
+            "indexer": indexer,
             "svc_dialog": ds,
             "svc_authz": authz,
             "svc_gen": gen,
