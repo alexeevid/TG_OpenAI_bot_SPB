@@ -85,7 +85,7 @@ class KbIndexer:
             self._repo.delete_chunks_by_document_id(did)
             return 0
 
-        embeddings = self._embed(chunks=[c.text for c in chunks])  # type: ignore
+        embeddings = self._embed([c.text for c in chunks])
 
         rows: List[Tuple[int, int, str, list[float]]] = []
         for c, emb in zip(chunks, embeddings):
