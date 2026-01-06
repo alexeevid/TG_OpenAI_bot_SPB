@@ -1,6 +1,6 @@
-# app/handlers/errors.py
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -10,17 +10,28 @@ from telegram.ext import Application, ContextTypes
 
 log = logging.getLogger(__name__)
 
+_conflict_exit_scheduled = False
+
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global _conflict_exit_scheduled
     err = context.error
 
-    # Polling conflict: during rolling deploy старый процесс может не успеть умереть.
-    # Самое надёжное — завершить процесс, Railway поднимет чистый инстанс.
+    # Polling conflict (two instances calling getUpdates).
+    # Do NOT exit immediately: it creates a restart storm during rolling deploy.
+    # Instead: wait a bit, then exit once.
     if isinstance(err, Conflict):
-        log.warning("Telegram polling conflict detected (another getUpdates). Exiting to release lock.")
-        os._exit(1)
+        if not _conflict_exit_scheduled:
+            _conflict_exit_scheduled = True
+            log.warning(
+                "Telegram polling conflict detected (another getUpdates). "
+                "Will exit in 25s to release lock and avoid restart storm."
+            )
+            await asyncio.sleep(25)
+            os._exit(1)
+        return
 
-    # transient network errors: без шумных traceback
+    # transient network errors: without noisy traceback
     if isinstance(err, (NetworkError, TimedOut)):
         log.warning("Telegram network error: %s", err)
         return
