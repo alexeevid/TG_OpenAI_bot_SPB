@@ -231,6 +231,5 @@ def run() -> None:
     app = build_application()
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=None,
-        stop_signals=None,
+        allowed_updates=None,     
     )
