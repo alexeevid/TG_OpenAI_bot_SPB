@@ -178,7 +178,7 @@ def load_settings() -> Settings:
         _getenv("OPENAI_TEXT_MODEL")
         or _getenv("OPENAI_MODEL")
         or _getenv("TEXT_MODEL")
-        or "gpt-4.5-turbo"
+        or "gpt-5"
     )
     openai_image_model = _getenv("OPENAI_IMAGE_MODEL") or _getenv("IMAGE_MODEL") or "gpt-image-1"
     openai_embedding_model = (
