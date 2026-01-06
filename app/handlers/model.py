@@ -6,27 +6,31 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 BTN_MODEL_PREFIX = "model:set:"
 
 
-def _get_available_models(cfg) -> List[str]:
+def _get_available_models(context: ContextTypes.DEFAULT_TYPE) -> List[str]:
     """
-    Возвращает список доступных моделей.
-    Сейчас — минимально безопасно:
-    либо из denylist/allowlist,
-    либо только текущая модель.
+    Возвращает список доступных TEXT-моделей
+    напрямую из OpenAI API (через OpenAIClient).
     """
-    # Если в будущем появится список — сюда легко добавить
-    model = getattr(cfg, "text_model", None)
-    if model:
-        return [model]
-    return []
+    openai = context.bot_data.get("openai")
+    if not openai:
+        return []
+
+    try:
+        return openai.list_models_by_kind("text")
+    except Exception:
+        return []
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_message:
+        return
+
     cfg = context.bot_data.get("settings")
-    if not cfg or not update.effective_message:
+    if not cfg:
         return
 
     current_model = getattr(cfg, "text_model", "unknown")
-    models = _get_available_models(cfg)
+    models = _get_available_models(context)
 
     # Если моделей нет — всегда отвечаем текстом
     if not models:
@@ -37,7 +41,6 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Строим клавиатуру
     kb = []
     for m in models:
         label = f"✅ {m}" if m == current_model else m
@@ -67,8 +70,11 @@ async def on_model_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     model = query.data[len(BTN_MODEL_PREFIX) :]
 
-    # Сейчас безопасно: просто подтверждаем выбор
-    # (реальная смена модели может быть добавлена позже)
+    # ВАЖНО:
+    # здесь мы пока НЕ меняем модель глобально,
+    # а только подтверждаем выбор.
+    # Реальное сохранение модели (в диалог / БД)
+    # делается на следующем шаге.
     await query.answer(f"Выбрана модель: {model}", show_alert=False)
 
     await query.message.edit_text(
