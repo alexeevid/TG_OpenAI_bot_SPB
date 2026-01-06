@@ -130,18 +130,23 @@ def build_application() -> Application:
     repo_dialog_kb = DialogKBRepo(session_factory)
 
     # --- services ---
-    ds = DialogService(repo_dialogs)
+    # ВАЖНО: прокидываем settings, чтобы DialogService мог выставлять дефолты моделей в dialog.settings
+    ds = DialogService(repo_dialogs, settings=cfg)
     authz = AuthzService(cfg)
 
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-    gen = GenService(api_key=cfg.openai_api_key, default_model=cfg.text_model)
+
+    # GenService: default_model остаётся, но реальный выбор теперь идёт из dialog_settings
+    gen = GenService(api_key=cfg.openai_api_key, default_model=getattr(cfg, "text_model", "gpt-4o-mini"))
 
     img = (
-        ImageService(api_key=cfg.openai_api_key, image_model=cfg.image_model)
+        ImageService(api_key=cfg.openai_api_key, image_model=getattr(cfg, "image_model", "gpt-image-1"))
         if getattr(cfg, "enable_image_generation", False)
         else None
     )
-    vs = VoiceService(openai_client=oai_client)
+
+    # ВАЖНО: прокидываем settings, чтобы дефолт STT модели был консистентен
+    vs = VoiceService(openai_client=oai_client, settings=cfg)
 
     yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
 
@@ -162,7 +167,9 @@ def build_application() -> Application:
             "repo_dialogs": repo_dialogs,
             "repo_kb": repo_kb,
             "repo_dialog_kb": repo_dialog_kb,
+            # OpenAI client aliases:
             "oai_client": oai_client,
+            "openai": oai_client,  # важно для handlers/model.py
             "retriever": retriever,
             "indexer": indexer,
             "svc_dialog": ds,
