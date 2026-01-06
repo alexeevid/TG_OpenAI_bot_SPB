@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
@@ -26,6 +26,23 @@ def _extract_draw_prompt(text: str) -> str | None:
     return None
 
 
+def _get_openai_client(context: ContextTypes.DEFAULT_TYPE):
+    # main.py кладёт alias "openai" и "oai_client"
+    return context.application.bot_data.get("openai") or context.application.bot_data.get("oai_client")
+
+
+def _safe_model(openai, *, model: Optional[str], kind: str, fallback: str) -> str:
+    """
+    Soft normalize model to an available one. Best effort; never raises.
+    """
+    if not openai:
+        return model or fallback
+    try:
+        return openai.ensure_model_available(model=model, kind=kind, fallback=fallback)
+    except Exception:
+        return model or fallback
+
+
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not update.effective_user:
@@ -39,8 +56,8 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     ds: DialogService | None = context.application.bot_data.get("svc_dialog")
     dialog_settings: Dict[str, Any] = {}
-    transcribe_model: str | None = None
-    image_model: str | None = None
+    transcribe_model: Optional[str] = None
+    image_model: Optional[str] = None
 
     if ds:
         try:
@@ -51,11 +68,41 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             log.warning("Failed to read dialog settings for voice models: %s", e)
 
+    # --- Normalize models against real availability BEFORE calling services ---
+    openai = _get_openai_client(context)
+
+    safe_transcribe = _safe_model(
+        openai,
+        model=transcribe_model,
+        kind="transcribe",
+        fallback=getattr(cfg, "transcribe_model", None) or getattr(cfg, "openai_transcribe_model", None) or "whisper-1",
+    )
+    if ds and safe_transcribe and safe_transcribe != transcribe_model:
+        try:
+            ds.update_active_settings(update.effective_user.id, {"transcribe_model": safe_transcribe})
+            dialog_settings["transcribe_model"] = safe_transcribe
+            transcribe_model = safe_transcribe
+        except Exception as e:
+            log.warning("Failed to sync transcribe_model to dialog settings: %s", e)
+
+    safe_image = _safe_model(
+        openai,
+        model=image_model,
+        kind="image",
+        fallback=getattr(cfg, "image_model", None) or getattr(cfg, "openai_image_model", None) or "gpt-image-1",
+    )
+    if ds and safe_image and safe_image != image_model:
+        try:
+            ds.update_active_settings(update.effective_user.id, {"image_model": safe_image})
+            dialog_settings["image_model"] = safe_image
+            image_model = safe_image
+        except Exception as e:
+            log.warning("Failed to sync image_model to dialog settings: %s", e)
+
     await msg.reply_text("🎙️ Распознаю…")
 
     try:
-        # ТВОЯ текущая сигнатура: transcribe(message)
-        # Но если VoiceService уже поддерживает model/dialog_settings — используем.
+        # VoiceService уже поддерживает model/dialog_settings — используем.
         try:
             text = await vs.transcribe(msg, model=transcribe_model, dialog_settings=dialog_settings)
         except TypeError:
@@ -104,6 +151,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Иначе — обычная обработка текста через общий пайплайн
     try:
         from .text import process_text
+
         await process_text(update, context, text)
     except Exception as e:
         log.exception("process_text failed after voice: %s", e)
