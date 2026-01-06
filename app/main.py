@@ -59,6 +59,7 @@ def _setup_logging(cfg) -> None:
     log_format = os.getenv("LOG_FORMAT") or "%(asctime)s %(levelname)s %(name)s: %(message)s"
     logging.basicConfig(level=root_level, format=log_format)
 
+    # Снижаем шум, чтобы DEBUG был полезен
     noisy = [
         "telegram",
         "telegram.ext",
