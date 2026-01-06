@@ -72,6 +72,42 @@ class DialogService:
         repo = self._ensure_repo()
         repo.add_message(dialog_id, "assistant", text)
 
+    def ensure_active_dialog(self, user_id: int):
+        """
+        Backward-compatible method.
+        Handlers expect ensure_active_dialog(user_id) to always return a dialog.
+    
+        Strategy:
+        1) try get_active_dialog
+        2) if none -> create a new dialog and make it active (via existing APIs)
+        """
+        d = self.get_active_dialog(user_id)
+        if d:
+            return d
+    
+        # Try common create methods if they exist in your codebase
+        if hasattr(self, "create_dialog"):
+            return self.create_dialog(user_id)
+    
+        if hasattr(self, "create_new_dialog"):
+            return self.create_new_dialog(user_id)
+    
+        # If service uses repo directly, fall back carefully
+        if hasattr(self, "repo") and hasattr(self.repo, "create_dialog"):
+            d = self.repo.create_dialog(user_id=user_id)
+            # If there is a set_active method, call it
+            if hasattr(self, "set_active_dialog"):
+                try:
+                    self.set_active_dialog(user_id, getattr(d, "id", None))
+                except Exception:
+                    pass
+            return d
+    
+        raise AttributeError(
+            "DialogService has no ensure_active_dialog and no compatible create method found "
+            "(expected create_dialog/create_new_dialog or repo.create_dialog)."
+        )
+
     def history(self, dialog_id: int, limit: int = 30) -> List[Message]:
         repo = self._ensure_repo()
         return repo.list_messages(dialog_id, limit=limit)
