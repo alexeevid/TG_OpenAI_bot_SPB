@@ -30,20 +30,11 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("⚠️ VoiceService не инициализирован.")
         return
 
-    # Получаем файл
-    voice = update.effective_message.voice or update.effective_message.audio
-    if not voice:
-        return
-
     await update.effective_message.reply_text("🎙️ Распознаю…")
 
     try:
-        tg_file = await voice.get_file()
-        # VoiceService в твоём проекте обычно умеет работать с telegram.File
-        text = await vs.transcribe_telegram_file(tg_file)  # если у тебя метод называется иначе — скажи, поправлю
-    except AttributeError:
-        # fallback: если VoiceService принимает Update/Context иначе
-        text = await vs.transcribe(update, context)
+        # ТВОЯ сигнатура: transcribe(message)
+        text = await vs.transcribe(update.effective_message)
     except Exception as e:
         log.exception("Voice transcription failed: %s", e)
         await update.effective_message.reply_text(f"❌ Ошибка распознавания голоса: {e}")
@@ -53,12 +44,13 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("⚠️ Не удалось распознать речь.")
         return
 
-    # Если голос начинается с "нарисуй ..." — запускаем генерацию изображения
+    # Если распознанный текст начинается с "нарисуй ..." — генерируем картинку
     prompt = _extract_draw_prompt(text)
     if prompt:
         if not getattr(cfg, "enable_image_generation", False):
             await update.effective_message.reply_text("🚫 Генерация изображений отключена в настройках.")
             return
+
         img_svc = context.application.bot_data.get("svc_image")
         if img_svc is None:
             await update.effective_message.reply_text("⚠️ Сервис генерации изображений не инициализирован.")
