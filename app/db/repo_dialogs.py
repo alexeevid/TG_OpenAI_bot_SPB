@@ -135,10 +135,24 @@ class DialogsRepo:
             d = s.get(Dialog, dialog_id)
             if not d:
                 return None
+
+            if not patch or not isinstance(patch, dict):
+                return d
+
+            # base must be dict
             base = d.settings or {}
             if not isinstance(base, dict):
                 base = {}
-            base.update(patch or {})
+            else:
+                # work with a copy to avoid in-place mutation edge cases
+                base = dict(base)
+
+            # filter out None values (avoid poisoning settings)
+            clean_patch: Dict[str, Any] = {k: v for k, v in (patch or {}).items() if v is not None}
+            if not clean_patch:
+                return d
+
+            base.update(clean_patch)
             d.settings = base
 
             # updated_at должен меняться
