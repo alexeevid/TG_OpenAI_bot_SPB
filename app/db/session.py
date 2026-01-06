@@ -35,5 +35,50 @@ def make_session_factory(database_url: str | None):
                 register_vector(dbapi_connection)
             except Exception:
                 pass
+# app/db/session.py
+from __future__ import annotations
+
+import logging
+from sqlalchemy import text
+
+log = logging.getLogger(__name__)
+
+
+def reset_schema(engine) -> None:
+    """
+    Полный reset схемы БД: удаляет все таблицы, затем создаёт заново по models.py.
+    ВНИМАНИЕ: уничтожает все данные.
+    """
+    from .models import Base  # важно импортировать здесь, чтобы не было циклов
+
+    log.warning("DB RESET: dropping all tables...")
+    Base.metadata.drop_all(bind=engine)
+
+    # На всякий случай: pgvector extension (если используется в KB)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    except Exception as e:
+        log.warning("Could not ensure pgvector extension (ok if not used): %s", e)
+
+    log.warning("DB RESET: creating all tables...")
+    Base.metadata.create_all(bind=engine)
+    log.warning("DB RESET: done.")
+
+
+def ensure_schema(engine) -> None:
+    """
+    Мягкая инициализация: создаёт таблицы, если их нет.
+    Данные не трогает.
+    """
+    from .models import Base
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    except Exception as e:
+        log.info("pgvector extension not ensured (ok): %s", e)
+
+    Base.metadata.create_all(bind=engine)
 
     return sessionmaker(bind=engine, expire_on_commit=False), engine
