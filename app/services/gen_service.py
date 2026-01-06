@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from ..clients.openai_client import OpenAIClient
 
@@ -39,7 +39,6 @@ class GenService:
         return await asyncio.to_thread(self.client.list_models)
 
     def _rank_models(self, models: List[str]) -> List[str]:
-        # Prefer "latest & strong" first, then others.
         preferred = [
             "gpt-5.2-pro",
             "gpt-5.2",
@@ -56,12 +55,10 @@ class GenService:
 
     async def selectable_models(self, limit: int = 12) -> List[str]:
         models = await self.list_models()
-        # Filter typical chat-capable families
         filtered = [m for m in models if m.startswith(("gpt-", "o"))]
         ranked = self._rank_models(filtered)
         if ranked:
             return ranked[:limit]
-        # Safe fallback if listing fails
         return ["gpt-5.2", "gpt-5.2-pro", "gpt-4o", "gpt-4o-mini"]
 
     async def chat(
@@ -109,7 +106,10 @@ class GenService:
                         max_output_tokens=self.max_output_tokens,
                         reasoning_effort=self.reasoning_effort,
                     )
-                    return f"⚠️ Выбранная модель `{use_model}` недоступна или вернула ошибку. Переключился на `{fallback_model}`.\n\n{txt}"
+                    return (
+                        f"⚠️ Выбранная модель `{use_model}` недоступна или вернула ошибку. "
+                        f"Переключился на `{fallback_model}`.\n\n{txt}"
+                    )
                 except Exception as e2:
                     log.exception("Fallback model also failed: %s", e2)
             raise
@@ -118,6 +118,6 @@ class GenService:
         use_model = model or self.image_model
         return await asyncio.to_thread(self.client.generate_image_url, model=use_model, prompt=prompt, size=size)
 
-    async def transcribe_file(self, file_obj, model: Optional[str] = None) -> str:
+    async def transcribe_path(self, file_path: str, model: Optional[str] = None) -> str:
         use_model = model or self.transcribe_model
-        return await asyncio.to_thread(self.client.transcribe_file, file_obj, use_model)
+        return await asyncio.to_thread(self.client.transcribe_path, file_path=file_path, model=use_model)
