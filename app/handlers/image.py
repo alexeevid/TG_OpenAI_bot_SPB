@@ -23,7 +23,7 @@ def _extract_draw_prompt(text: str) -> str | None:
     return None
 
 
-async def on_draw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
     cfg = context.application.bot_data.get("settings")
     if not getattr(cfg, "enable_image_generation", False):
         await update.effective_message.reply_text("🚫 Генерация изображений отключена в настройках.")
@@ -34,23 +34,9 @@ async def on_draw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("⚠️ Сервис генерации изображений не инициализирован.")
         return
 
-    text = (update.effective_message.text or "").strip()
-    prompt = _extract_draw_prompt(text)
-
-    # поддержка /draw <prompt>
-    if not prompt:
-        parts = text.split(maxsplit=1)
-        if parts and parts[0].lstrip("/").lower() in ("draw", "image", "img"):
-            prompt = parts[1].strip() if len(parts) > 1 else None
-
-    if not prompt:
-        await update.effective_message.reply_text("Напиши: «нарисуй <что рисовать>» или /draw <описание>.")
-        return
-
     await update.effective_message.reply_text("🎨 Рисую…")
 
     try:
-        # Можно брать размер/модель из настроек, если у тебя они есть
         url = await img_svc.generate_url(prompt)
         await update.effective_message.reply_text(url)
     except Exception as e:
@@ -58,12 +44,26 @@ async def on_draw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f"❌ Ошибка генерации изображения: {e}")
 
 
-def register(app: Application) -> None:
+async def on_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # /draw <prompt>
-    app.add_handler(CommandHandler("draw", on_draw))
+    text = (update.effective_message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    prompt = parts[1].strip() if len(parts) > 1 else None
+    if not prompt:
+        await update.effective_message.reply_text("Напиши: /draw <что рисовать> (или текстом: «нарисуй …»).")
+        return
+    await _generate_and_reply(update, context, prompt)
 
-    # текстовые триггеры "нарисуй ..."
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, on_draw),
-        group=50,  # поздняя группа, чтобы не мешать обычному тексту
-    )
+
+async def on_draw_text_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Триггер только если текст начинается с "нарисуй/рисуй/draw"
+    text = (update.effective_message.text or "").strip()
+    prompt = _extract_draw_prompt(text)
+    if not prompt:
+        return
+    await _generate_and_reply(update, context, prompt)
+
+
+def register(app: Application) -> None:
+    app.add_handler(CommandHandler("draw", on_draw_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_draw_text_trigger))
