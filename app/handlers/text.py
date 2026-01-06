@@ -95,6 +95,8 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     history_rows = ds.history(d.id, limit=24)
     history: List[Dict[str, str]] = [{"role": m.role, "content": m.content} for m in history_rows]
 
+    meta: Dict[str, Any] = {}
+
     try:
         # model НЕ передаём: GenService сам выберет text_model из dialog_settings
         answer = await gs.chat(
@@ -104,11 +106,25 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             system_prompt=sys,
             temperature=cfg.openai_temperature,
             dialog_settings=settings,
+            out_meta=meta,
         )
     except Exception as e:
         log.exception("GenService.chat failed: %s", e)
         await msg.reply_text("⚠️ Ошибка генерации.")
         return
+
+    # --- Synchronize REAL used model back into dialog settings ---
+    # This fixes: "fallback used but /status shows selected (unavailable) model".
+    try:
+        used_model = meta.get("used_model")
+        if used_model and isinstance(used_model, str):
+            current_model = settings.get("text_model")
+            if current_model != used_model:
+                ds.update_active_settings(update.effective_user.id, {"text_model": used_model})
+                # Обновляем локальную копию settings (на случай дальнейших шагов в этом же хендлере)
+                settings["text_model"] = used_model
+    except Exception as e:
+        log.warning("Failed to sync used text model to dialog settings: %s", e)
 
     ds.add_user_message(d.id, text)
     ds.add_assistant_message(d.id, answer)
