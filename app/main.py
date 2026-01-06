@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+
 from telegram.ext import Application
 
 from .settings import load_settings
@@ -56,20 +58,31 @@ def _setup_logging(cfg) -> None:
     Управляемое логирование:
     - общий уровень берём из cfg.log_level
     - шумные либы приглушаем до WARNING
+    - формат можно переопределить через env LOG_FORMAT
     """
     level_name = (getattr(cfg, "log_level", "INFO") or "INFO").upper()
     root_level = getattr(logging, level_name, logging.INFO)
 
+    log_format = os.getenv("LOG_FORMAT") or "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
     logging.basicConfig(
         level=root_level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        format=log_format,
     )
 
     # Снижаем шум, чтобы DEBUG был полезен
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    logging.getLogger("telegram.ext").setLevel(logging.WARNING)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
+    noisy = [
+        "telegram",
+        "telegram.ext",
+        "httpx",
+        "httpcore",
+        "httpcore.http11",
+        "openai",
+        "sqlalchemy",
+        "urllib3",
+    ]
+    for name in noisy:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     log.info("Logging initialized: level=%s", level_name)
 
@@ -105,6 +118,7 @@ def _build_kb_indexer(*, repo_kb: KBRepo, embedder: Embedder, cfg) -> KbIndexer:
         overlap,
     )
 
+
 def build_application() -> Application:
     cfg = load_settings()
     _setup_logging(cfg)
@@ -114,6 +128,9 @@ def build_application() -> Application:
 
     if not cfg.database_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках")
+
+    if not cfg.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY отсутствует в настройках")
 
     log.info(
         "Startup config: image=%s web=%s provider=%s",
