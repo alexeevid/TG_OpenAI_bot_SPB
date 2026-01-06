@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -6,28 +8,33 @@ from ..services.dialog_service import DialogService
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg:
+        return
+
     az: AuthzService = context.bot_data.get("svc_authz")
     if az and update.effective_user and not az.is_allowed(update.effective_user.id):
-        await update.message.reply_text("⛔ Доступ запрещен.")
+        await msg.reply_text("⛔ Доступ запрещен.")
         return
 
     ds: DialogService = context.bot_data.get("svc_dialog")
     cfg = context.bot_data.get("settings")
     if not ds or not cfg or not update.effective_user:
-        await update.message.reply_text("⚠️ Сервисы не настроены.")
+        await msg.reply_text("⚠️ Сервисы не настроены.")
         return
 
-    d = ds.get_active_dialog(update.effective_user.id)
+    # Надёжно: гарантируем активный диалог
+    d = ds.ensure_active_dialog(update.effective_user.id)
     settings = ds.get_active_settings(update.effective_user.id) or {}
 
     # Информация по диалогу
-    mode = settings.get("mode") or "detailed"
+    mode = str(settings.get("mode") or "detailed")
 
     # Модели по модальностям (источник истины — settings диалога)
     # Если вдруг пусто — показываем дефолты из cfg для понятности.
-    text_model = settings.get("text_model") or getattr(cfg, "text_model", "unknown")
-    image_model = settings.get("image_model") or getattr(cfg, "image_model", "unknown")
-    transcribe_model = settings.get("transcribe_model") or getattr(cfg, "transcribe_model", "unknown")
+    text_model = str(settings.get("text_model") or getattr(cfg, "text_model", "unknown"))
+    image_model = str(settings.get("image_model") or getattr(cfg, "image_model", "unknown"))
+    transcribe_model = str(settings.get("transcribe_model") or getattr(cfg, "transcribe_model", "unknown"))
 
     image_enabled = bool(context.bot_data.get("svc_image"))
     rag_enabled = bool(context.bot_data.get("svc_rag"))
@@ -53,7 +60,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🖼️ Генерация изображений: {'включена' if image_enabled else 'отключена'}\n"
         f"📚 База знаний (RAG): {'включена' if rag_enabled else 'отключена'}"
     )
-    await update.message.reply_text(text)
+    await msg.reply_text(text)
 
 
 def register(app):
