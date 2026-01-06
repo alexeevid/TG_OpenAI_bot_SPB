@@ -30,21 +30,14 @@ def _get_dialog_service(context: ContextTypes.DEFAULT_TYPE) -> DialogService | N
 
 
 def _get_available_models(context: ContextTypes.DEFAULT_TYPE, kind: ModelKind, *, force_refresh: bool = False) -> List[str]:
-    """
-    Возвращает список доступных моделей по модальности
-    напрямую из OpenAI API (через OpenAIClient).
-    """
     openai = _get_openai(context)
     if not openai:
         return []
-
     try:
         return list(openai.list_models_by_kind(kind, force_refresh=force_refresh))
     except TypeError:
         # на случай старого OpenAIClient без force_refresh
         try:
-            if force_refresh and hasattr(openai, "list_models"):
-                _ = openai.list_models()  # best-effort
             return list(openai.list_models_by_kind(kind))
         except Exception:
             return []
@@ -62,9 +55,6 @@ def _format_current_models(models: Dict[str, str]) -> str:
 
 
 async def _render_kind_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: bool = False) -> None:
-    """
-    Рендерим экран выбора модальности + кнопка обновления списка моделей.
-    """
     if not update.effective_user:
         return
 
@@ -108,7 +98,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_refresh_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Обновить кеш модели и перерисовать меню модальностей.
+    Обновить кеш моделей и перерисовать меню модальностей.
     """
     query = update.callback_query
     if not query or not query.data:
@@ -117,19 +107,20 @@ async def on_refresh_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     openai = _get_openai(context)
-    try:
-        # прогреваем кеш заново (best effort)
-        if openai and hasattr(openai, "_list_models_cached"):
-            # на всякий случай, если вдруг миксин другой
+    if openai:
+        # принудительно обновляем кеш (best effort)
+        try:
+            _ = openai.list_models_by_kind("text", force_refresh=True)
+        except Exception:
             pass
-        if openai and hasattr(openai, "list_models"):
-            # в новом OpenAIClient list_models() использует кеш; но нам нужен refresh
-            try:
-                _ = openai._list_models_cached(force_refresh=True)  # type: ignore
-            except Exception:
-                _ = openai.list_models()
-    except Exception:
-        pass
+        try:
+            _ = openai.list_models_by_kind("image", force_refresh=True)
+        except Exception:
+            pass
+        try:
+            _ = openai.list_models_by_kind("transcribe", force_refresh=True)
+        except Exception:
+            pass
 
     await query.answer("Список моделей обновлён", show_alert=False)
     await _render_kind_menu(update, context, edit=True)
@@ -259,10 +250,8 @@ async def on_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("DialogService не настроен", show_alert=True)
         return
 
-    # Сохраняем в активный диалог (в БД)
     dialog_service.set_active_model(query.from_user.id, kind, model)
 
-    # Показываем обновлённые текущие модели
     current = dialog_service.get_active_models(query.from_user.id)
 
     await query.answer(f"Выбрана модель для «{KIND_LABELS[kind]}»: {model}", show_alert=False)
@@ -273,9 +262,6 @@ async def on_set_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_kind_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обработка "назад" из списка моделей — возвращаемся к выбору модальности.
-    """
     query = update.callback_query
     if not query or not query.data or not query.from_user:
         return
