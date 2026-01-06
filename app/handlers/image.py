@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -26,6 +26,23 @@ def _extract_draw_prompt(text: str) -> str | None:
     return None
 
 
+def _get_openai_client(context: ContextTypes.DEFAULT_TYPE):
+    # main.py кладёт alias "openai" и "oai_client"
+    return context.application.bot_data.get("openai") or context.application.bot_data.get("oai_client")
+
+
+def _safe_model(openai, *, model: Optional[str], kind: str, fallback: str) -> str:
+    """
+    Soft normalize model to an available one. Best effort; never raises.
+    """
+    if not openai:
+        return model or fallback
+    try:
+        return openai.ensure_model_available(model=model, kind=kind, fallback=fallback)
+    except Exception:
+        return model or fallback
+
+
 async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
     msg = update.effective_message
     if not msg or not update.effective_user:
@@ -43,7 +60,7 @@ async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     ds: DialogService | None = context.application.bot_data.get("svc_dialog")
     dialog_settings: Dict[str, Any] = {}
-    image_model: str | None = None
+    image_model: Optional[str] = None
 
     if ds:
         try:
@@ -52,6 +69,22 @@ async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
             image_model = dialog_settings.get("image_model")
         except Exception as e:
             log.warning("Failed to read dialog settings for image model: %s", e)
+
+    # --- Normalize & sync model (so /status matches actual used model) ---
+    openai = _get_openai_client(context)
+    safe_image = _safe_model(
+        openai,
+        model=image_model,
+        kind="image",
+        fallback=getattr(cfg, "image_model", None) or getattr(cfg, "openai_image_model", None) or "gpt-image-1",
+    )
+    if ds and safe_image and safe_image != image_model:
+        try:
+            ds.update_active_settings(update.effective_user.id, {"image_model": safe_image})
+            dialog_settings["image_model"] = safe_image
+            image_model = safe_image
+        except Exception as e:
+            log.warning("Failed to sync image_model to dialog settings: %s", e)
 
     await msg.reply_text("🎨 Рисую…")
 
