@@ -137,10 +137,12 @@ def build_application() -> Application:
     oai_client = OpenAIClient(api_key=cfg.openai_api_key)
 
     # GenService: default_model остаётся, но реальный выбор теперь идёт из dialog_settings
-    gen = GenService(api_key=cfg.openai_api_key, default_model=getattr(cfg, "text_model", "gpt-4o-mini"))
+    default_text_model = str(getattr(cfg, "text_model", "") or "gpt-4o-mini")
+    gen = GenService(api_key=cfg.openai_api_key, default_model=default_text_model)
 
+    default_image_model = str(getattr(cfg, "image_model", "") or "gpt-image-1")
     img = (
-        ImageService(api_key=cfg.openai_api_key, image_model=getattr(cfg, "image_model", "gpt-image-1"))
+        ImageService(api_key=cfg.openai_api_key, image_model=default_image_model)
         if getattr(cfg, "enable_image_generation", False)
         else None
     )
@@ -169,7 +171,7 @@ def build_application() -> Application:
             "repo_dialog_kb": repo_dialog_kb,
             # OpenAI client aliases:
             "oai_client": oai_client,
-            "openai": oai_client,  # важно для handlers/model.py
+            "openai": oai_client,  # важно для handlers/model.py + handlers/image.py/voice.py
             "retriever": retriever,
             "indexer": indexer,
             "svc_dialog": ds,
