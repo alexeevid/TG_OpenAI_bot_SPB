@@ -3,9 +3,8 @@ from __future__ import annotations
 import logging
 import time
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
-import openai
 from openai import OpenAI
 
 log = logging.getLogger(__name__)
@@ -15,8 +14,8 @@ class OpenAIClient:
     """
     OpenAI API client wrapper.
 
-    In this project we use:
-    - text generation (Responses API when available, fallback to Chat Completions)
+    We use:
+    - text generation (try Responses API; fallback to Chat Completions when needed)
     - image generation
     - audio transcription
     - embeddings (for KB/RAG)
@@ -29,7 +28,7 @@ class OpenAIClient:
     def list_models(self) -> List[str]:
         try:
             out = self.client.models.list()
-            ids = []
+            ids: List[str] = []
             for m in getattr(out, "data", []) or []:
                 mid = getattr(m, "id", None)
                 if mid:
@@ -41,44 +40,30 @@ class OpenAIClient:
 
     # -------- embeddings (KB/RAG) --------
     def embeddings(self, texts: Sequence[str], model: str) -> List[List[float]]:
-        """
-        Return embeddings for each text.
-        """
         if not texts:
             return []
 
-        # Basic retries for transient errors / rate limits.
         last_err: Optional[Exception] = None
         for attempt in range(1, 4):
             try:
-                resp = self.client.embeddings.create(
-                    model=model,
-                    input=list(texts),
-                )
+                resp = self.client.embeddings.create(model=model, input=list(texts))
                 return [d.embedding for d in resp.data]
             except Exception as e:
                 last_err = e
-                # simple backoff
                 time.sleep(0.5 * attempt)
 
         raise last_err or RuntimeError("embeddings() failed")
 
     def embed(self, texts: Sequence[str], model: Optional[str] = None) -> List[List[float]]:
-        """
-        Compatibility alias for KB code that calls `openai_client.embed(texts)`.
-
-        If model is None, we try to get it from app.settings.cfg (project settings).
-        """
+        # Backward-compatible alias
         if model is None:
             try:
-                # local import to avoid circular deps at import time
                 from app.settings import cfg  # type: ignore
                 model = getattr(cfg, "OPENAI_EMBEDDING_MODEL", None)
             except Exception:
                 model = None
 
         if not model:
-            # safe default (matches your KB defaults)
             model = "text-embedding-3-large"
 
         return self.embeddings(texts, model=model)
@@ -93,13 +78,17 @@ class OpenAIClient:
         max_output_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> str:
-        """Generate assistant text.
-
-        Notes:
-        - For GPT-5.* we prefer the Responses API (recommended by OpenAI).
-        - We map any `system` messages into the `instructions` field for Responses.
-        - If the selected model is not available on the key/account, we surface the API error.
         """
+        Generate assistant text.
+
+        Strategy:
+        1) Try Responses API when available and likely supported by the model.
+           If it fails with "unsupported/unknown" style errors -> fallback.
+        2) Fallback to Chat Completions.
+
+        This makes text generation resilient across model families/accounts.
+        """
+
         # Split system instructions from conversational turns.
         sys_parts: List[str] = []
         turns: List[Dict[str, str]] = []
@@ -133,12 +122,17 @@ class OpenAIClient:
                                 return str(t).strip()
             return str(resp).strip()
 
-        has_responses = hasattr(self.client, "responses") and hasattr(self.client.responses, "create")
-        prefer_responses = model.startswith("gpt-5") or model.startswith("o")
+        def _should_try_responses(model_name: str) -> bool:
+            # Conservative allowlist: models most likely to support Responses well.
+            # (We still fallback if the API rejects it.)
+            return model_name.startswith(("gpt-5", "o", "gpt-4o", "gpt-4.1"))
 
-        if has_responses and (prefer_responses or True):
+        has_responses = hasattr(self.client, "responses") and hasattr(self.client.responses, "create")
+
+        # 1) Try Responses (if available + model family suggests it)
+        if has_responses and _should_try_responses(model):
             last_err: Optional[Exception] = None
-            for attempt in range(1, 4):
+            for attempt in range(1, 3 + 1):
                 try:
                     kwargs: Dict[str, Any] = {
                         "model": model,
@@ -157,16 +151,35 @@ class OpenAIClient:
                     return _extract_output_text(resp)
                 except Exception as e:
                     last_err = e
+                    msg = str(e).lower()
+                    # If model/endpoint is not supported, break to fallback immediately.
+                    if any(
+                        s in msg
+                        for s in (
+                            "unsupported",
+                            "not supported",
+                            "unknown model",
+                            "model_not_found",
+                            "invalid model",
+                            "404",
+                            "not found",
+                            "unrecognized",
+                            "responses",
+                        )
+                    ):
+                        break
                     time.sleep(0.5 * attempt)
-            raise last_err or RuntimeError("responses.create() failed")
 
-        # Fallback: Chat Completions API
+            # If we tried Responses and it failed, we continue to fallback below.
+            log.warning("Responses API failed for model=%s, falling back to chat.completions. err=%s", model, last_err)
+
+        # 2) Fallback: Chat Completions API
         last_err2: Optional[Exception] = None
         for attempt in range(1, 4):
             try:
                 resp = self.client.chat.completions.create(
                     model=model,
-                    messages=messages,  # keep original messages
+                    messages=messages,
                     temperature=float(temperature),
                     max_tokens=int(max_output_tokens) if max_output_tokens is not None else None,
                 )
@@ -174,14 +187,8 @@ class OpenAIClient:
             except Exception as e:
                 last_err2 = e
                 time.sleep(0.5 * attempt)
-        raise last_err2 or RuntimeError("chat.completions.create() failed")
 
-    # -------- (internal helper; kept for backward compatibility) --------
-    def _extract_output_text(self, resp: Any) -> str:
-        out_txt = getattr(resp, "output_text", None)
-        if out_txt:
-            return str(out_txt).strip()
-        return str(resp).strip()
+        raise last_err2 or RuntimeError("chat.completions.create() failed")
 
     # -------- images --------
     def generate_image_url(self, *, prompt: str, model: str = "gpt-image-1", size: str = "1024x1024") -> str:
@@ -195,15 +202,22 @@ class OpenAIClient:
         return str(url)
 
     # -------- audio transcription --------
+    def transcribe_file(self, file_obj, model: str = "whisper-1") -> str:
+        """
+        Transcribe from an already opened binary file-like object.
+        (This is what VoiceService currently uses.)
+        """
+        resp = self.client.audio.transcriptions.create(model=model, file=file_obj)
+        return str(getattr(resp, "text", "")).strip()
+
     def transcribe_bytes(self, *, audio_bytes: bytes, filename: str, model: str = "whisper-1") -> str:
         bio = BytesIO(audio_bytes)
         bio.name = filename
-        resp = self.client.audio.transcriptions.create(model=model, file=bio)
-        return str(getattr(resp, "text", "")).strip()
+        return self.transcribe_file(bio, model=model)
 
-    def transcribe_file(self, *, file_path: str, model: str = "whisper-1") -> str:
+    def transcribe_path(self, *, file_path: str, model: str = "whisper-1") -> str:
+        """
+        Transcribe from a filesystem path.
+        """
         with open(file_path, "rb") as f:
-            bio = BytesIO(f.read())
-        bio.name = file_path.split("/")[-1]
-        resp = self.client.audio.transcriptions.create(model=model, file=bio)
-        return str(getattr(resp, "text", "")).strip()
+            return self.transcribe_file(f, model=model)
