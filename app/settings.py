@@ -138,6 +138,11 @@ class Settings:
         return self.openai_image_model
 
     @property
+    def transcribe_model(self) -> str:
+        # добавлено для консистентности с codebase
+        return self.openai_transcribe_model
+
+    @property
     def embedding_dim(self) -> int:
         # OpenAI embedding model dims (stable defaults)
         m = (self.openai_embedding_model or "").lower()
