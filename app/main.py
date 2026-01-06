@@ -12,14 +12,6 @@ from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
 from .db.session import make_session_factory, reset_schema, ensure_schema
-session_factory, engine = make_session_factory(cfg.database_url)
-
-# Одноразовый reset по env (удобно для Railway, где нет SQL-консоли)
-if os.getenv("DB_RESET_ON_START", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
-    reset_schema(engine)
-else:
-    ensure_schema(engine)
-
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
 from .db.repo_dialog_kb import DialogKBRepo
@@ -44,7 +36,6 @@ log = logging.getLogger(__name__)
 
 
 async def _post_init(app: Application) -> None:
-    """PTB ожидает coroutine. Здесь обязателен async + await."""
     try:
         await app.bot.set_my_commands(
             [
@@ -62,23 +53,12 @@ async def _post_init(app: Application) -> None:
 
 
 def _setup_logging(cfg) -> None:
-    """
-    Управляемое логирование:
-    - общий уровень берём из cfg.log_level
-    - шумные либы приглушаем до WARNING
-    - формат можно переопределить через env LOG_FORMAT
-    """
     level_name = (getattr(cfg, "log_level", "INFO") or "INFO").upper()
     root_level = getattr(logging, level_name, logging.INFO)
 
     log_format = os.getenv("LOG_FORMAT") or "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    logging.basicConfig(level=root_level, format=log_format)
 
-    logging.basicConfig(
-        level=root_level,
-        format=log_format,
-    )
-
-    # Снижаем шум, чтобы DEBUG был полезен
     noisy = [
         "telegram",
         "telegram.ext",
@@ -96,14 +76,6 @@ def _setup_logging(cfg) -> None:
 
 
 def _resolve_embedding_dim(cfg) -> int:
-    """
-    Единая точка определения размерности embeddings.
-
-    Приоритет:
-    1) cfg.embedding_dim (property в Settings)
-    2) cfg.pgvector_dim (если где-то используется)
-    3) дефолт 3072 (text-embedding-3-large)
-    """
     dim = getattr(cfg, "embedding_dim", None)
     if isinstance(dim, int) and dim > 0:
         return dim
@@ -118,13 +90,7 @@ def _resolve_embedding_dim(cfg) -> int:
 def _build_kb_indexer(*, repo_kb: KBRepo, embedder: Embedder, cfg) -> KbIndexer:
     chunk_size = getattr(cfg, "chunk_size", 900)
     overlap = getattr(cfg, "chunk_overlap", 150)
-
-    return KbIndexer(
-        repo_kb,
-        embedder,
-        chunk_size,
-        overlap,
-    )
+    return KbIndexer(repo_kb, embedder, chunk_size, overlap)
 
 
 def build_application() -> Application:
@@ -133,10 +99,8 @@ def build_application() -> Application:
 
     if not cfg.telegram_token:
         raise RuntimeError("telegram_token отсутствует в настройках")
-
     if not cfg.database_url:
         raise RuntimeError("DATABASE_URL отсутствует в настройках")
-
     if not cfg.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY отсутствует в настройках")
 
@@ -147,22 +111,21 @@ def build_application() -> Application:
         getattr(cfg, "web_search_provider", "disabled"),
     )
 
-    app = (
-        Application.builder()
-        .token(cfg.telegram_token)
-        .post_init(_post_init)
-        .build()
-    )
+    app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
 
-    session_factory, _engine = make_session_factory(cfg.database_url)
-    # Schema is managed by Alembic (see Docker CMD).
+    # ---- DB init (ONE place) ----
+    session_factory, engine = make_session_factory(cfg.database_url)
+
+    # One-shot reset on start (Railway-friendly)
+    if os.getenv("DB_RESET_ON_START", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
+        reset_schema(engine)
+    else:
+        ensure_schema(engine)
 
     # --- repos ---
     repo_dialogs = DialogsRepo(session_factory)
-
     embedding_dim = _resolve_embedding_dim(cfg)
     repo_kb = KBRepo(session_factory, embedding_dim)
-
     repo_dialog_kb = DialogKBRepo(session_factory)
 
     # --- services ---
@@ -179,7 +142,6 @@ def build_application() -> Application:
     )
     vs = VoiceService(openai_client=oai_client)
 
-    # KB core
     yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
 
     embedder = Embedder(oai_client, cfg.openai_embedding_model)
@@ -188,7 +150,6 @@ def build_application() -> Application:
     dialog_kb = DialogKBService(repo_dialog_kb, repo_kb)
     rag = RagService(retriever, dialog_kb)
 
-    # indexer + syncer (админские /kb sync/scan/status)
     indexer = _build_kb_indexer(repo_kb=repo_kb, embedder=embedder, cfg=cfg)
     syncer = KBSyncer(cfg, repo_kb, indexer, yd)
 
@@ -196,6 +157,7 @@ def build_application() -> Application:
     app.bot_data.update(
         {
             "settings": cfg,
+            "db_engine": engine,  # полезно для админских операций
             "repo_dialogs": repo_dialogs,
             "repo_kb": repo_kb,
             "repo_dialog_kb": repo_dialog_kb,
@@ -239,5 +201,5 @@ def run() -> None:
     app = build_application()
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=None,     
+        allowed_updates=None,
     )
