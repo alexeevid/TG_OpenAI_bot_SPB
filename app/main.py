@@ -11,7 +11,15 @@ from .settings import load_settings
 from .clients.openai_client import OpenAIClient
 from .clients.yandex_disk_client import YandexDiskClient
 
-from .db.session import make_session_factory
+from .db.session import make_session_factory, reset_schema, ensure_schema
+session_factory, engine = make_session_factory(cfg.database_url)
+
+# Одноразовый reset по env (удобно для Railway, где нет SQL-консоли)
+if os.getenv("DB_RESET_ON_START", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
+    reset_schema(engine)
+else:
+    ensure_schema(engine)
+
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_kb import KBRepo
 from .db.repo_dialog_kb import DialogKBRepo
