@@ -18,6 +18,11 @@ class GenService:
         - text_model
         - image_model
         - transcribe_model
+
+    ВАЖНО:
+    - GenService НЕ трогает БД.
+    - Если происходит fallback модели, GenService сообщает об этом через out_meta,
+      а хендлер синхронизирует dialog.settings.
     """
 
     def __init__(
@@ -82,6 +87,12 @@ class GenService:
                 return str(v)
         return fallback
 
+    def _meta_init(self, out_meta: Optional[Dict[str, Any]], *, kind: str) -> Dict[str, Any]:
+        m = out_meta if isinstance(out_meta, dict) else {}
+        # не перезатираем, если кто-то уже положил
+        m.setdefault("kind", kind)
+        return m
+
     async def chat(
         self,
         user_msg: str,
@@ -90,11 +101,22 @@ class GenService:
         system_prompt: Optional[str] = None,
         temperature: Optional[float] = None,
         dialog_settings: Optional[Dict[str, Any]] = None,
+        out_meta: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         dialog_settings: settings активного диалога (JSON dict).
         Если model не передан — используем dialog_settings["text_model"].
+
+        out_meta (optional): dict, который будет заполнен информацией о реально использованной модели:
+          - kind="text"
+          - requested_model
+          - chosen_model (после ensure_model_available)
+          - used_model (что реально ушло в вызов)
+          - fallback_used: bool
+          - error: str (если была ошибка)
         """
+        meta = self._meta_init(out_meta, kind="text")
+
         messages: List[Dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -107,10 +129,8 @@ class GenService:
         messages.append({"role": "user", "content": user_msg})
 
         # 1) choose model (explicit param > dialog setting > service default)
-        desired_model = (
-            model
-            or self._pick_from_dialog_settings(dialog_settings, "text_model", self.default_model)
-        )
+        desired_model = model or self._pick_from_dialog_settings(dialog_settings, "text_model", self.default_model)
+        meta["requested_model"] = desired_model
 
         use_temp = self.temperature if temperature is None else float(temperature)
 
@@ -121,8 +141,12 @@ class GenService:
             kind="text",
             fallback=self.default_model,
         )
+        meta["chosen_model"] = safe_model
 
+        # 3) call API
         try:
+            meta["used_model"] = safe_model
+            meta["fallback_used"] = False
             return await asyncio.to_thread(
                 self.client.generate_text,
                 model=safe_model,
@@ -133,12 +157,14 @@ class GenService:
             )
         except Exception as e:
             log.exception("OpenAI generate_text failed (model=%s): %s", safe_model, e)
+            meta["error"] = f"{e.__class__.__name__}: {e}"
 
             # Fallback strategy:
-            # - if chosen model differs from a known stable fallback, try that
             fallback_model = "gpt-4o"
             if safe_model != fallback_model:
                 try:
+                    meta["used_model"] = fallback_model
+                    meta["fallback_used"] = True
                     txt = await asyncio.to_thread(
                         self.client.generate_text,
                         model=fallback_model,
@@ -147,12 +173,12 @@ class GenService:
                         max_output_tokens=self.max_output_tokens,
                         reasoning_effort=self.reasoning_effort,
                     )
-                    return (
-                        f"⚠️ Выбранная модель `{desired_model}` недоступна или вернула ошибку. "
-                        f"Переключился на `{fallback_model}`.\n\n{txt}"
-                    )
+                    # ВАЖНО: здесь не добавляем префикс-предупреждение в текст,
+                    # чтобы не засорять ответы. Синхронизацию модели делает хендлер.
+                    return txt
                 except Exception as e2:
                     log.exception("Fallback model also failed: %s", e2)
+                    meta["error"] = f"{e2.__class__.__name__}: {e2}"
             raise
 
     async def image(
@@ -166,10 +192,7 @@ class GenService:
         dialog_settings: settings активного диалога.
         Если model не передан — используем dialog_settings["image_model"].
         """
-        desired_model = (
-            model
-            or self._pick_from_dialog_settings(dialog_settings, "image_model", self.image_model)
-        )
+        desired_model = model or self._pick_from_dialog_settings(dialog_settings, "image_model", self.image_model)
 
         safe_model = await asyncio.to_thread(
             self.client.ensure_model_available,
@@ -190,10 +213,7 @@ class GenService:
         dialog_settings: settings активного диалога.
         Если model не передан — используем dialog_settings["transcribe_model"].
         """
-        desired_model = (
-            model
-            or self._pick_from_dialog_settings(dialog_settings, "transcribe_model", self.transcribe_model)
-        )
+        desired_model = model or self._pick_from_dialog_settings(dialog_settings, "transcribe_model", self.transcribe_model)
 
         safe_model = await asyncio.to_thread(
             self.client.ensure_model_available,
