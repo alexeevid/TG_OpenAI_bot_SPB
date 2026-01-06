@@ -1,11 +1,28 @@
+# app/db/repo_dialogs.py
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import desc, func, nullslast, select
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc, nullslast, func
-from .models import User, Dialog, Message
-from app.db.models import User, Dialog
+
+from .models import Dialog, Message, User
+
+
+def _today_prefix(dt: Optional[datetime]) -> str:
+    if not dt:
+        # на крайний случай
+        return datetime.utcnow().strftime("%Y-%m-%d")
+    return dt.strftime("%Y-%m-%d")
+
+
+def _masked_title(created_at: Optional[datetime], name: str) -> str:
+    n = (name or "").strip()
+    if not n:
+        n = "Новый диалог"
+    return f"{_today_prefix(created_at)}_{n}"
+
 
 class DialogsRepo:
     def __init__(self, sf):
@@ -14,24 +31,17 @@ class DialogsRepo:
     # ---------- users ----------
     def ensure_user(self, tg_id: str) -> User:
         with self.sf() as s:  # type: Session
-            u = (
-                s.execute(
-                    select(User).where(User.tg_id == str(tg_id))
-                )
-                .scalars()
-                .first()
-            )
-    
+            u = s.execute(select(User).where(User.tg_id == str(tg_id))).scalars().first()
             if not u:
                 u = User(tg_id=str(tg_id), role="user")
                 s.add(u)
                 s.commit()
                 s.refresh(u)
-    
-            # --- UX-fix: гарантируем активный диалог ---
+
+            # Гарантируем активный диалог
             if u.active_dialog_id is None:
-                # Проверяем, есть ли уже диалоги
-                dialog = (
+                # Берём самый первый существующий или создаём новый
+                d = (
                     s.execute(
                         select(Dialog)
                         .where(Dialog.user_id == u.id)
@@ -40,24 +50,25 @@ class DialogsRepo:
                     .scalars()
                     .first()
                 )
-    
-                # Если диалога нет — создаём
-                if not dialog:
-                    dialog = Dialog(
-                        user_id=u.id,
-                        title="Диалог 1",
-                        settings={},
-                    )
-                    s.add(dialog)
+
+                if not d:
+                    d = Dialog(user_id=u.id, title="", settings={})
+                    # created_at/updated_at задаются БД/моделью; после commit будут доступны
+                    s.add(d)
                     s.commit()
-                    s.refresh(dialog)
-    
-                # Назначаем активный диалог
-                u.active_dialog_id = dialog.id
-                s.add(u)
+                    s.refresh(d)
+
+                    # Принудительно задаём маску имени по created_at
+                    d.title = _masked_title(getattr(d, "created_at", None), "Новый диалог")
+                    # updated_at = created_at на старте — ок
+                    d.updated_at = getattr(d, "created_at", None) or func.now()
+                    s.commit()
+                    s.refresh(d)
+
+                u.active_dialog_id = d.id
                 s.commit()
                 s.refresh(u)
-    
+
             return u
 
     def get_user(self, tg_id: str) -> Optional[User]:
@@ -75,10 +86,19 @@ class DialogsRepo:
     # ---------- dialogs ----------
     def new_dialog(self, user_id: int, title: str = "", settings: Optional[Dict[str, Any]] = None) -> Dialog:
         with self.sf() as s:
-            d = Dialog(user_id=user_id, title=title or "", settings=settings or {})
+            d = Dialog(user_id=user_id, title=(title or "").strip(), settings=settings or {})
             s.add(d)
             s.commit()
             s.refresh(d)
+
+            # Если title пустой — сразу ставим маску
+            if not (d.title or "").strip():
+                d.title = _masked_title(getattr(d, "created_at", None), "Новый диалог")
+            # Обновляем updated_at на создание
+            d.updated_at = getattr(d, "created_at", None) or func.now()
+            s.commit()
+            s.refresh(d)
+
             return d
 
     def count_dialogs(self, user_id: int) -> int:
@@ -120,6 +140,10 @@ class DialogsRepo:
                 base = {}
             base.update(patch or {})
             d.settings = base
+
+            # updated_at должен меняться
+            d.updated_at = func.now()
+
             s.commit()
             s.refresh(d)
             return d
@@ -130,6 +154,7 @@ class DialogsRepo:
             if not d:
                 return None
             d.title = (title or "").strip()
+            d.updated_at = func.now()
             s.commit()
             s.refresh(d)
             return d
@@ -139,11 +164,25 @@ class DialogsRepo:
             d = s.get(Dialog, dialog_id)
             if not d:
                 return
+
             u = s.get(User, d.user_id)
-            if u and u.active_dialog_id == dialog_id:
-                u.active_dialog_id = None
+
             s.delete(d)
             s.commit()
+
+            # Если удалили активный — назначаем следующий (самый свежий) или None
+            if u and u.active_dialog_id == dialog_id:
+                next_d = (
+                    s.execute(
+                        select(Dialog)
+                        .where(Dialog.user_id == u.id)
+                        .order_by(nullslast(desc(Dialog.updated_at)), desc(Dialog.id))
+                    )
+                    .scalars()
+                    .first()
+                )
+                u.active_dialog_id = next_d.id if next_d else None
+                s.commit()
 
     # ---------- messages ----------
     def add_message(self, dialog_id: int, role: str, content: str) -> Message:
@@ -151,7 +190,7 @@ class DialogsRepo:
             m = Message(dialog_id=dialog_id, role=role, content=content)
             s.add(m)
 
-            # Реально обновляем updated_at (а не "no-op")
+            # updated_at меняется при любом сообщении
             d = s.get(Dialog, dialog_id)
             if d:
                 d.updated_at = func.now()
@@ -162,8 +201,11 @@ class DialogsRepo:
 
     def list_messages(self, dialog_id: int, limit: int = 30) -> List[Message]:
         with self.sf() as s:
-            q = select(Message).where(Message.dialog_id == dialog_id).order_by(Message.id.desc()).limit(limit)
+            q = (
+                select(Message)
+                .where(Message.dialog_id == dialog_id)
+                .order_by(Message.id.desc())
+                .limit(limit)
+            )
             rows = list(s.execute(q).scalars().all())
-
-
             return list(reversed(rows))
