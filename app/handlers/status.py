@@ -1,7 +1,9 @@
 from telegram import Update
 from telegram.ext import ContextTypes
+
 from ..services.authz_service import AuthzService
 from ..services.dialog_service import DialogService
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     az: AuthzService = context.bot_data.get("svc_authz")
@@ -16,11 +18,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     d = ds.get_active_dialog(update.effective_user.id)
-    settings = ds.get_active_settings(update.effective_user.id)
+    settings = ds.get_active_settings(update.effective_user.id) or {}
 
     # Информация по диалогу
-    model = settings.get("text_model") or cfg.text_model
     mode = settings.get("mode") or "detailed"
+
+    # Модели по модальностям (источник истины — settings диалога)
+    # Если вдруг пусто — показываем дефолты из cfg для понятности.
+    text_model = settings.get("text_model") or getattr(cfg, "text_model", "unknown")
+    image_model = settings.get("image_model") or getattr(cfg, "image_model", "unknown")
+    transcribe_model = settings.get("transcribe_model") or getattr(cfg, "transcribe_model", "unknown")
+
     image_enabled = bool(context.bot_data.get("svc_image"))
     rag_enabled = bool(context.bot_data.get("svc_rag"))
     history = ds.history(d.id, limit=1000)
@@ -36,15 +44,21 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"📄 Диалог: {d.id} — {d.title or '(без названия)'}\n"
         f"🕒 Создан: {created_s}  |  ✏️ Изменён: {updated_s}\n"
-        f"🤖 Модель: {model}  |  🎯 Режим: {mode}\n"
+        f"🎯 Режим: {mode}\n"
+        f"🤖 Модели:\n"
+        f"  • Текст: {text_model}\n"
+        f"  • Изображения: {image_model}\n"
+        f"  • Распознавание: {transcribe_model}\n"
         f"💬 Сообщений: {total} (пользователь: {user_count}, ассистент: {assistant_count})\n"
         f"🖼️ Генерация изображений: {'включена' if image_enabled else 'отключена'}\n"
         f"📚 База знаний (RAG): {'включена' if rag_enabled else 'отключена'}"
     )
     await update.message.reply_text(text)
 
+
 def register(app):
     from telegram.ext import CommandHandler
+
     app.add_handler(CommandHandler("status", cmd_status))
     # Совместимость: команда /stats в меню
     app.add_handler(CommandHandler("stats", cmd_status))
