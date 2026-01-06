@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
@@ -65,11 +65,12 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         return
 
     d = ds.ensure_active_dialog(update.effective_user.id)
-    settings: Dict[str, str] = ds.get_active_settings(update.effective_user.id) or {}
 
-    model = settings.get("text_model") or cfg.text_model
-    mode = settings.get("mode") or "detailed"
+    # settings диалога: здесь живут text_model/image_model/transcribe_model и пользовательские режимы
+    settings: Dict[str, Any] = ds.get_active_settings(update.effective_user.id) or {}
 
+    # режим ответа (это именно настройка диалога)
+    mode = str(settings.get("mode") or "detailed")
     sys = _system_prompt(mode)
 
     # KB context
@@ -95,12 +96,14 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     history: List[Dict[str, str]] = [{"role": m.role, "content": m.content} for m in history_rows]
 
     try:
+        # model НЕ передаём: GenService сам выберет text_model из dialog_settings
         answer = await gs.chat(
             user_msg=text,
             history=history,
-            model=model,
+            model=None,
             system_prompt=sys,
             temperature=cfg.openai_temperature,
+            dialog_settings=settings,
         )
     except Exception as e:
         log.exception("GenService.chat failed: %s", e)
