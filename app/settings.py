@@ -82,7 +82,7 @@ class Settings:
     bot_language: str = "ru"
 
     # Models & params
-    openai_text_model: str = "gpt-4.5-turbo"
+    openai_text_model: str = "gpt-5"
     openai_image_model: str = "gpt-image-1"
     openai_embedding_model: str = "text-embedding-3-large"
     openai_transcribe_model: str = "whisper-1"
