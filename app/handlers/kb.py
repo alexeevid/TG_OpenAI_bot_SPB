@@ -1,7 +1,9 @@
 # app/handlers/kb.py
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from math import ceil
 
 from telegram import Update
@@ -34,6 +36,11 @@ HELP = """База знаний (встроена в диалоги)
 Админ (если настроен syncer):
 /kb scan | /kb sync | /kb status
 """
+
+
+def _short_name(path: str) -> str:
+    p = (path or "").strip()
+    return p.split("/")[-1] if p else ""
 
 
 async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,6 +210,7 @@ async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not syncer:
             await update.effective_message.reply_text("⚠️ Сервис синхронизации не настроен.")
             return
+
         try:
             if sub == "scan":
                 rep = syncer.scan()
@@ -210,18 +218,60 @@ async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     f"KB scan: new={len(rep.new)} outdated={len(rep.outdated)} deleted={len(rep.deleted)}"
                 )
                 return
-            if sub == "sync":
-                rep, ok, fail, deleted = syncer.sync()
-                await update.effective_message.reply_text(
-                    f"KB sync: ok={ok} fail={fail} deleted={deleted} | new={len(rep.new)} outdated={len(rep.outdated)}"
-                )
-                return
+
             if sub == "status":
                 st = syncer.status_summary()
                 await update.effective_message.reply_text(
                     "KB status:\n" + "\n".join(f"- {k}: {v}" for k, v in st.items())
                 )
                 return
+
+            if sub == "sync":
+                # 1) Сразу отвечаем + прогресс будем редактировать это сообщение
+                msg = await update.effective_message.reply_text("KB sync: стартовал… (это может занять несколько минут)")
+
+                loop = asyncio.get_running_loop()
+                start_ts = time.time()
+                last_text = {"value": ""}
+
+                async def _safe_edit(text: str) -> None:
+                    # не дёргаем edit если текст тот же
+                    if text == last_text["value"]:
+                        return
+                    last_text["value"] = text
+                    try:
+                        await msg.edit_text(text)
+                    except Exception:
+                        # редактирование может падать (rate limits / message not modified) — не критично
+                        pass
+
+                def progress_cb(processed: int, total: int, path: str, ok: int, fail: int) -> None:
+                    elapsed = int(time.time() - start_ts)
+                    name = _short_name(path) if path and path != "<done>" else ""
+                    line = f"KB sync: {processed}/{total} | ok={ok} fail={fail} | {elapsed}s"
+                    if name:
+                        line += f"\n{ name }"
+                    # вызываем edit из thread-safe контекста
+                    asyncio.run_coroutine_threadsafe(_safe_edit(line), loop)
+
+                # 2) НЕ блокируем обработку апдейтов: запускаем sync в executor
+                def _run_sync():
+                    return syncer.sync(progress_cb=progress_cb)
+
+                rep, ok, fail, deleted = await loop.run_in_executor(None, _run_sync)
+
+                elapsed = int(time.time() - start_ts)
+                final = (
+                    f"KB sync: ✅ готово за {elapsed}s\n"
+                    f"- ok: {ok}\n"
+                    f"- fail: {fail}\n"
+                    f"- deleted: {deleted}\n"
+                    f"- new: {len(rep.new)}\n"
+                    f"- outdated: {len(rep.outdated)}"
+                )
+                await _safe_edit(final)
+                return
+
         except Exception as e:
             log.exception("admin kb op failed: %s", e)
             await update.effective_message.reply_text("⚠️ Внутренняя ошибка KB (см. лог).")
