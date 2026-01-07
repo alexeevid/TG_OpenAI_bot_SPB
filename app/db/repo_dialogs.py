@@ -129,6 +129,47 @@ class DialogsRepo:
             s.refresh(d)
             return d
 
+    def update_dialog_settings(self, dialog_id: int, patch: Dict[str, Any]) -> Optional[Dialog]:
+        """Обновить settings диалога (JSON) merge-патчем.
+
+        Используется сервисами /mode, /model, а также внутренним автозаполнением
+        дефолтных моделей. Важно не затирать весь settings целиком.
+        """
+        patch = patch or {}
+        with self.sf() as s:
+            d = s.get(Dialog, int(dialog_id))
+            if not d:
+                return None
+
+            cur = d.settings if isinstance(d.settings, dict) else {}
+            merged = dict(cur)
+            merged.update(dict(patch))
+            d.settings = merged
+            d.updated_at = func.now()
+
+            s.commit()
+            s.refresh(d)
+            return d
+
+    def delete_dialog(self, dialog_id: int) -> None:
+        """Удалить диалог и его сообщения (cascade)."""
+        with self.sf() as s:
+            d = s.get(Dialog, int(dialog_id))
+            if not d:
+                return
+            s.delete(d)
+            s.commit()
+
+    def list_dialogs(self, user_id: int, limit: int = 20) -> List[Dialog]:
+        with self.sf() as s:
+            q = (
+                select(Dialog)
+                .where(Dialog.user_id == int(user_id))
+                .order_by(nullslast(desc(Dialog.updated_at)), desc(Dialog.id))
+                .limit(int(limit))
+            )
+            return list(s.execute(q).scalars().all())
+
     def list_dialogs_page(self, user_id: int, limit: int, offset: int) -> List[Dialog]:
         with self.sf() as s:
             q = (
