@@ -1,6 +1,19 @@
 from __future__ import annotations
 
-from sqlalchemy import Column, Integer, String, ForeignKey, Text, DateTime, func, JSON, Boolean, BigInteger
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    ForeignKey,
+    Text,
+    DateTime,
+    func,
+    JSON,
+    Boolean,
+    BigInteger,
+    UniqueConstraint,
+    Index,
+)
 from sqlalchemy.orm import relationship
 
 from pgvector.sqlalchemy import Vector
@@ -106,13 +119,19 @@ class KBChunk(Base):
 
 
 class DialogKBDocument(Base):
-
     """
     Связь диалог ↔ документ БЗ (many-to-many через таблицу).
     is_enabled позволяет быстро исключать документ из контекста, не удаляя связь.
     """
 
     __tablename__ = "dialog_kb_documents"
+
+    # Ключевой момент: ON CONFLICT (dialog_id, document_id) требует UNIQUE/PK на эти поля.
+    __table_args__ = (
+        UniqueConstraint("dialog_id", "document_id", name="uq_dialog_kb_documents_dialog_doc"),
+        Index("ix_dialog_kb_documents_dialog_id", "dialog_id"),
+        Index("ix_dialog_kb_documents_document_id", "document_id"),
+    )
 
     id = Column(Integer, primary_key=True)
     dialog_id = Column(Integer, ForeignKey("dialogs.id", ondelete="CASCADE"), nullable=False)
@@ -132,6 +151,12 @@ class DialogKBSecret(Base):
     """
 
     __tablename__ = "dialog_kb_secrets"
+
+    __table_args__ = (
+        UniqueConstraint("dialog_id", "document_id", name="uq_dialog_kb_secrets_dialog_doc"),
+        Index("ix_dialog_kb_secrets_dialog_id", "dialog_id"),
+        Index("ix_dialog_kb_secrets_document_id", "document_id"),
+    )
 
     id = Column(Integer, primary_key=True)
     dialog_id = Column(Integer, ForeignKey("dialogs.id", ondelete="CASCADE"), nullable=False)
