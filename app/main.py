@@ -19,7 +19,7 @@ from .db.repo_dialog_kb import DialogKBRepo
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
 from .kb.indexer import KbIndexer
-from .kb.syncer import KBSyncer
+from .kb.syncer import KbSyncer as KBSyncer
 
 from .services.dialog_service import DialogService
 from .services.dialog_kb_service import DialogKBService
@@ -84,13 +84,15 @@ def _setup_logging(cfg) -> None:
 
 def _resolve_embedding_dim(cfg) -> int:
     dim = getattr(cfg, "embedding_dim", None)
-    if isinstance(dim, int) and dim > 0:
-        return dim
-
-    dim = getattr(cfg, "pgvector_dim", None)
-    if isinstance(dim, int) and dim > 0:
-        return dim
-
+    try:
+        if isinstance(dim, int) and dim > 0:
+            return dim
+        if callable(dim):
+            v = int(dim())
+            if v > 0:
+                return v
+    except Exception:
+        pass
     return 3072
 
 
@@ -122,7 +124,6 @@ def build_application() -> Application:
 
     if bool(getattr(cfg, "reset_db", False)):
         reset_schema(engine)
-
     ensure_schema(engine)
 
     repo_dialogs = DialogsRepo(sf)
@@ -132,10 +133,14 @@ def build_application() -> Application:
     openai = OpenAIClient(cfg.openai_api_key)
     yandex = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
 
+    # Embedder принимает (openai_client, model)
     embedder = Embedder(openai, cfg.openai_embedding_model)
+
     retriever = Retriever(repo_kb, openai, dim=_resolve_embedding_dim(cfg))
     indexer = _build_kb_indexer(repo_kb=repo_kb, embedder=embedder, cfg=cfg)
-    syncer = KBSyncer(yandex, repo_kb, indexer)
+
+    # ВАЖНО: фактический контракт KbSyncer — (settings, repo, indexer, yandex_client)
+    syncer = KBSyncer(cfg, repo_kb, indexer, yandex)
 
     dialog_service = DialogService(repo_dialogs, settings=cfg)
     dialog_kb_service = DialogKBService(repo_dialog_kb, repo_kb)
@@ -164,6 +169,8 @@ def build_application() -> Application:
     app.bot_data["svc_voice"] = voice_service
     app.bot_data["svc_image"] = image_service
     app.bot_data["svc_authz"] = authz_service
+    # Кладём syncer по двум ключам (совместимость со старыми хендлерами)
+    app.bot_data["svc_syncer"] = syncer
     app.bot_data["kb_syncer"] = syncer
 
     # register handlers
@@ -185,7 +192,6 @@ def build_application() -> Application:
 
 
 def run() -> None:
-    """Entry point for run_local.py and production запусков."""
     app = build_application()
     app.run_polling(drop_pending_updates=True)
 
