@@ -4,7 +4,7 @@ from ..services.dialog_service import DialogService
 from ..services.authz_service import AuthzService
 
 MODES = [
-    ("concise", "Кратко"),
+    ("brief", "Кратко"),
     ("detailed", "Подробно"),
     ("mcwilliams", "McWilliams-стиль"),
 ]
@@ -30,7 +30,10 @@ async def on_mode_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⚠️ Сервис диалогов не настроен.")
         return
     ds.update_active_settings(q.from_user.id, {"mode": mode})
-    await q.edit_message_text(f"Режим для диалога установлен: {mode}")
+
+    title_map = {k: t for k, t in MODES}
+    shown = title_map.get(mode, mode)
+    await q.edit_message_text(f"✅ Режим для диалога установлен: {shown}")
 
 def register(app: Application) -> None:
     app.add_handler(CommandHandler("mode", cmd_mode))
