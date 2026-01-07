@@ -5,6 +5,7 @@ from telegram.ext import ContextTypes
 
 from ..services.authz_service import AuthzService
 from ..services.dialog_service import DialogService
+from ..services.dialog_kb_service import DialogKBService
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -38,6 +39,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     image_enabled = bool(context.bot_data.get("svc_image"))
     rag_enabled = bool(context.bot_data.get("svc_rag"))
+
+    # KB scope (режим и количество документов в текущем диалоге)
+    kb_mode = "-"
+    kb_enabled_docs = 0
+    kb_attached_docs = 0
+    dkb: DialogKBService | None = context.bot_data.get("svc_dialog_kb")
+    if dkb:
+        try:
+            kb_mode = dkb.get_mode(d.id)
+            attached = dkb.list_attached(d.id) or []
+            kb_attached_docs = len(attached)
+            kb_enabled_docs = sum(1 for x in attached if bool(x.get("is_enabled")))
+        except Exception:
+            # статус — не критичен, не ломаем команду
+            pass
+
     history = ds.history(d.id, limit=1000)
     total = len(history)
     user_count = sum(1 for m in history if getattr(m, "role", "") == "user")
@@ -58,7 +75,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  • Распознавание: {transcribe_model}\n"
         f"💬 Сообщений: {total} (пользователь: {user_count}, ассистент: {assistant_count})\n"
         f"🖼️ Генерация изображений: {'включена' if image_enabled else 'отключена'}\n"
-        f"📚 База знаний (RAG): {'включена' if rag_enabled else 'отключена'}"
+        f"📚 База знаний (RAG): {'включена' if rag_enabled else 'отключена'}\n"
+        f"   • KB mode: {kb_mode}\n"
+        f"   • Документы: подключено {kb_attached_docs}, включено {kb_enabled_docs}"
     )
     await msg.reply_text(text)
 
