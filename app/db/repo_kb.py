@@ -163,7 +163,7 @@ class KBRepo:
 
     def stats_for_document_ids(self, document_ids: Sequence[int]) -> Dict[str, Any]:
         """
-        Агрегаты для текущего диалога (совместимо с handlers/kb.py):
+        Агрегаты для текущего диалога:
           { documents: <сколько документов в scope>, chunks: <сколько чанков в scope> }
         """
         ids = [int(x) for x in document_ids]
@@ -290,12 +290,9 @@ class KBRepo:
                 return True
             old_md5, old_modified, old_size, indexed_at = row
 
-        # if never indexed -> yes
         if indexed_at is None:
             return True
 
-        # “Изменением считаем любое событие” — в Этапе 1 трактуем как:
-        # md5/size/modified любое отличие => reindex.
         if md5 and old_md5 and md5 != old_md5:
             return True
         if size is not None and old_size is not None and int(size) != int(old_size):
@@ -303,7 +300,6 @@ class KBRepo:
         if modified_at is not None and old_modified is not None and modified_at != old_modified:
             return True
 
-        # Если старые метаданные пустые, а новые появились — тоже reindex
         if old_md5 is None and md5 is not None:
             return True
         if old_size is None and size is not None:
@@ -371,7 +367,12 @@ class KBRepo:
             s.commit()
 
     def search_by_embedding(self, query_vector: list[float], *, limit: int = 6, document_ids: Sequence[int] | None = None):
-        params: Dict[str, Any] = {"q": query_vector, "lim": int(limit)}
+        # IMPORTANT:
+        # psycopg2 адаптирует list[float] как numeric[], а pgvector operator <=> ожидает vector.
+        # Поэтому передаем строковый литерал вида '[1,2,3,...]' и явно кастим к ::vector.
+        vec_literal = "[" + ",".join(f"{float(x):.10g}" for x in query_vector) + "]"
+
+        params: Dict[str, Any] = {"q": vec_literal, "lim": int(limit)}
         where = ""
         if document_ids:
             params["ids"] = [int(x) for x in document_ids]
@@ -382,10 +383,10 @@ class KBRepo:
                 sqltext(
                     f"""
                     SELECT id, document_id, chunk_order, text,
-                           1 - (embedding <=> :q) AS score
+                           1 - (embedding <=> (:q)::vector) AS score
                     FROM kb_chunks
                     {where}
-                    ORDER BY embedding <=> :q
+                    ORDER BY embedding <=> (:q)::vector
                     LIMIT :lim
                     """
                 ),
