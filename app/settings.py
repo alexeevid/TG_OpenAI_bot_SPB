@@ -160,7 +160,10 @@ class Settings:
 def load_settings() -> Settings:
     # Core (support multiple env var names)
     telegram_bot_token = (_getenv("TELEGRAM_BOT_TOKEN", "") or _getenv("BOT_TOKEN", "") or "")
-    openai_api_key = _getenv("OPENAI_API_KEY", "") or ""
+
+    # ✅ КРИТИЧНО: чистим OPENAI_API_KEY от пробелов/переносов
+    openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+
     database_url = _getenv("DATABASE_URL", "") or _getenv("POSTGRES_DSN", "") or ""
 
     # Admin / access
