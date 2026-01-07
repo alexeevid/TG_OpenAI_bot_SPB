@@ -19,7 +19,7 @@ from .db.repo_dialog_kb import DialogKBRepo
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
 from .kb.indexer import KbIndexer
-from .kb.syncer import KbSyncer as KBSyncer
+from .kb.syncer import KBSyncer
 
 from .services.dialog_service import DialogService
 from .services.dialog_kb_service import DialogKBService
@@ -29,43 +29,20 @@ from .services.voice_service import VoiceService
 from .services.image_service import ImageService
 from .services.authz_service import AuthzService
 
-from .handlers import start, help, errors, dialogs, model, mode, image, voice, text, status, kb
-from .handlers import kb_ui  # inline UI callbacks
+from .handlers import start, help, errors, dialogs, model, mode, text, kb, status
+
 
 log = logging.getLogger(__name__)
 
 
-async def _post_init(app: Application) -> None:
-    try:
-        await app.bot.set_my_commands(
-            [
-                ("start", "Старт"),
-                ("help", "Справка"),
-                ("reset", "Новый диалог"),
-                ("dialogs", "Диалоги (выбор/удаление/имя)"),
-                ("status", "Статус текущего диалога"),
-                ("stats", "Статус (alias)"),
-                ("model", "Выбрать модель"),
-                ("mode", "Стиль ответа"),
-                ("img", "Сгенерировать изображение"),
-                ("kb", "База знаний"),
-                ("update", "Синхронизировать БЗ"),
-                ("config", "Текущая конфигурация"),
-                ("about", "О проекте"),
-                ("feedback", "Оставить отзыв"),
-            ]
-        )
-    except Exception as e:
-        log.warning("set_my_commands failed: %s", e)
+def _configure_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "DEBUG").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.DEBUG),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
-
-def _setup_logging(cfg) -> None:
-    level_name = (getattr(cfg, "log_level", "INFO") or "INFO").upper()
-    root_level = getattr(logging, level_name, logging.INFO)
-
-    log_format = os.getenv("LOG_FORMAT") or "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    logging.basicConfig(level=root_level, format=log_format)
-
+    # noise reduction
     noisy = [
         "telegram",
         "telegram.ext",
@@ -79,75 +56,112 @@ def _setup_logging(cfg) -> None:
     for name in noisy:
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    log.info("Logging initialized: level=%s", level_name)
+    log.info("Logging initialized: level=%s", level)
 
 
-def _resolve_embedding_dim(cfg) -> int:
-    dim = getattr(cfg, "embedding_dim", None)
+async def _post_init(app: Application) -> None:
+    """
+    Optional post-init hook for PTB Application.
+    Keep it lightweight; heavy tasks should be in background jobs (job_queue) if enabled.
+    """
+    cfg = app.bot_data.get("settings")
+    if not cfg:
+        return
+
+    # Optional KB sync scheduler (if enabled)
     try:
-        if isinstance(dim, int) and dim > 0:
-            return dim
-        if callable(dim):
-            v = int(dim())
-            if v > 0:
-                return v
+        sync_interval = int(getattr(cfg, "kb_sync_interval", 0) or 0)
     except Exception:
-        pass
-    return 3072
+        sync_interval = 0
+
+    if sync_interval > 0:
+        try:
+            jq = app.job_queue
+            if jq is None:
+                log.warning(
+                    "job_queue is not available (python-telegram-bot[job-queue] not installed). "
+                    "KB sync scheduler disabled."
+                )
+                return
+
+            # Avoid scheduling if no syncer
+            syncer = app.bot_data.get("kb_syncer")
+            if syncer is None:
+                log.warning("KB syncer not found in bot_data. Scheduler disabled.")
+                return
+
+            async def _job_cb(ctx):
+                try:
+                    await syncer.sync()
+                except Exception:
+                    log.exception("KB sync job failed")
+
+            jq.run_repeating(_job_cb, interval=sync_interval, first=sync_interval)
+            log.info("KB sync scheduled: interval=%ss", sync_interval)
+        except Exception:
+            log.exception("Failed to schedule KB sync")
 
 
-def _build_kb_indexer(*, repo_kb: KBRepo, embedder: Embedder, cfg) -> KbIndexer:
-    chunk_size = getattr(cfg, "chunk_size", 900)
-    overlap = getattr(cfg, "chunk_overlap", 150)
-    return KbIndexer(repo_kb, embedder, chunk_size, overlap)
+def build_app() -> Application:
+    _configure_logging()
 
-
-def build_application() -> Application:
     cfg = load_settings()
-    _setup_logging(cfg)
 
-    if not cfg.telegram_token:
-        raise RuntimeError("telegram_token отсутствует в настройках")
-    if not cfg.database_url:
-        raise RuntimeError("DATABASE_URL отсутствует в настройках")
-    if not cfg.openai_api_key:
-        raise RuntimeError("OPENAI_API_KEY отсутствует в настройках")
+    # quick startup config log
+    try:
+        log.info(
+            "Startup config: image=%s web=%s provider=%s",
+            getattr(cfg, "enable_image_generation", True),
+            getattr(cfg, "enable_web_search", True),
+            getattr(cfg, "openai_provider", "auto"),
+        )
+    except Exception:
+        # do not break startup due to logging
+        pass
 
-    log.info(
-        "Startup config: image=%s web=%s provider=%s",
-        bool(getattr(cfg, "enable_image_generation", False)),
-        bool(getattr(cfg, "enable_web_search", False)),
-        getattr(cfg, "web_search_provider", None),
-    )
-
-    sf, engine = make_session_factory(cfg.database_url)
-
-    if bool(getattr(cfg, "reset_db", False)):
-        reset_schema(engine)
-    ensure_schema(engine)
+    # DB
+    sf = make_session_factory(cfg.database_url)
+    ensure_schema(sf)
 
     repo_dialogs = DialogsRepo(sf)
-    repo_kb = KBRepo(sf, dim=_resolve_embedding_dim(cfg))
+    repo_kb = KBRepo(sf)
     repo_dialog_kb = DialogKBRepo(sf)
 
+    # External clients
     openai = OpenAIClient(cfg.openai_api_key)
     yandex = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
 
-    # Embedder принимает (openai_client, model)
-    embedder = Embedder(openai, cfg.openai_embedding_model)
-
-    retriever = Retriever(repo_kb, openai, dim=_resolve_embedding_dim(cfg))
-    indexer = _build_kb_indexer(repo_kb=repo_kb, embedder=embedder, cfg=cfg)
-
-    # ВАЖНО: фактический контракт KbSyncer — (settings, repo, indexer, yandex_client)
+    # KB/RAG pipeline
+    embedder = Embedder(cfg, openai)
+    retriever = Retriever(cfg, repo_kb, embedder)
+    indexer = KbIndexer(cfg, repo_kb, embedder)
     syncer = KBSyncer(cfg, repo_kb, indexer, yandex)
 
+    # Domain services
     dialog_service = DialogService(repo_dialogs, settings=cfg)
     dialog_kb_service = DialogKBService(repo_dialog_kb, repo_kb)
     rag_service = RagService(retriever, dialog_kb_service)
-    gen_service = GenService(openai, rag_service, cfg)
+
+    # ---------------------------
+    # FIX: Correct DI / signatures
+    # ---------------------------
+    gen_service = GenService(
+        api_key=cfg.openai_api_key,
+        default_model=cfg.openai_text_model,
+        temperature=cfg.openai_temperature,
+        max_output_tokens=getattr(cfg, "openai_max_output_tokens", None),
+        reasoning_effort=getattr(cfg, "openai_reasoning_effort", None),
+        image_model=cfg.openai_image_model,
+        transcribe_model=cfg.openai_transcribe_model,
+    )
+
     voice_service = VoiceService(openai, cfg)
-    image_service = ImageService(openai, cfg.openai_image_model)
+
+    image_service = ImageService(
+        api_key=cfg.openai_api_key,
+        image_model=cfg.openai_image_model,
+    )
+
     authz_service = AuthzService(cfg)
 
     app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
@@ -169,22 +183,22 @@ def build_application() -> Application:
     app.bot_data["svc_voice"] = voice_service
     app.bot_data["svc_image"] = image_service
     app.bot_data["svc_authz"] = authz_service
-    # Кладём syncer по двум ключам (совместимость со старыми хендлерами)
-    app.bot_data["svc_syncer"] = syncer
-    app.bot_data["kb_syncer"] = syncer
 
-    # register handlers
+    # Кладём syncer по двум ключам: старый/новый
+    app.bot_data["kb_syncer"] = syncer
+    app.bot_data["svc_syncer"] = syncer
+
+    # handlers
     start.register(app)
     help.register(app)
     dialogs.register(app)
     model.register(app)
     mode.register(app)
-    image.register(app)
-    voice.register(app)
     kb.register(app)
-    kb_ui.register(app)
     status.register(app)
     text.register(app)
+
+    # error handler
     errors.register(app)
 
     log.info("Application built OK")
@@ -192,8 +206,8 @@ def build_application() -> Application:
 
 
 def run() -> None:
-    app = build_application()
-    app.run_polling(drop_pending_updates=True)
+    app = build_app()
+    app.run_polling(allowed_updates=None)
 
 
 def main() -> None:
