@@ -30,20 +30,16 @@ def _format_kb_context(results: List[RetrievedChunk]) -> str:
 
 
 def _format_kb_sources_for_user(results: List[RetrievedChunk], *, max_items: int = 5) -> str:
-    """Формирует блок источников для пользователя.
+    """Формирует блок источников для пользователя (детерминированно).
 
     Зачем:
     - LLM может использовать RAG-контекст, но не написать явные ссылки.
-    - Этот блок добавляется ДЕТЕРМИНИРОВАННО, если results не пустой.
-
-    Ограничения:
-    - Telegram имеет лимиты на размер сообщений, поэтому цитаты короткие.
+    - Этот блок добавляется кодом, если retrieval вернул результаты выше порога.
     """
     if not results:
         return ""
 
     lines: List[str] = ["\n\n📚 Источники (БЗ):"]
-
     for i, r in enumerate(results[: max(1, int(max_items))], start=1):
         title = (r.document_title or "").strip()
         path = (r.document_path or "").strip()
@@ -54,8 +50,7 @@ def _format_kb_sources_for_user(results: List[RetrievedChunk], *, max_items: int
             quote = quote[:280] + "…"
 
         score = f"{float(r.score):.3f}" if r.score is not None else "-"
-        chunk_id = r.id
-        lines.append(f"{i}) {src} | chunk#{chunk_id} | sim={score}\n   «{quote}»")
+        lines.append(f"{i}) {src} | chunk#{r.id} | sim={score}\n   «{quote}»")
 
     return "\n".join(lines)
 
@@ -104,20 +99,35 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     mode = str(settings.get("mode") or "detailed")
     sys = _system_prompt(mode)
 
-    # KB context
+    # --- KB / RAG retrieve (с порогом релевантности) ---
     results: List[RetrievedChunk] = []
+    kb_ctx = ""
+    kb_min_score = float(getattr(cfg, "kb_min_score", 0.35))
+    kb_top_k = int(getattr(cfg, "max_kb_chunks", 6))
+    kb_debug = bool(getattr(cfg, "kb_debug", False))
+
     try:
         if rag:
-            results = rag.retrieve(query=text, dialog_id=d.id, top_k=int(cfg.max_kb_chunks or 6))
+            results = rag.retrieve(
+                query=text,
+                dialog_id=d.id,
+                top_k=kb_top_k,
+                min_score=kb_min_score,
+            )
     except Exception as e:
         log.warning("RAG retrieve failed: %s", e)
+        results = []
 
+    # Если retrieval вернул результаты — усиливаем grounded-правила
     if results:
         kb_ctx = _format_kb_context(results)
         sys = (
             sys
             + "\n\n"
-            + "Если в данных из базы знаний есть прямые ответы — опирайся на них. "
+            + "ВАЖНО: Ниже приведены фрагменты из базы знаний. "
+              "Если вопрос можно покрыть этими фрагментами — отвечай ТОЛЬКО на их основе. "
+              "Не добавляй внешние сведения. "
+              "Если в фрагментах нет ответа — прямо скажи, что в базе знаний нет данных, и попроси уточнение.\n"
               "Цитаты приводи дословно и указывай источник (путь/название документа).\n\n"
               "Данные из базы знаний:\n"
             + kb_ctx
@@ -152,16 +162,22 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             current_model = settings.get("text_model")
             if current_model != used_model:
                 ds.update_active_settings(update.effective_user.id, {"text_model": used_model})
-                # Обновляем локальную копию settings (на случай дальнейших шагов в этом же хендлере)
                 settings["text_model"] = used_model
     except Exception as e:
         log.warning("Failed to sync used text model to dialog settings: %s", e)
 
-    # Если RAG нашёл данные, но модель не сослалась на документы,
-    # добавляем детерминированный блок источников.
+    # --- Add deterministic KB sources block (only if retrieval passed threshold) ---
     final_answer = answer
-    if results and "Источники (БЗ)" not in answer:
-        final_answer = answer + _format_kb_sources_for_user(results)
+
+    if results:
+        # чтобы пользователь видел, что RAG реально сработал (по желанию — только в debug)
+        if kb_debug:
+            max_sim = max(float(r.score) for r in results if r.score is not None)
+            final_answer = f"🧩 RAG: найдено {len(results)} фрагм., max_sim={max_sim:.3f}, min_score={kb_min_score:.2f}\n\n" + final_answer
+
+        # добавляем источники, если их ещё нет
+        if "Источники (БЗ)" not in final_answer:
+            final_answer += _format_kb_sources_for_user(results)
 
     ds.add_user_message(d.id, text)
     ds.add_assistant_message(d.id, final_answer)
