@@ -66,7 +66,6 @@ def _setup_logging(cfg) -> None:
     log_format = os.getenv("LOG_FORMAT") or "%(asctime)s %(levelname)s %(name)s: %(message)s"
     logging.basicConfig(level=root_level, format=log_format)
 
-    # Снижаем шум, чтобы DEBUG был полезен
     noisy = [
         "telegram",
         "telegram.ext",
@@ -121,7 +120,6 @@ def build_application() -> Application:
 
     sf, engine = make_session_factory(cfg.database_url)
 
-    # (Опционально) ресет схемы — только если выставлен флаг окружения
     if bool(getattr(cfg, "reset_db", False)):
         reset_schema(engine)
 
@@ -186,9 +184,14 @@ def build_application() -> Application:
     return app
 
 
-def main() -> None:
+def run() -> None:
+    """Entry point for run_local.py and production запусков."""
     app = build_application()
     app.run_polling(drop_pending_updates=True)
+
+
+def main() -> None:
+    run()
 
 
 if __name__ == "__main__":
