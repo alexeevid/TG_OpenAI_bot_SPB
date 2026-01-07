@@ -273,6 +273,13 @@ async def rename_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not dialog_id:
         return ConversationHandler.END
 
+    # ВАЖНО: этот текст НЕ должен уходить в общий text-хендлер.
+    # Сохраняем message_id, чтобы text.py мог подавить обработку.
+    try:
+        context.user_data["suppress_text_message_id"] = int(update.effective_message.message_id)
+    except Exception:
+        pass
+
     new_name = (update.effective_message.text or "").strip()
     if not new_name:
         context.user_data.pop("dlg_rename_id", None)
@@ -314,7 +321,15 @@ def register(app: Application) -> None:
 
     # Основные кнопки меню (кроме rename)
     # rename перехватывается ConversationHandler entrypoint, чтобы не мешать тексту.
-    app.add_handler(CallbackQueryHandler(on_cb, pattern=r"^(dlg:(new|prev|next|open:|delete:).+|noop)$"))
+    # ВАЖНО:
+    # Раньше паттерн требовал ".+" после new/prev/next, из-за чего
+    # кнопки "➕ Новый диалог" и пагинация не работали.
+    app.add_handler(
+        CallbackQueryHandler(
+            on_cb,
+            pattern=r"^(dlg:(new|prev|next)$|dlg:(open|delete):\d+$|noop)$",
+        )
+    )
 
     # Rename conversation:
     # - entry: callback dlg:rename:<id>
