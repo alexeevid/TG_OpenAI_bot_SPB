@@ -44,7 +44,7 @@ class DialogKBRepo:
                 settings = {}
             settings["kb_mode"] = mode_u
 
-            # ✅ FIX: dict нельзя передавать параметром — только JSON string + cast to jsonb
+            # psycopg2 can't adapt dict in raw SQL params -> JSON string + cast to jsonb
             s.execute(
                 sqltext("UPDATE dialogs SET settings=(:st)::jsonb WHERE id=:id"),
                 {"st": json.dumps(settings, ensure_ascii=False), "id": int(dialog_id)},
@@ -88,6 +88,10 @@ class DialogKBRepo:
                 {"did": int(dialog_id)},
             ).fetchall()
         return [int(r[0]) for r in rows]
+
+    # ✅ Backward-compatible alias (old code expects this name)
+    def get_allowed_document_ids(self, dialog_id: int) -> List[int]:
+        return self.allowed_document_ids(dialog_id)
 
     def attach(self, dialog_id: int, document_id: int) -> None:
         with self.sf() as s:  # type: Session
