@@ -48,8 +48,8 @@ class KbIndexer:
     """
 
     # ---- safety limits ----
-    MAX_ITEMS_PER_BATCH = 64
-    MAX_CHARS_PER_BATCH = 180_000  # грубый, но безопасный суррогат токенов
+    MAX_ITEMS_PER_BATCH = 32
+    MAX_CHARS_PER_BATCH = 80_000  # грубый, но безопасный суррогат токенов
 
     def __init__(self, kb_repo: KBRepo, embedder, chunk_size: int, overlap: int):
         self._repo = kb_repo
