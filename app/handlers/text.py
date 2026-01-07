@@ -29,6 +29,37 @@ def _format_kb_context(results: List[RetrievedChunk]) -> str:
     return "\n".join(lines)
 
 
+def _format_kb_sources_for_user(results: List[RetrievedChunk], *, max_items: int = 5) -> str:
+    """Формирует блок источников для пользователя.
+
+    Зачем:
+    - LLM может использовать RAG-контекст, но не написать явные ссылки.
+    - Этот блок добавляется ДЕТЕРМИНИРОВАННО, если results не пустой.
+
+    Ограничения:
+    - Telegram имеет лимиты на размер сообщений, поэтому цитаты короткие.
+    """
+    if not results:
+        return ""
+
+    lines: List[str] = ["\n\n📚 Источники (БЗ):"]
+
+    for i, r in enumerate(results[: max(1, int(max_items))], start=1):
+        title = (r.document_title or "").strip()
+        path = (r.document_path or "").strip()
+        src = title if title else (path if path else f"document_id={r.document_id}")
+
+        quote = (r.text or "").strip().replace("\n", " ")
+        if len(quote) > 280:
+            quote = quote[:280] + "…"
+
+        score = f"{float(r.score):.3f}" if r.score is not None else "-"
+        chunk_id = r.id
+        lines.append(f"{i}) {src} | chunk#{chunk_id} | sim={score}\n   «{quote}»")
+
+    return "\n".join(lines)
+
+
 def _system_prompt(mode: str) -> str:
     base = (
         "Ты — профессиональный ассистент по управлению проектами и цифровым продуктам. "
@@ -126,10 +157,16 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     except Exception as e:
         log.warning("Failed to sync used text model to dialog settings: %s", e)
 
-    ds.add_user_message(d.id, text)
-    ds.add_assistant_message(d.id, answer)
+    # Если RAG нашёл данные, но модель не сослалась на документы,
+    # добавляем детерминированный блок источников.
+    final_answer = answer
+    if results and "Источники (БЗ)" not in answer:
+        final_answer = answer + _format_kb_sources_for_user(results)
 
-    await msg.reply_text(answer)
+    ds.add_user_message(d.id, text)
+    ds.add_assistant_message(d.id, final_answer)
+
+    await msg.reply_text(final_answer)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
