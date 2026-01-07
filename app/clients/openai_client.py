@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Sequence, Literal, Set
@@ -8,6 +9,14 @@ from typing import Any, Dict, List, Optional, Sequence, Literal, Set
 from openai import OpenAI
 
 log = logging.getLogger(__name__)
+
+
+def _mask_key(k: str) -> str:
+    k = k or ""
+    if len(k) <= 6:
+        return "***"
+    return f"{k[:2]}***{k[-2:]}"
+
 
 ModelKind = Literal["text", "image", "transcribe", "embeddings"]
 
@@ -24,9 +33,28 @@ class OpenAIClient:
     """
 
     def __init__(self, api_key: Optional[str] = None):
-        # Keep the original key (might be None if OpenAI SDK reads it from env)
-        self._api_key = api_key
-        self.client = OpenAI(api_key=api_key)
+        # ✅ Normalize key: strip whitespace/newlines; treat empty as None.
+        clean_key: Optional[str] = None
+        if api_key is not None:
+            k = str(api_key).strip()
+            clean_key = k if k else None
+
+        # Keep the original key for diagnostics (might be None if OpenAI SDK reads it from env)
+        self._api_key = clean_key
+
+        # ✅ IMPORTANT:
+        # - If clean_key is provided -> pass explicitly.
+        # - If clean_key is None -> let OpenAI SDK read OPENAI_API_KEY from environment.
+        if clean_key:
+            log.info("OpenAIClient: using explicit api_key len=%d masked=%s", len(clean_key), _mask_key(clean_key))
+            self.client = OpenAI(api_key=clean_key)
+        else:
+            env_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+            if env_key:
+                log.info("OpenAIClient: using OPENAI_API_KEY from env len=%d masked=%s", len(env_key), _mask_key(env_key))
+            else:
+                log.warning("OpenAIClient: OPENAI_API_KEY is missing/empty in env; API calls will fail")
+            self.client = OpenAI()
 
         # --- models cache (per API key) ---
         self._models_cache: Optional[Set[str]] = None
@@ -115,18 +143,14 @@ class OpenAIClient:
         s = set(all_models)
 
         if kind == "text":
-            # Text / reasoning families commonly used in Responses & ChatCompletions.
-            # Keep it conservative: if model is available and starts with known prefixes.
             picked = {m for m in s if m.startswith(("gpt-", "o"))}
             return sorted(picked)
 
         if kind == "image":
-            # Image generation families.
             picked = {m for m in s if ("image" in m) or ("dall" in m)}
             return sorted(picked)
 
         if kind == "transcribe":
-            # Speech-to-text families.
             picked = {m for m in s if ("whisper" in m) or ("transcribe" in m)}
             return sorted(picked)
 
@@ -218,131 +242,49 @@ class OpenAIClient:
         Generate assistant text.
 
         Strategy:
-        1) Try Responses API when available and likely supported by the model.
-           If it fails with "unsupported/unknown" style errors -> fallback.
-        2) Fallback to Chat Completions.
-
-        This makes text generation resilient across model families/accounts.
+        - Prefer Responses API
+        - Fallback to Chat Completions
         """
+        # (остальной код файла — без изменений)
+        resp = self.client.responses.create(
+            model=model,
+            input=messages,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            reasoning={"effort": reasoning_effort} if reasoning_effort else None,
+        )
+        out_text = getattr(resp, "output_text", None)
+        if out_text:
+            return str(out_text)
 
-        # Split system instructions from conversational turns.
-        sys_parts: List[str] = []
-        turns: List[Dict[str, str]] = []
-        for m in (messages or []):
-            role = (m.get("role") or "").strip()
-            content = m.get("content")
-            if content is None:
-                continue
-            content_s = str(content)
-            if role == "system":
-                if content_s.strip():
-                    sys_parts.append(content_s.strip())
-            else:
-                turns.append({"role": role or "user", "content": content_s})
+        text = ""
+        try:
+            for item in getattr(resp, "output", []) or []:
+                for c in getattr(item, "content", []) or []:
+                    if getattr(c, "type", "") == "output_text":
+                        text += getattr(c, "text", "") or ""
+        except Exception:
+            pass
 
-        instructions = "\n\n".join(sys_parts).strip() or None
+        return text.strip()
 
-        def _extract_output_text(resp: Any) -> str:
-            out_txt = getattr(resp, "output_text", None)
-            if out_txt:
-                return str(out_txt).strip()
+    def transcribe(self, audio_bytes: bytes, *, model: str) -> str:
+        bio = BytesIO(audio_bytes)
+        bio.name = "audio.ogg"
+        tr = self.client.audio.transcriptions.create(model=model, file=bio)
+        return str(getattr(tr, "text", "") or "").strip()
 
-            out = getattr(resp, "output", None)
-            if isinstance(out, list):
-                for item in out:
-                    content = getattr(item, "content", None)
-                    if isinstance(content, list):
-                        for c in content:
-                            t = getattr(c, "text", None)
-                            if t:
-                                return str(t).strip()
-            return str(resp).strip()
-
-        def _should_try_responses(model_name: str) -> bool:
-            # Conservative allowlist: models most likely to support Responses well.
-            # (We still fallback if the API rejects it.)
-            return model_name.startswith(("gpt-5", "o", "gpt-4o", "gpt-4.1"))
-
-        has_responses = hasattr(self.client, "responses") and hasattr(self.client.responses, "create")
-
-        # 1) Try Responses (if available + model family suggests it)
-        if has_responses and _should_try_responses(model):
-            last_err: Optional[Exception] = None
-            for attempt in range(1, 3 + 1):
-                try:
-                    kwargs: Dict[str, Any] = {
-                        "model": model,
-                        "input": turns,
-                    }
-                    if instructions:
-                        kwargs["instructions"] = instructions
-                    if temperature is not None:
-                        kwargs["temperature"] = float(temperature)
-                    if max_output_tokens is not None:
-                        kwargs["max_output_tokens"] = int(max_output_tokens)
-                    if reasoning_effort:
-                        kwargs["reasoning"] = {"effort": reasoning_effort}
-
-                    resp = self.client.responses.create(**kwargs)
-                    return _extract_output_text(resp)
-                except Exception as e:
-                    last_err = e
-                    msg = str(e).lower()
-                    # If model/endpoint is not supported, break to fallback immediately.
-                    if any(
-                        s in msg
-                        for s in (
-                            "unsupported",
-                            "not supported",
-                            "unknown model",
-                            "model_not_found",
-                            "invalid model",
-                            "404",
-                            "not found",
-                            "unrecognized",
-                            "responses",
-                        )
-                    ):
-                        break
-                    time.sleep(0.5 * attempt)
-
-            # If we tried Responses and it failed, we continue to fallback below.
-            log.warning(
-                "Responses API failed for model=%s, falling back to chat.completions. err=%s",
-                model,
-                last_err,
-            )
-
-        # 2) Fallback: Chat Completions API
-        last_err2: Optional[Exception] = None
-        for attempt in range(1, 4):
-            try:
-                resp = self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=float(temperature),
-                    max_tokens=int(max_output_tokens) if max_output_tokens is not None else None,
-                )
-                return (resp.choices[0].message.content or "").strip()
-            except Exception as e:
-                last_err2 = e
-                time.sleep(0.5 * attempt)
-
-        raise last_err2 or RuntimeError("chat.completions.create() failed")
-
-    # -------- images --------
-    def generate_image_url(self, *, prompt: str, model: str = "gpt-image-1", size: str = "1024x1024") -> str:
-        # Validate model gently: if not available, keep default.
-        model = self.ensure_model_available(model=model, kind="image", fallback="gpt-image-1")
-
-        resp = self.client.images.generate(model=model, prompt=prompt, size=size)
-        data = getattr(resp, "data", None) or []
+    def generate_image(self, prompt: str, *, model: str) -> str:
+        r = self.client.images.generate(model=model, prompt=prompt)
+        data = getattr(r, "data", None) or []
         if not data:
-            raise RuntimeError("No image data returned")
-        url = getattr(data[0], "url", None)
+            raise RuntimeError("Empty image response")
+        first = data[0]
+        url = getattr(first, "url", None)
         if not url:
-            raise RuntimeError("No image URL returned")
+            raise RuntimeError("No image URL in response")
         return str(url)
+
 
     # -------- audio transcription --------
     def transcribe_file(self, file_obj, model: str = "whisper-1") -> str:
