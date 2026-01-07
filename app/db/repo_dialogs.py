@@ -130,11 +130,7 @@ class DialogsRepo:
             return d
 
     def update_dialog_settings(self, dialog_id: int, patch: Dict[str, Any]) -> Optional[Dialog]:
-        """Обновить settings диалога (JSON) merge-патчем.
-
-        Используется сервисами /mode, /model, а также внутренним автозаполнением
-        дефолтных моделей. Важно не затирать весь settings целиком.
-        """
+        """Обновить settings диалога (JSON) merge-патчем."""
         patch = patch or {}
         with self.sf() as s:
             d = s.get(Dialog, int(dialog_id))
@@ -152,7 +148,6 @@ class DialogsRepo:
             return d
 
     def delete_dialog(self, dialog_id: int) -> None:
-        """Удалить диалог и его сообщения (cascade)."""
         with self.sf() as s:
             d = s.get(Dialog, int(dialog_id))
             if not d:
