@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from datetime import datetime
 
-import sqlalchemy as sa
 from sqlalchemy.orm import Session
 from sqlalchemy import text as sqltext
 
@@ -22,6 +21,38 @@ class KBRepo:
         with self.sf() as s:
             row = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE")).first()
             return int(row[0]) if row else 0
+
+    def list_documents_brief(self, *, active_only: bool = True) -> List[Dict[str, Any]]:
+        """
+        Минимальный набор полей для служебных операций (scan/sync).
+        """
+        where = "WHERE is_active=TRUE" if active_only else ""
+        with self.sf() as s:
+            rows = s.execute(
+                sqltext(
+                    f"""
+                    SELECT id, path, md5, size, modified_at, indexed_at, status, is_active
+                    FROM kb_documents
+                    {where}
+                    """
+                )
+            ).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": int(r[0]),
+                    "path": r[1],
+                    "md5": r[2],
+                    "size": int(r[3]) if r[3] is not None else None,
+                    "modified_at": r[4],
+                    "indexed_at": r[5],
+                    "status": r[6],
+                    "is_active": bool(r[7]),
+                }
+            )
+        return out
 
     def catalog(
         self,
@@ -67,14 +98,14 @@ class KBRepo:
                     """
                 ),
                 params,
-            )
+            ).fetchall()
 
         items: List[Dict[str, Any]] = []
         for r in rows:
             items.append(
                 {
                     "id": int(r[0]),
-                    "title": r[1] or None,
+                    "title": (r[1] or "").strip() or None,
                     "path": r[2],
                     "status": r[3],
                     "indexed_at": r[4],
@@ -95,13 +126,17 @@ class KBRepo:
         return {"id": int(row[0]), "title": row[1], "path": row[2]}
 
     def stats_global(self) -> Dict[str, Any]:
+        """
+        Формат совместим с handlers/kb.py:
+          { documents, chunks, top_docs:[{id,title,path,chunks}] }
+        """
         with self.sf() as s:
             docs = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE")).first()
             chunks = s.execute(sqltext("SELECT COUNT(*) FROM kb_chunks")).first()
             top = s.execute(
                 sqltext(
                     """
-                    SELECT d.path, COUNT(c.id) AS cnt
+                    SELECT d.id, COALESCE(d.title, '') AS title, d.path, COUNT(c.id) AS cnt
                     FROM kb_documents d
                     LEFT JOIN kb_chunks c ON c.document_id = d.id
                     WHERE d.is_active=TRUE
@@ -111,33 +146,80 @@ class KBRepo:
                     """
                 )
             ).fetchall()
+
         return {
             "documents": int(docs[0]) if docs else 0,
             "chunks": int(chunks[0]) if chunks else 0,
-            "top_documents": [{"path": r[0], "chunks": int(r[1])} for r in top],
+            "top_docs": [
+                {
+                    "id": int(r[0]),
+                    "title": (r[1] or "").strip() or None,
+                    "path": r[2],
+                    "chunks": int(r[3]),
+                }
+                for r in top
+            ],
         }
 
-    def stats_for_document_ids(self, document_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
+    def stats_for_document_ids(self, document_ids: Sequence[int]) -> Dict[str, Any]:
+        """
+        Агрегаты для текущего диалога (совместимо с handlers/kb.py):
+          { documents: <сколько документов в scope>, chunks: <сколько чанков в scope> }
+        """
         ids = [int(x) for x in document_ids]
         if not ids:
-            return {}
+            return {"documents": 0, "chunks": 0}
+
         with self.sf() as s:
-            rows = s.execute(
+            docs_row = s.execute(
                 sqltext(
                     """
-                    SELECT d.id, d.path, COUNT(c.id) AS cnt
-                    FROM kb_documents d
-                    LEFT JOIN kb_chunks c ON c.document_id=d.id
-                    WHERE d.id = ANY(:ids)
-                    GROUP BY d.id
+                    SELECT COUNT(*)
+                    FROM kb_documents
+                    WHERE is_active=TRUE AND id = ANY(:ids)
                     """
                 ),
                 {"ids": ids},
-            ).fetchall()
-        out: Dict[int, Dict[str, Any]] = {}
-        for r in rows:
-            out[int(r[0])] = {"id": int(r[0]), "path": r[1], "chunks": int(r[2])}
-        return out
+            ).first()
+            chunks_row = s.execute(
+                sqltext(
+                    """
+                    SELECT COUNT(*)
+                    FROM kb_chunks
+                    WHERE document_id = ANY(:ids)
+                    """
+                ),
+                {"ids": ids},
+            ).first()
+
+        return {
+            "documents": int(docs_row[0]) if docs_row else 0,
+            "chunks": int(chunks_row[0]) if chunks_row else 0,
+        }
+
+    def status_summary(self) -> Dict[str, Any]:
+        """
+        Для /kb status (админ): показывает “здоровье” БЗ.
+        """
+        with self.sf() as s:
+            active_docs = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE")).first()
+            all_docs = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents")).first()
+            chunks = s.execute(sqltext("SELECT COUNT(*) FROM kb_chunks")).first()
+
+            last_indexed = s.execute(sqltext("SELECT MAX(indexed_at) FROM kb_documents WHERE indexed_at IS NOT NULL")).first()
+            err_docs = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE AND status='error'")).first()
+            skipped_docs = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE AND status='skipped'")).first()
+            indexed_docs = s.execute(sqltext("SELECT COUNT(*) FROM kb_documents WHERE is_active=TRUE AND status='indexed'")).first()
+
+        return {
+            "documents_active": int(active_docs[0]) if active_docs else 0,
+            "documents_total": int(all_docs[0]) if all_docs else 0,
+            "chunks_total": int(chunks[0]) if chunks else 0,
+            "documents_indexed": int(indexed_docs[0]) if indexed_docs else 0,
+            "documents_skipped": int(skipped_docs[0]) if skipped_docs else 0,
+            "documents_error": int(err_docs[0]) if err_docs else 0,
+            "last_indexed_at": last_indexed[0] if last_indexed else None,
+        }
 
     def upsert_document(
         self,
@@ -212,12 +294,23 @@ class KBRepo:
         if indexed_at is None:
             return True
 
+        # “Изменением считаем любое событие” — в Этапе 1 трактуем как:
+        # md5/size/modified любое отличие => reindex.
         if md5 and old_md5 and md5 != old_md5:
             return True
         if size is not None and old_size is not None and int(size) != int(old_size):
             return True
         if modified_at is not None and old_modified is not None and modified_at != old_modified:
             return True
+
+        # Если старые метаданные пустые, а новые появились — тоже reindex
+        if old_md5 is None and md5 is not None:
+            return True
+        if old_size is None and size is not None:
+            return True
+        if old_modified is None and modified_at is not None:
+            return True
+
         return False
 
     def set_document_status(self, document_id: int, *, status: str, last_error: str | None = None) -> None:
