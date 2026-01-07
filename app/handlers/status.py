@@ -24,15 +24,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Сервисы не настроены.")
         return
 
-    # Надёжно: гарантируем активный диалог
     d = ds.ensure_active_dialog(update.effective_user.id)
     settings = ds.get_active_settings(update.effective_user.id) or {}
 
-    # Информация по диалогу
     mode = str(settings.get("mode") or "detailed")
-
-    # Модели по модальностям (источник истины — settings диалога)
-    # Если вдруг пусто — показываем дефолты из cfg для понятности.
     text_model = str(settings.get("text_model") or getattr(cfg, "text_model", "unknown"))
     image_model = str(settings.get("image_model") or getattr(cfg, "image_model", "unknown"))
     transcribe_model = str(settings.get("transcribe_model") or getattr(cfg, "transcribe_model", "unknown"))
@@ -40,7 +35,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_enabled = bool(context.bot_data.get("svc_image"))
     rag_enabled = bool(context.bot_data.get("svc_rag"))
 
-    # KB scope (режим и количество документов в текущем диалоге)
     kb_mode = "-"
     kb_enabled_docs = 0
     kb_attached_docs = 0
@@ -52,7 +46,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_attached_docs = len(attached)
             kb_enabled_docs = sum(1 for x in attached if bool(x.get("is_enabled")))
         except Exception:
-            # статус — не критичен, не ломаем команду
             pass
 
     history = ds.history(d.id, limit=1000)
@@ -86,5 +79,4 @@ def register(app):
     from telegram.ext import CommandHandler
 
     app.add_handler(CommandHandler("status", cmd_status))
-    # Совместимость: команда /stats в меню
     app.add_handler(CommandHandler("stats", cmd_status))
