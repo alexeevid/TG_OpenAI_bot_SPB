@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.settings import Settings
 from app.db.repo_kb import KBRepo
@@ -20,6 +22,9 @@ from app.kb.parsers import (
 )
 
 log = logging.getLogger(__name__)
+
+ProgressCB = Callable[[int, int, str, int, int], None]
+# progress_cb(processed, total, current_path, ok, fail)
 
 
 @dataclass
@@ -43,7 +48,7 @@ class KbSyncer:
     """
     Синхронизация базы знаний (Яндекс.Диск -> kb_documents + kb_chunks).
 
-    Публичный API ДОЛЖЕН соответствовать handlers/kb.py:
+    Публичный API соответствует handlers/kb.py:
       - scan() -> ScanReport (new/outdated/deleted)
       - sync() -> (ScanReport, ok, fail, deleted_count)
       - status_summary() -> Dict[str, Any]
@@ -55,6 +60,9 @@ class KbSyncer:
         self._indexer = indexer
         self._y = yandex_client
 
+        # Защита от одновременных /kb sync
+        self._sync_lock = threading.Lock()
+
     # -----------------------------
     # helpers
     # -----------------------------
@@ -64,7 +72,6 @@ class KbSyncer:
             return value
         if isinstance(value, str) and value.strip():
             try:
-                # Yandex часто дает ISO + "Z"
                 return datetime.fromisoformat(value.replace("Z", "+00:00"))
             except Exception:
                 return None
@@ -94,10 +101,6 @@ class KbSyncer:
         return ""
 
     def _disk_files(self) -> List[Dict[str, Any]]:
-        """
-        Нормализуем метаданные с Диска к единому виду.
-        Важно: "modified" (как в клиенте) тоже считаем "modified_at" (наш ключ).
-        """
         raw: List[Dict[str, Any]] = self._y.list_kb_files_metadata() or []
         out: List[Dict[str, Any]] = []
         for f in raw:
@@ -110,7 +113,6 @@ class KbSyncer:
             md5 = f.get("md5")
             size = f.get("size")
 
-            # В проде у клиента поле чаще называется "modified"
             modified_at = f.get("modified_at")
             if modified_at is None:
                 modified_at = f.get("modified")
@@ -132,14 +134,6 @@ class KbSyncer:
     # public API
     # -----------------------------
     def scan(self) -> ScanReport:
-        """
-        new:
-          - есть на Диске, но нет в БД (по path), либо есть, но is_active=False (считаем как new для админа)
-        outdated:
-          - есть на Диске и в БД (active), но needs_reindex=True
-        deleted:
-          - есть в БД (active), но нет на Диске
-        """
         disk = self._disk_files()
         disk_by_path = {x["path"]: x for x in disk}
 
@@ -150,12 +144,10 @@ class KbSyncer:
         outdated: List[Dict[str, Any]] = []
         deleted: List[Dict[str, Any]] = []
 
-        # deleted (active in DB but missing on disk)
         for p, d in db_by_path.items():
             if p not in disk_by_path:
                 deleted.append({"id": d["id"], "path": p})
 
-        # new/outdated based on disk
         for p, f in disk_by_path.items():
             db = db_by_path.get(p)
             if not db:
@@ -173,96 +165,132 @@ class KbSyncer:
 
         return ScanReport(new=new, outdated=outdated, deleted=deleted)
 
-    def sync(self) -> Tuple[ScanReport, int, int, int]:
+    def sync(self, *, progress_cb: Optional[ProgressCB] = None) -> Tuple[ScanReport, int, int, int]:
         """
         Возвращает:
           (report, ok, fail, deleted_count)
-        где ok/fail — количество обработанных файлов (индексация/ошибки),
-        deleted_count — сколько активных документов исчезло с Диска.
+
+        progress_cb(processed, total, current_path, ok, fail) — опционально.
         """
-        report = self.scan()
+        if not self._sync_lock.acquire(blocking=False):
+            raise RuntimeError("KB sync is already running")
 
-        ok = 0
-        fail = 0
-
-        disk_files = self._disk_files()
-        scanned = len(disk_files)
-
-        # Delete-propagation: всё делаем inactive, затем активируем найденные.
         try:
-            self._repo.mark_all_documents_inactive()
-        except Exception as e:
-            log.warning("mark_all_documents_inactive failed (continue): %s", e)
+            report = self.scan()
 
-        for f in disk_files:
-            path = f["path"]
-            title = f.get("title") or path.split("/")[-1]
-            resource_id = f.get("resource_id")
-            md5 = f.get("md5")
-            size = f.get("size")
-            modified_at = f.get("modified_at")
+            ok = 0
+            fail = 0
 
-            document_id: Optional[int] = None
+            disk_files = self._disk_files()
+            total = len(disk_files)
+            scanned = total
+
+            # delete-propagation
             try:
-                document_id = self._repo.upsert_document(
-                    path=path,
-                    title=title,
-                    resource_id=resource_id,
-                    md5=md5,
-                    size=size,
-                    modified_at=modified_at,
-                    is_active=True,
-                    status=None,
-                    last_error=None,
-                )
-
-                needs = self._repo.document_needs_reindex(
-                    document_id=document_id,
-                    md5=md5,
-                    modified_at=modified_at,
-                    size=size,
-                )
-                if not needs:
-                    continue
-
-                data: bytes = self._y.download(path)
-                text = self._parse_to_text(title, data).strip()
-
-                if not text:
-                    self._repo.set_document_status(
-                        document_id=document_id,
-                        status="skipped",
-                        last_error="Empty text after parsing (possibly encrypted PDF or unsupported format).",
-                    )
-                    continue
-
-                n = self._indexer.reindex_document(document_id=document_id, text=text)
-                self._repo.set_document_indexed(document_id=document_id)
-
-                log.info("KB indexed %s chunks for %s", n, path)
-                ok += 1
-
+                self._repo.mark_all_documents_inactive()
             except Exception as e:
-                log.exception("KB sync failed for path=%s: %s", path, e)
+                log.warning("mark_all_documents_inactive failed (continue): %s", e)
+
+            last_emit = 0.0
+
+            def emit(processed: int, path: str) -> None:
+                nonlocal last_emit
+                if not progress_cb:
+                    return
+                now = time.time()
+                # не спамим телегу: раз в ~1.5 сек или на финале
+                if (now - last_emit) < 1.5 and processed < total:
+                    return
+                last_emit = now
                 try:
-                    if document_id:
-                        self._repo.set_document_status(document_id=document_id, status="error", last_error=str(e))
+                    progress_cb(processed, total, path, ok, fail)
                 except Exception:
                     pass
-                fail += 1
 
-        # deleted_count — сколько активных ранее исчезло
-        deleted_count = len(report.deleted)
+            processed = 0
+            for f in disk_files:
+                path = f["path"]
+                title = f.get("title") or path.split("/")[-1]
+                resource_id = f.get("resource_id")
+                md5 = f.get("md5")
+                size = f.get("size")
+                modified_at = f.get("modified_at")
 
-        log.info("KB sync finished: scanned=%s ok=%s fail=%s deleted=%s", scanned, ok, fail, deleted_count)
-        return report, ok, fail, deleted_count
+                document_id: Optional[int] = None
+                try:
+                    document_id = self._repo.upsert_document(
+                        path=path,
+                        title=title,
+                        resource_id=resource_id,
+                        md5=md5,
+                        size=size,
+                        modified_at=modified_at,
+                        is_active=True,
+                        status=None,
+                        last_error=None,
+                    )
+
+                    needs = self._repo.document_needs_reindex(
+                        document_id=document_id,
+                        md5=md5,
+                        modified_at=modified_at,
+                        size=size,
+                    )
+                    if not needs:
+                        processed += 1
+                        emit(processed, path)
+                        continue
+
+                    data: bytes = self._y.download(path)
+                    text = self._parse_to_text(title, data).strip()
+
+                    if not text:
+                        self._repo.set_document_status(
+                            document_id=document_id,
+                            status="skipped",
+                            last_error="Empty text after parsing (possibly encrypted PDF or unsupported format).",
+                        )
+                        processed += 1
+                        emit(processed, path)
+                        continue
+
+                    n = self._indexer.reindex_document(document_id=document_id, text=text)
+                    self._repo.set_document_indexed(document_id=document_id)
+
+                    log.info("KB indexed %s chunks for %s", n, path)
+                    ok += 1
+
+                except Exception as e:
+                    log.exception("KB sync failed for path=%s: %s", path, e)
+                    try:
+                        if document_id:
+                            self._repo.set_document_status(document_id=document_id, status="error", last_error=str(e))
+                    except Exception:
+                        pass
+                    fail += 1
+
+                processed += 1
+                emit(processed, path)
+
+            deleted_count = len(report.deleted)
+            log.info("KB sync finished: scanned=%s ok=%s fail=%s deleted=%s", scanned, ok, fail, deleted_count)
+
+            # финальный emit
+            if progress_cb:
+                try:
+                    progress_cb(total, total, "<done>", ok, fail)
+                except Exception:
+                    pass
+
+            return report, ok, fail, deleted_count
+        finally:
+            try:
+                self._sync_lock.release()
+            except Exception:
+                pass
 
     def status_summary(self) -> Dict[str, Any]:
-        """
-        Короткая сводка для /kb status (админ).
-        """
         st = self._repo.status_summary()
-        # На всякий случай добавим "scan" summary (дешево)
         rep = self.scan()
         st.update(
             {
@@ -274,5 +302,4 @@ class KbSyncer:
         return st
 
 
-# stable public API name
 KBSyncer = KbSyncer
