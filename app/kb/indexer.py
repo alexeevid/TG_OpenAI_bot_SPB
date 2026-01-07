@@ -42,11 +42,14 @@ class KbIndexer:
     """
     Устойчивый индексатор БЗ.
 
-    Поддерживает разные версии Embedder:
-    - embed(texts)
-    - embed_texts(texts)
-    - embed_documents(texts)
+    Ключевая особенность:
+    - embeddings вызываются БАТЧАМИ
+    - защита от max_tokens_per_request
     """
+
+    # ---- safety limits ----
+    MAX_ITEMS_PER_BATCH = 64
+    MAX_CHARS_PER_BATCH = 180_000  # грубый, но безопасный суррогат токенов
 
     def __init__(self, kb_repo: KBRepo, embedder, chunk_size: int, overlap: int):
         self._repo = kb_repo
@@ -54,7 +57,9 @@ class KbIndexer:
         self._chunk_size = int(chunk_size)
         self._overlap = int(overlap)
 
-    def _embed(self, texts: List[str]) -> List[list[float]]:
+    # ---------- embeddings helpers ----------
+
+    def _embed_raw(self, texts: List[str]) -> List[list[float]]:
         if hasattr(self._embedder, "embed"):
             return self._embedder.embed(texts)
         if hasattr(self._embedder, "embed_texts"):
@@ -64,6 +69,56 @@ class KbIndexer:
         raise AttributeError(
             "Embedder has no supported method: expected one of embed / embed_texts / embed_documents"
         )
+
+    def _embed_batched(self, texts: List[str]) -> List[list[float]]:
+        """
+        Делит embeddings на безопасные батчи.
+        При ошибке — рекурсивно делит батч пополам.
+        """
+        if not texts:
+            return []
+
+        results: List[list[float]] = []
+
+        batch: List[str] = []
+        batch_chars = 0
+
+        def flush_batch(b: List[str]) -> List[list[float]]:
+            if not b:
+                return []
+            try:
+                return self._embed_raw(b)
+            except Exception:
+                # fallback: делим пополам
+                if len(b) == 1:
+                    raise
+                mid = len(b) // 2
+                return flush_batch(b[:mid]) + flush_batch(b[mid:])
+
+        for t in texts:
+            t = t or ""
+            t_len = len(t)
+
+            if (
+                batch
+                and (
+                    len(batch) >= self.MAX_ITEMS_PER_BATCH
+                    or (batch_chars + t_len) >= self.MAX_CHARS_PER_BATCH
+                )
+            ):
+                results.extend(flush_batch(batch))
+                batch = []
+                batch_chars = 0
+
+            batch.append(t)
+            batch_chars += t_len
+
+        if batch:
+            results.extend(flush_batch(batch))
+
+        return results
+
+    # ---------- public API ----------
 
     def reindex_document(
         self,
@@ -85,7 +140,7 @@ class KbIndexer:
             self._repo.delete_chunks_by_document_id(did)
             return 0
 
-        embeddings = self._embed([c.text for c in chunks])
+        embeddings = self._embed_batched([c.text for c in chunks])
 
         rows: List[Tuple[int, int, str, list[float]]] = []
         for c, emb in zip(chunks, embeddings):
