@@ -24,12 +24,42 @@ class OpenAIClient:
     """
 
     def __init__(self, api_key: Optional[str] = None):
+        # Keep the original key (might be None if OpenAI SDK reads it from env)
+        self._api_key = api_key
         self.client = OpenAI(api_key=api_key)
 
         # --- models cache (per API key) ---
         self._models_cache: Optional[Set[str]] = None
         self._models_cache_ts: float = 0.0
         self._models_cache_ttl_sec: int = 1800  # 30 minutes
+
+    def is_enabled(self) -> bool:
+        """
+        Backward-compatible feature flag used by older KB/RAG code.
+
+        Returns True if we likely have an API key configured (explicitly or via env).
+        Even if True, actual calls can still fail; callers should keep try/except.
+        """
+        if self._api_key:
+            return True
+
+        # Try to introspect common OpenAI SDK internal fields (best-effort)
+        for attr_path in (
+            ("api_key",),
+            ("_client", "api_key"),
+            ("_client", "_config", "api_key"),
+        ):
+            obj: Any = self.client
+            ok = True
+            for a in attr_path:
+                if not hasattr(obj, a):
+                    ok = False
+                    break
+                obj = getattr(obj, a)
+            if ok and obj:
+                return True
+
+        return False
 
     # -------- models --------
     def _list_models_cached(self, *, force_refresh: bool = False) -> List[str]:
