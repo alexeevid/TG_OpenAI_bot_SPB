@@ -156,8 +156,8 @@ async def kb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     f"- dialog_id: {d.id}\n"
                     f"- attached: {len(attached)}\n"
                     f"- enabled: {enabled}\n"
-                    f"- documents_in_scope: {st['documents']}\n"
-                    f"- chunks_in_scope: {st['chunks']}"
+                    f"- documents_in_scope: {st.get('documents', 0)}\n"
+                    f"- chunks_in_scope: {st.get('chunks', 0)}"
                 )
             else:
                 st = kb_repo.stats_global()
