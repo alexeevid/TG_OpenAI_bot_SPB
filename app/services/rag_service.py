@@ -19,13 +19,7 @@ class RagService:
         *,
         min_score: float = 0.35,
     ) -> list[RetrievedChunk]:
-        """Возвращает релевантные чанки для RAG.
-
-        Важно:
-        - allowed_document_ids задаёт скоуп БЗ текущего диалога.
-        - min_score отсекает слабые совпадения, чтобы не подсовывать LLM «мусор»
-          (типичный источник галлюцинаций).
-        """
+        """Возвращает релевантные чанки для RAG."""
         if not self._dkb.rag_enabled(dialog_id):
             return []
 
@@ -43,7 +37,6 @@ class RagService:
         if not results:
             return []
 
-        # Фильтруем по порогу релевантности
         try:
             ms = float(min_score)
         except Exception:
