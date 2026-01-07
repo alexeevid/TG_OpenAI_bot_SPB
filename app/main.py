@@ -11,8 +11,8 @@ from .clients.yandex_disk_client import YandexDiskClient
 
 from .db.session import make_session_factory, reset_schema, ensure_schema
 from .db.repo_dialogs import DialogsRepo
-from .db.repo_kb import KBRepo
 from .db.repo_dialog_kb import DialogKBRepo
+from .db.repo_kb import KBRepo
 
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
@@ -90,19 +90,20 @@ def build_application() -> Application:
 
     ensure_schema(engine)
 
-    # ⚠️ FIX: KBRepo теперь требует embedding dim
-    embedding_dim = cfg.openai_embedding_dim
+    # --- external clients ---
+    openai = OpenAIClient(cfg.openai_api_key)
+    yandex = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
 
+    # --- Embedder FIRST (он знает dim) ---
+    embedder = Embedder(cfg, openai)
+    embedding_dim = embedder.dim  # ← ИСТИННЫЙ источник
+
+    # --- repos ---
     repo_dialogs = DialogsRepo(sf)
     repo_kb = KBRepo(sf, dim=embedding_dim)
     repo_dialog_kb = DialogKBRepo(sf)
 
-    # --- clients ---
-    openai = OpenAIClient(cfg.openai_api_key)
-    yandex = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
-
     # --- KB / RAG ---
-    embedder = Embedder(cfg, openai)
     retriever = Retriever(cfg, repo_kb, embedder)
     indexer = KbIndexer(cfg, repo_kb, embedder)
     syncer = KBSyncer(cfg, repo_kb, indexer, yandex)
@@ -111,7 +112,7 @@ def build_application() -> Application:
     dialog_kb_service = DialogKBService(repo_dialog_kb, repo_kb)
     rag_service = RagService(retriever, dialog_kb_service)
 
-    # --- Gen / Voice / Image ---
+    # --- generation ---
     gen_service = GenService(
         api_key=cfg.openai_api_key,
         default_model=cfg.openai_text_model,
@@ -123,12 +124,7 @@ def build_application() -> Application:
     )
 
     voice_service = VoiceService(openai, cfg)
-
-    image_service = ImageService(
-        api_key=cfg.openai_api_key,
-        image_model=cfg.openai_image_model,
-    )
-
+    image_service = ImageService(cfg.openai_api_key, cfg.openai_image_model)
     authz_service = AuthzService(cfg)
 
     app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
@@ -153,7 +149,6 @@ def build_application() -> Application:
         }
     )
 
-    # handlers
     start.register(app)
     help.register(app)
     dialogs.register(app)
