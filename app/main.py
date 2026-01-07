@@ -44,6 +44,9 @@ from .handlers import (
 
 log = logging.getLogger(__name__)
 
+# ✅ ЯВНАЯ, СТАБИЛЬНАЯ РАЗМЕРНОСТЬ EMBEDDINGS
+EMBEDDING_DIM = 1536
+
 
 async def _post_init(app: Application) -> None:
     try:
@@ -90,20 +93,17 @@ def build_application() -> Application:
 
     ensure_schema(engine)
 
-    # --- external clients ---
+    # --- clients ---
     openai = OpenAIClient(cfg.openai_api_key)
     yandex = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
 
-    # --- Embedder FIRST (он знает dim) ---
-    embedder = Embedder(cfg, openai)
-    embedding_dim = embedder.dim  # ← ИСТИННЫЙ источник
-
     # --- repos ---
     repo_dialogs = DialogsRepo(sf)
-    repo_kb = KBRepo(sf, dim=embedding_dim)
+    repo_kb = KBRepo(sf, dim=EMBEDDING_DIM)
     repo_dialog_kb = DialogKBRepo(sf)
 
     # --- KB / RAG ---
+    embedder = Embedder(cfg, openai)
     retriever = Retriever(cfg, repo_kb, embedder)
     indexer = KbIndexer(cfg, repo_kb, embedder)
     syncer = KBSyncer(cfg, repo_kb, indexer, yandex)
