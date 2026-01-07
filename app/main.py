@@ -40,12 +40,19 @@ async def _post_init(app: Application) -> None:
         await app.bot.set_my_commands(
             [
                 ("start", "Старт"),
-                ("help", "Помощь"),
-                ("dialogs", "Управление диалогами"),
+                ("help", "Справка"),
+                ("reset", "Новый диалог"),
+                ("dialogs", "Диалоги (выбор/удаление/имя)"),
+                ("status", "Статус текущего диалога"),
+                ("stats", "Статус (alias)"),
                 ("model", "Выбрать модель"),
-                ("mode", "Режим ответа"),
-                ("kb", "База знаний (диалоговая)"),
-                ("status", "Сводка по диалогу"),
+                ("mode", "Стиль ответа"),
+                ("img", "Сгенерировать изображение"),
+                ("kb", "База знаний"),
+                ("update", "Синхронизировать БЗ"),
+                ("config", "Текущая конфигурация"),
+                ("about", "О проекте"),
+                ("feedback", "Оставить отзыв"),
             ]
         )
     except Exception as e:
@@ -109,107 +116,80 @@ def build_application() -> Application:
         "Startup config: image=%s web=%s provider=%s",
         bool(getattr(cfg, "enable_image_generation", False)),
         bool(getattr(cfg, "enable_web_search", False)),
-        getattr(cfg, "web_search_provider", "disabled"),
+        getattr(cfg, "web_search_provider", None),
     )
+
+    sf, engine = make_session_factory(cfg.database_url)
+
+    # (Опционально) ресет схемы — только если выставлен флаг окружения
+    if bool(getattr(cfg, "reset_db", False)):
+        reset_schema(engine)
+
+    ensure_schema(engine)
+
+    repo_dialogs = DialogsRepo(sf)
+    repo_kb = KBRepo(sf, dim=_resolve_embedding_dim(cfg))
+    repo_dialog_kb = DialogKBRepo(sf)
+
+    openai = OpenAIClient(cfg.openai_api_key)
+    yandex = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
+
+    embedder = Embedder(openai, cfg.embedding_model, dim=_resolve_embedding_dim(cfg))
+    retriever = Retriever(repo_kb, openai, dim=_resolve_embedding_dim(cfg))
+    indexer = _build_kb_indexer(repo_kb=repo_kb, embedder=embedder, cfg=cfg)
+    syncer = KBSyncer(yandex, repo_kb, indexer)
+
+    dialog_service = DialogService(repo_dialogs, settings=cfg)
+    dialog_kb_service = DialogKBService(repo_dialog_kb, repo_kb)
+    rag_service = RagService(retriever, dialog_kb_service)
+    gen_service = GenService(openai, rag_service, cfg)
+    voice_service = VoiceService(openai, cfg)
+    image_service = ImageService(openai, cfg.openai_image_model)
+    authz_service = AuthzService(cfg)
 
     app = Application.builder().token(cfg.telegram_token).post_init(_post_init).build()
 
-    # ---- DB init (ONE place) ----
-    session_factory, engine = make_session_factory(cfg.database_url)
+    # bot_data (services / repos)
+    app.bot_data["settings"] = cfg
 
-    # One-shot reset on start (Railway-friendly)
-    if os.getenv("DB_RESET_ON_START", "").strip() in ("1", "true", "TRUE", "yes", "YES"):
-        reset_schema(engine)
-    else:
-        ensure_schema(engine)
+    app.bot_data["openai"] = openai
+    app.bot_data["yandex"] = yandex
 
-    # --- repos ---
-    repo_dialogs = DialogsRepo(session_factory)
-    embedding_dim = _resolve_embedding_dim(cfg)
-    repo_kb = KBRepo(session_factory, embedding_dim)
-    repo_dialog_kb = DialogKBRepo(session_factory)
+    app.bot_data["repo_dialogs"] = repo_dialogs
+    app.bot_data["repo_kb"] = repo_kb
+    app.bot_data["repo_dialog_kb"] = repo_dialog_kb
 
-    # --- services ---
-    # ВАЖНО: прокидываем settings, чтобы DialogService мог выставлять дефолты моделей в dialog.settings
-    ds = DialogService(repo_dialogs, settings=cfg)
-    authz = AuthzService(cfg)
+    app.bot_data["svc_dialog"] = dialog_service
+    app.bot_data["svc_dialog_kb"] = dialog_kb_service
+    app.bot_data["svc_rag"] = rag_service
+    app.bot_data["svc_gen"] = gen_service
+    app.bot_data["svc_voice"] = voice_service
+    app.bot_data["svc_image"] = image_service
+    app.bot_data["svc_authz"] = authz_service
+    app.bot_data["kb_syncer"] = syncer
 
-    oai_client = OpenAIClient(api_key=cfg.openai_api_key)
-
-    # GenService: default_model остаётся, но реальный выбор теперь идёт из dialog_settings
-    default_text_model = str(getattr(cfg, "text_model", "") or "gpt-4o-mini")
-    gen = GenService(api_key=cfg.openai_api_key, default_model=default_text_model)
-
-    default_image_model = str(getattr(cfg, "image_model", "") or "gpt-image-1")
-    img = (
-        ImageService(api_key=cfg.openai_api_key, image_model=default_image_model)
-        if getattr(cfg, "enable_image_generation", False)
-        else None
-    )
-
-    # ВАЖНО: прокидываем settings, чтобы дефолт STT модели был консистентен
-    vs = VoiceService(openai_client=oai_client, settings=cfg)
-
-    yd = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
-
-    embedder = Embedder(oai_client, cfg.openai_embedding_model)
-    retriever = Retriever(repo_kb, oai_client, embedding_dim)
-
-    dialog_kb = DialogKBService(repo_dialog_kb, repo_kb)
-    rag = RagService(retriever, dialog_kb)
-
-    indexer = _build_kb_indexer(repo_kb=repo_kb, embedder=embedder, cfg=cfg)
-    syncer = KBSyncer(cfg, repo_kb, indexer, yd)
-
-    # --- bot_data ---
-    app.bot_data.update(
-        {
-            "settings": cfg,
-            "db_engine": engine,  # полезно для админских операций
-            "repo_dialogs": repo_dialogs,
-            "repo_kb": repo_kb,
-            "repo_dialog_kb": repo_dialog_kb,
-            # OpenAI client aliases:
-            "oai_client": oai_client,
-            "openai": oai_client,  # важно для handlers/model.py + handlers/image.py/voice.py
-            "retriever": retriever,
-            "indexer": indexer,
-            "svc_dialog": ds,
-            "svc_authz": authz,
-            "svc_gen": gen,
-            "svc_voice": vs,
-            "svc_image": img,
-            "svc_dialog_kb": dialog_kb,
-            "svc_rag": rag,
-            "yandex": yd,
-            "embedder": embedder,
-            "svc_syncer": syncer,
-        }
-    )
-
-    # --- handlers ---
+    # register handlers
     start.register(app)
     help.register(app)
-    errors.register(app)
-
     dialogs.register(app)
     model.register(app)
     mode.register(app)
-
-    kb.register(app)
-    kb_ui.register(app)
-
     image.register(app)
     voice.register(app)
-    text.register(app)
+    kb.register(app)
+    kb_ui.register(app)
     status.register(app)
+    text.register(app)
+    errors.register(app)
 
+    log.info("Application built OK")
     return app
 
 
-def run() -> None:
+def main() -> None:
     app = build_application()
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=None,
-    )
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
