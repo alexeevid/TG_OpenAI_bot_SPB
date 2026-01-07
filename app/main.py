@@ -132,7 +132,7 @@ def build_application() -> Application:
     openai = OpenAIClient(cfg.openai_api_key)
     yandex = YandexDiskClient(cfg.yandex_disk_token, cfg.yandex_root_path)
 
-    embedder = Embedder(openai, cfg.embedding_model, dim=_resolve_embedding_dim(cfg))
+    embedder = Embedder(openai, dim=_resolve_embedding_dim(cfg))
     retriever = Retriever(repo_kb, openai, dim=_resolve_embedding_dim(cfg))
     indexer = _build_kb_indexer(repo_kb=repo_kb, embedder=embedder, cfg=cfg)
     syncer = KBSyncer(yandex, repo_kb, indexer)
