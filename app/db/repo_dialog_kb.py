@@ -25,6 +25,7 @@ class DialogKBRepo:
         settings = (row[0] if row else None) or {}
         if not isinstance(settings, dict):
             settings = {}
+
         mode = str(settings.get("kb_mode") or "AUTO").upper()
         return mode if mode in ("AUTO", "ON", "OFF") else "AUTO"
 
@@ -44,7 +45,7 @@ class DialogKBRepo:
                 settings = {}
             settings["kb_mode"] = mode_u
 
-            # psycopg2 can't adapt dict in raw SQL params -> JSON string + cast to jsonb
+            # ✅ psycopg2 can't adapt dict in raw SQL params -> JSON string + cast to jsonb
             s.execute(
                 sqltext("UPDATE dialogs SET settings=(:st)::jsonb WHERE id=:id"),
                 {"st": json.dumps(settings, ensure_ascii=False), "id": int(dialog_id)},
@@ -53,7 +54,22 @@ class DialogKBRepo:
 
         return mode_u
 
-    # --- attachments ---
+    # --- attachments (dialog_kb_documents) ---
+    def is_attached(self, dialog_id: int, document_id: int) -> bool:
+        with self.sf() as s:  # type: Session
+            row = s.execute(
+                sqltext(
+                    """
+                    SELECT 1
+                    FROM dialog_kb_documents
+                    WHERE dialog_id = :did AND document_id = :doc
+                    LIMIT 1
+                    """
+                ),
+                {"did": int(dialog_id), "doc": int(document_id)},
+            ).first()
+        return bool(row)
+
     def list_attached(self, dialog_id: int) -> List[Dict[str, Any]]:
         with self.sf() as s:  # type: Session
             rows = s.execute(
@@ -73,25 +89,6 @@ class DialogKBRepo:
             {"document_id": int(r[0]), "is_enabled": bool(r[1]), "path": r[2], "title": r[3]}
             for r in rows
         ]
-
-    def allowed_document_ids(self, dialog_id: int) -> List[int]:
-        with self.sf() as s:  # type: Session
-            rows = s.execute(
-                sqltext(
-                    """
-                    SELECT document_id
-                    FROM dialog_kb_documents
-                    WHERE dialog_id = :did AND is_enabled = TRUE
-                    ORDER BY document_id ASC
-                    """
-                ),
-                {"did": int(dialog_id)},
-            ).fetchall()
-        return [int(r[0]) for r in rows]
-
-    # ✅ Backward-compatible alias (old code expects this name)
-    def get_allowed_document_ids(self, dialog_id: int) -> List[int]:
-        return self.allowed_document_ids(dialog_id)
 
     def attach(self, dialog_id: int, document_id: int) -> None:
         with self.sf() as s:  # type: Session
@@ -118,6 +115,25 @@ class DialogKBRepo:
                     """
                 ),
                 {"did": int(dialog_id), "doc": int(document_id)},
+            )
+            s.commit()
+
+    def set_enabled(self, dialog_id: int, document_id: int, enabled: bool) -> None:
+        """
+        DialogKBService ожидает этот метод.
+        Если строки нет — создаём её. Если есть — обновляем is_enabled.
+        """
+        with self.sf() as s:  # type: Session
+            s.execute(
+                sqltext(
+                    """
+                    INSERT INTO dialog_kb_documents (dialog_id, document_id, is_enabled)
+                    VALUES (:did, :doc, :en)
+                    ON CONFLICT (dialog_id, document_id)
+                    DO UPDATE SET is_enabled = EXCLUDED.is_enabled
+                    """
+                ),
+                {"did": int(dialog_id), "doc": int(document_id), "en": bool(enabled)},
             )
             s.commit()
 
@@ -151,6 +167,25 @@ class DialogKBRepo:
             )
             s.commit()
             return bool(new_val)
+
+    def allowed_document_ids(self, dialog_id: int) -> List[int]:
+        with self.sf() as s:  # type: Session
+            rows = s.execute(
+                sqltext(
+                    """
+                    SELECT document_id
+                    FROM dialog_kb_documents
+                    WHERE dialog_id = :did AND is_enabled = TRUE
+                    ORDER BY document_id ASC
+                    """
+                ),
+                {"did": int(dialog_id)},
+            ).fetchall()
+        return [int(r[0]) for r in rows]
+
+    # ✅ Backward-compatible alias (старый код ожидает это имя)
+    def get_allowed_document_ids(self, dialog_id: int) -> List[int]:
+        return self.allowed_document_ids(dialog_id)
 
     # --- secrets (оставляем на будущее) ---
     def set_pdf_password(self, dialog_id: int, document_id: int, password: str) -> None:
