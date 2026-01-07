@@ -67,6 +67,12 @@ def _system_prompt(mode: str) -> str:
         return base + " Режим: кратко (до 6–10 предложений)."
     if mode == "exec":
         return base + " Режим: для руководителя (вывод + 3–5 пунктов решений/рисков)."
+    if mode == "mcwilliams":
+        return (
+            base
+            + " Стиль: McWilliams (ясно, структурно, деловой тон, "
+              "делай выводы и рекомендации, избегай воды)."
+        )
     return base + " Режим: развёрнуто (пункты, примеры, рекомендации)."
 
 
@@ -192,6 +198,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     if not text:
         return
+
+    # --- Suppress text processing for UI conversations (e.g., dialogs rename) ---
+    # Некоторые ConversationHandler'ы используют обычное TEXT сообщение как ввод
+    # (например, переименование диалога). В ряде окружений PTB такое сообщение
+    # может быть обработано и ConversationHandler'ом, и нашим catch-all текстовым
+    # хендлером. Чтобы бот не отвечал "как на запрос", подавляем обработку.
+    try:
+        suppress_id = context.user_data.get("suppress_text_message_id")
+        if suppress_id and int(suppress_id) == int(update.message.message_id):
+            context.user_data.pop("suppress_text_message_id", None)
+            return
+    except Exception:
+        # если что-то пошло не так — не ломаем обычную обработку
+        pass
+
     await process_text(update, context, text)
 
 
