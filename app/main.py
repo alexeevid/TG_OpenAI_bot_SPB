@@ -44,9 +44,6 @@ from .handlers import (
 
 log = logging.getLogger(__name__)
 
-# ✅ ЯВНАЯ, СТАБИЛЬНАЯ РАЗМЕРНОСТЬ EMBEDDINGS
-EMBEDDING_DIM = 1536
-
 
 async def _post_init(app: Application) -> None:
     try:
@@ -99,13 +96,14 @@ def build_application() -> Application:
 
     # --- repos ---
     repo_dialogs = DialogsRepo(sf)
-    repo_kb = KBRepo(sf, dim=EMBEDDING_DIM)
+    repo_kb = KBRepo(sf, dim=cfg.embedding_dim)
     repo_dialog_kb = DialogKBRepo(sf)
 
     # --- KB / RAG ---
-    embedder = Embedder(cfg, openai)
-    retriever = Retriever(cfg, repo_kb, embedder)
-    indexer = KbIndexer(cfg, repo_kb, embedder)
+    # В (25) у классов другие сигнатуры, поэтому wiring должен быть строго таким:
+    embedder = Embedder(openai, cfg.openai_embedding_model)
+    retriever = Retriever(repo_kb, openai, cfg.embedding_dim)
+    indexer = KbIndexer(repo_kb, embedder, cfg.chunk_size, cfg.chunk_overlap)
     syncer = KBSyncer(cfg, repo_kb, indexer, yandex)
 
     dialog_service = DialogService(repo_dialogs, settings=cfg)
