@@ -9,9 +9,13 @@ log = logging.getLogger(__name__)
 
 
 class VoiceService:
-    """Распознавание голоса через OpenAI (whisper-1 по умолчанию).
+    """
+    Распознавание голоса через OpenAI.
 
-    openai_client должен предоставлять метод transcribe_file(fobj, model=...).
+    В версии проекта (25) OpenAIClient предоставляет метод:
+        transcribe(audio_bytes: bytes, *, model: str) -> str
+
+    Поэтому VoiceService читает файл в bytes и вызывает openai_client.transcribe(...).
     """
 
     def __init__(self, openai_client, settings=None):
@@ -19,12 +23,14 @@ class VoiceService:
         self._settings = settings
 
     def _default_model(self) -> str:
+        # Пытаемся взять из settings, иначе — whisper-1
         if self._settings is not None:
-            return (
+            m = (
                 getattr(self._settings, "openai_transcribe_model", None)
                 or getattr(self._settings, "transcribe_model", None)
-                or "whisper-1"
             )
+            if m:
+                return str(m)
         return "whisper-1"
 
     def _pick_from_dialog_settings(self, dialog_settings: Optional[Dict[str, Any]], key: str) -> Optional[str]:
@@ -43,22 +49,25 @@ class VoiceService:
     ) -> str:
         p = Path(path)
         if not p.exists():
-            return "[ошибка распознавания: файл не найден]"
+            return ""
 
         # приоритет: model аргумент > dialog_settings > settings default
-        desired_model = model or self._pick_from_dialog_settings(dialog_settings, "transcribe_model") or self._default_model()
+        desired_model = (
+            model
+            or self._pick_from_dialog_settings(dialog_settings, "transcribe_model")
+            or self._default_model()
+        )
 
         try:
-            with p.open("rb") as f:
-                # OpenAIClient.transcribe_file умеет принимать model как именованный аргумент,
-                # но в нашей обёртке допускается и позиционный.
-                try:
-                    return await asyncio.to_thread(self._openai.transcribe_file, f, desired_model)
-                except TypeError:
-                    return await asyncio.to_thread(self._openai.transcribe_file, f, model=desired_model)
+            audio_bytes = p.read_bytes()
+
+            # OpenAIClient.transcribe синхронный -> в thread
+            text = await asyncio.to_thread(self._openai.transcribe, audio_bytes, model=desired_model)
+            return (text or "").strip()
         except Exception as e:
             log.exception("VOICE: transcribe_path failed: %s", e)
-            return f"[ошибка распознавания: {e.__class__.__name__}]"
+            # Возвращаем пусто, чтобы handler показал нормальную ошибку UX-уровня
+            return ""
 
     async def transcribe(
         self,
@@ -75,4 +84,4 @@ class VoiceService:
             return await self.transcribe_path(local_path, model=model, dialog_settings=dialog_settings)
         except Exception as e:
             log.exception("VOICE: transcribe failed: %s", e)
-            return f"[ошибка распознавания: {e.__class__.__name__}]"
+            return ""
