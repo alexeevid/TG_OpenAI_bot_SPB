@@ -59,10 +59,6 @@ def _strip_date_prefix(title: str) -> str:
 
 
 def _masked_title(created_at: Optional[datetime], raw_title: str) -> str:
-    """
-    Всегда возвращает: YYYY-MM-DD_<Имя>
-    Имя берём из title (без даты), иначе "Новый диалог"
-    """
     name = _strip_date_prefix(raw_title)
     if not name:
         name = "Новый диалог"
@@ -85,7 +81,6 @@ def _build_keyboard(dialogs, *, active_dialog_id: Optional[int], page: int, page
         created_at = getattr(d, "created_at", None)
         title = _masked_title(created_at, getattr(d, "title", "") or "")
 
-        # 1) имя — одна строка
         kb.append(
             [
                 InlineKeyboardButton(
@@ -95,8 +90,6 @@ def _build_keyboard(dialogs, *, active_dialog_id: Optional[int], page: int, page
             ]
         )
 
-        # 2) снизу: дата изменения + ✏️ + 🗑 (в одной строке)
-        # дата изменения берётся из updated_at (если None — показываем created_at)
         updated_at = getattr(d, "updated_at", None) or created_at
         kb.append(
             [
@@ -106,7 +99,6 @@ def _build_keyboard(dialogs, *, active_dialog_id: Optional[int], page: int, page
             ]
         )
 
-    # пагинация
     nav: List[InlineKeyboardButton] = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️", callback_data=BTN_PAGE_PREV))
@@ -115,7 +107,6 @@ def _build_keyboard(dialogs, *, active_dialog_id: Optional[int], page: int, page
         nav.append(InlineKeyboardButton("➡️", callback_data=BTN_PAGE_NEXT))
     kb.append(nav)
 
-    # отдельная кнопка Новый диалог
     kb.append([InlineKeyboardButton("➕ Новый диалог", callback_data=BTN_NEW)])
 
     return InlineKeyboardMarkup(kb)
@@ -139,8 +130,6 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
     dialogs = repo.list_dialogs_page(u.id, limit=PAGE_SIZE, offset=offset)
 
     markup = _build_keyboard(dialogs, active_dialog_id=active_dialog_id, page=page, pages_total=pages_total)
-
-    # компактная шапка (без требований/инструкций)
     text = "📚 Диалоги"
 
     if edit and update.callback_query and update.callback_query.message:
@@ -151,13 +140,11 @@ async def _render(update: Update, context: ContextTypes.DEFAULT_TYPE, *, edit: b
             await update.effective_message.reply_text(text, reply_markup=markup)
 
 
-# -------- commands --------
 async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["dialogs_page"] = 1
     await _render(update, context, edit=False)
 
 
-# -------- callbacks (non-conversation actions) --------
 async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     repo: DialogsRepo = context.application.bot_data.get("repo_dialogs")
     if not repo or not update.callback_query or not update.effective_user:
@@ -182,7 +169,6 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == BTN_NEW:
         d = repo.new_dialog(u.id, title="", settings={})
-        # имя по маске (дата создания + дефолт)
         masked = _masked_title(getattr(d, "created_at", None), "Новый диалог")
         repo.rename_dialog(d.id, masked)
         repo.set_active_dialog(u.id, d.id)
@@ -192,7 +178,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if data.startswith(BTN_OPEN_PREFIX):
-        dialog_id = int(data[len(BTN_OPEN_PREFIX) :])
+        dialog_id = int(data[len(BTN_OPEN_PREFIX):])
         d = repo.get_dialog_for_user(dialog_id, u.id)
         if not d:
             await update.callback_query.answer("Не найден", show_alert=True)
@@ -203,7 +189,7 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if data.startswith(BTN_DELETE_PREFIX):
-        dialog_id = int(data[len(BTN_DELETE_PREFIX) :])
+        dialog_id = int(data[len(BTN_DELETE_PREFIX):])
         d = repo.get_dialog_for_user(dialog_id, u.id)
         if not d:
             await update.callback_query.answer("Не найден", show_alert=True)
@@ -214,15 +200,13 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _render(update, context, edit=True)
         return
 
-    # rename обрабатывается ConversationHandler entrypoint (ниже)
     await update.callback_query.answer()
 
 
 # -------- rename conversation --------
+RENAME_WAIT_TEXT = 1
+
 async def rename_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Entry point on ✏️ callback.
-    """
     repo: DialogsRepo = context.application.bot_data.get("repo_dialogs")
     if not repo or not update.callback_query or not update.effective_user:
         return ConversationHandler.END
@@ -230,7 +214,7 @@ async def rename_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     data = update.callback_query.data or ""
     u = repo.ensure_user(str(update.effective_user.id))
 
-    dialog_id = int(data[len(BTN_RENAME_PREFIX) :])
+    dialog_id = int(data[len(BTN_RENAME_PREFIX):])
     d = repo.get_dialog_for_user(dialog_id, u.id)
     if not d:
         await update.callback_query.answer("Не найден", show_alert=True)
@@ -242,24 +226,19 @@ async def rename_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await update.callback_query.message.reply_text(
         "Введите новое имя диалога одним сообщением (без даты).\n"
         "Отмена — кнопка ниже.",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("✖️ Отмена", callback_data=BTN_CANCEL_RENAME)]]
-        ),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Отмена", callback_data=BTN_CANCEL_RENAME)]]),
     )
     return RENAME_WAIT_TEXT
 
 
 async def rename_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("dlg_rename_id", None)
-
-    # может быть callback или команда
     if update.callback_query:
         await update.callback_query.answer("Отменено")
         if update.callback_query.message:
             await update.callback_query.message.reply_text("Ок, переименование отменено.")
     elif update.effective_message:
         await update.effective_message.reply_text("Ок, переименование отменено.")
-
     return ConversationHandler.END
 
 
@@ -273,8 +252,7 @@ async def rename_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not dialog_id:
         return ConversationHandler.END
 
-    # ВАЖНО: этот текст НЕ должен уходить в общий text-хендлер.
-    # Сохраняем message_id, чтобы text.py мог подавить обработку.
+    # подавляем обработку этого message_id в общем text-хендлере
     try:
         context.user_data["suppress_text_message_id"] = int(update.effective_message.message_id)
     except Exception:
@@ -299,16 +277,12 @@ async def rename_receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.pop("dlg_rename_id", None)
 
     await update.effective_message.reply_text("✅ Переименовано.")
-    # перерисуем меню (не редактируем старое сообщение, просто показываем актуальное)
     await _render(update, context, edit=False)
 
     return ConversationHandler.END
 
 
 async def rename_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Called when conversation times out.
-    """
     context.user_data.pop("dlg_rename_id", None)
     if update.effective_message:
         await update.effective_message.reply_text("⏳ Время ожидания истекло. Переименование отменено.")
@@ -316,14 +290,9 @@ async def rename_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def register(app: Application) -> None:
-    # /dialogs
     app.add_handler(CommandHandler("dialogs", cmd_dialogs))
 
-    # Основные кнопки меню (кроме rename)
-    # rename перехватывается ConversationHandler entrypoint, чтобы не мешать тексту.
-    # ВАЖНО:
-    # Раньше паттерн требовал ".+" после new/prev/next, из-за чего
-    # кнопки "➕ Новый диалог" и пагинация не работали.
+    # ВАЖНО: pattern без лишних .+ — иначе new/prev/next не матчились
     app.add_handler(
         CallbackQueryHandler(
             on_cb,
@@ -331,10 +300,6 @@ def register(app: Application) -> None:
         )
     )
 
-    # Rename conversation:
-    # - entry: callback dlg:rename:<id>
-    # - state: next TEXT message becomes new name
-    # - timeout: 60 sec
     conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(rename_entry, pattern=r"^dlg:rename:\d+$")],
         states={
@@ -347,7 +312,7 @@ def register(app: Application) -> None:
             CallbackQueryHandler(rename_cancel, pattern=r"^dlg:cancel_rename$"),
             CommandHandler("cancel", rename_cancel),
         ],
-        conversation_timeout=RENAME_TIMEOUT_SEC,
+        conversation_timeout=60,
         allow_reentry=True,
         per_user=True,
         per_chat=True,
@@ -355,5 +320,4 @@ def register(app: Application) -> None:
     )
     app.add_handler(conv)
 
-    # Отмена по кнопке (если прилетела вне активного состояния — просто чистим)
     app.add_handler(CallbackQueryHandler(rename_cancel, pattern=r"^dlg:cancel_rename$"))
