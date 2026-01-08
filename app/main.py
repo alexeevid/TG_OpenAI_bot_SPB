@@ -141,7 +141,7 @@ def build_application() -> Application:
 
     search_service = SearchService(web_client, enabled=cfg.enable_web_search)
 
-    # --- documents / OCR ---
+    # --- documents (3.1–3.5) ---
     document_service = DocumentService(openai, cfg)
 
     app = Application.builder().token(cfg.telegram_bot_token).post_init(_post_init).build()
@@ -176,7 +176,7 @@ def build_application() -> Application:
     mode.register(app)
     web.register(app)
 
-    # важно: files раньше text (group=9 vs group=10)
+    # важное: файлы/фото раньше обычного текста
     files.register(app)
 
     image.register(app)
