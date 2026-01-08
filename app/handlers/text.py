@@ -12,54 +12,32 @@ from ..services.dialog_service import DialogService
 from ..services.gen_service import GenService
 from ..services.rag_service import RagService
 from ..core.types import RetrievedChunk
+from ..core.response_modes import build_system_prompt
 
 log = logging.getLogger(__name__)
 
 
 def _format_kb_context(results: List[RetrievedChunk]) -> str:
-    lines: List[str] = []
+    parts: List[str] = []
     for r in results:
-        title = (r.document_title or "").strip()
-        path = (r.document_path or "").strip()
-        src = title if title else (path if path else f"document_id={r.document_id}")
-        chunk = (r.text or "").strip()
-        if len(chunk) > 900:
-            chunk = chunk[:900] + "…"
-        lines.append(f"- Источник: {src} | chunk#{r.id} | sim={r.score:.3f}\n  {chunk}")
-    return "\n".join(lines)
-
-
-def _format_kb_sources_for_user(results: List[RetrievedChunk], *, max_items: int = 5) -> str:
-    if not results:
-        return ""
-    lines: List[str] = ["\n\n📚 Источники (БЗ):"]
-    for i, r in enumerate(results[: max(1, int(max_items))], start=1):
-        title = (r.document_title or "").strip()
-        path = (r.document_path or "").strip()
-        src = title if title else (path if path else f"document_id={r.document_id}")
-        quote = (r.text or "").strip().replace("\n", " ")
-        if len(quote) > 280:
-            quote = quote[:280] + "…"
-        score = f"{float(r.score):.3f}" if r.score is not None else "-"
-        lines.append(f"{i}) {src} | chunk#{r.id} | sim={score}\n   «{quote}»")
-    return "\n".join(lines)
+        title = r.get("title") or r.get("source") or "Документ"
+        path = r.get("path") or ""
+        score = r.get("score")
+        text = r.get("text") or ""
+        hdr = f"- [{title}] {path}"
+        if score is not None:
+            try:
+                hdr += f" (score={float(score):.3f})"
+            except Exception:
+                pass
+        parts.append(hdr + "\n" + text.strip())
+    return "\n\n".join(parts)
 
 
 def _system_prompt(mode: str) -> str:
-    base = (
-        "Ты — профессиональный ассистент по управлению проектами и цифровым продуктам. "
-        "Отвечай на русском языке. "
-        "Пиши структурировано и предметно. "
-        "Не выдумывай факты и источники. "
-        "Если данных недостаточно — задай уточняющие вопросы."
-    )
-    if mode == "brief":
-        return base + " Режим: кратко (до 6–10 предложений)."
-    if mode == "exec":
-        return base + " Режим: для руководителя (вывод + 3–5 пунктов решений/рисков)."
-    if mode == "mcwilliams":
-        return base + " Стиль: McWilliams (ясно, структурно, деловой тон, выводы и рекомендации)."
-    return base + " Режим: развёрнуто (пункты, примеры, рекомендации)."
+    # Сохраняем внешний контракт файла (используется ниже),
+    # но всю логику режимов держим в одном месте: app/core/response_modes.py
+    return build_system_prompt(mode)
 
 
 async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -84,7 +62,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     d = ds.ensure_active_dialog(update.effective_user.id)
     settings: Dict[str, Any] = ds.get_active_settings(update.effective_user.id) or {}
 
-    mode = str(settings.get("mode") or "detailed")
+    mode = str(settings.get("mode") or "professional")
     sys = _system_prompt(mode)
 
     results: List[RetrievedChunk] = []
@@ -104,8 +82,10 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         log.warning("RAG retrieve failed: %s", e)
         results = []
 
+    kb_ctx = ""
     if results:
         kb_ctx = _format_kb_context(results)
+
         sys = (
             sys
             + "\n\n"
@@ -148,24 +128,30 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     except Exception as e:
         log.warning("Failed to sync used text model to dialog settings: %s", e)
 
-    final_answer = answer
-    if results:
-        if kb_debug:
-            max_sim = max(float(r.score) for r in results if r.score is not None)
-            final_answer = f"🧩 RAG: найдено {len(results)} фрагм., max_sim={max_sim:.3f}, min_score={kb_min_score:.2f}\n\n" + final_answer
-        if "Источники (БЗ)" not in final_answer:
-            final_answer += _format_kb_sources_for_user(results)
+    try:
+        ds.add_message(d.id, role="user", content=text)
+    except Exception:
+        pass
 
-    ds.add_user_message(d.id, text)
-    ds.add_assistant_message(d.id, final_answer)
+    try:
+        ds.add_message(d.id, role="assistant", content=answer or "")
+    except Exception:
+        pass
 
-    await msg.reply_text(final_answer)
+    if kb_debug and results:
+        try:
+            await msg.reply_text(f"🔎 KB chunks: {len(results)} (top_k={kb_top_k}, min_score={kb_min_score})")
+        except Exception:
+            pass
+
+    await msg.reply_text(answer or "⚠️ Пустой ответ.")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg or not getattr(update, "message", None):
+    if not msg or not update.message:
         return
+
     text = (update.message.text or "").strip()
     if not text:
         return
