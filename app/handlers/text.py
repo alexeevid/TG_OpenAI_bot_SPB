@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List
 
 from telegram import Update
@@ -11,10 +12,53 @@ from ..services.authz_service import AuthzService
 from ..services.dialog_service import DialogService
 from ..services.gen_service import GenService
 from ..services.rag_service import RagService
+from ..services.search_service import SearchService
 from ..core.types import RetrievedChunk
 from ..core.response_modes import build_system_prompt
 
 log = logging.getLogger(__name__)
+
+
+_WEB_PATTERNS = [
+    # RU
+    r"^\s*(найди|найти)\s+(в\s+интернете\s+)?(?P<q>.+)$",
+    r"^\s*поиск\s*:\s*(?P<q>.+)$",
+    r"^\s*веб\s*поиск\s*:\s*(?P<q>.+)$",
+    r"^\s*гугл(и|ь)?\s+(?P<q>.+)$",
+    # EN
+    r"^\s*(search|web)\s*:\s*(?P<q>.+)$",
+]
+
+
+def _try_extract_web_query(text: str) -> str | None:
+    t = (text or "").strip()
+    if not t:
+        return None
+    for p in _WEB_PATTERNS:
+        m = re.match(p, t, flags=re.IGNORECASE)
+        if m:
+            q = (m.groupdict().get("q") or "").strip()
+            return q if q else None
+    return None
+
+
+async def _handle_web_search(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> bool:
+    msg = update.effective_message
+    if not msg:
+        return True
+
+    svc: SearchService | None = context.bot_data.get("svc_search")
+    if not svc:
+        await msg.reply_text("⚠️ Веб-поиск не настроен.")
+        return True
+
+    res = svc.search(query, max_results=7)
+    if not res:
+        await msg.reply_text("Нет результатов (или веб-поиск выключен).")
+        return True
+
+    await msg.reply_text("🔎 Результаты веб-поиска:\n\n" + "\n\n".join(res))
+    return True
 
 
 def _format_kb_context(results: List[RetrievedChunk]) -> str:
@@ -34,12 +78,6 @@ def _format_kb_context(results: List[RetrievedChunk]) -> str:
     return "\n\n".join(parts)
 
 
-def _system_prompt(mode: str) -> str:
-    # Сохраняем внешний контракт файла (используется ниже),
-    # но всю логику режимов держим в одном месте: app/core/response_modes.py
-    return build_system_prompt(mode)
-
-
 async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     msg = update.effective_message
     if not msg or not update.effective_user:
@@ -48,6 +86,12 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     az: AuthzService | None = context.bot_data.get("svc_authz")
     if az and not az.is_allowed(update.effective_user.id):
         await msg.reply_text("⛔ Доступ запрещен.")
+        return
+
+    # --- WEB SEARCH TRIGGER (ранний выход) ---
+    q = _try_extract_web_query(text)
+    if q:
+        await _handle_web_search(update, context, q)
         return
 
     ds: DialogService | None = context.bot_data.get("svc_dialog")
@@ -63,7 +107,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     settings: Dict[str, Any] = ds.get_active_settings(update.effective_user.id) or {}
 
     mode = str(settings.get("mode") or "professional")
-    sys = _system_prompt(mode)
+    sys = build_system_prompt(mode)
 
     results: List[RetrievedChunk] = []
     kb_min_score = float(getattr(cfg, "kb_min_score", 0.35))
@@ -82,10 +126,8 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         log.warning("RAG retrieve failed: %s", e)
         results = []
 
-    kb_ctx = ""
     if results:
         kb_ctx = _format_kb_context(results)
-
         sys = (
             sys
             + "\n\n"
@@ -149,7 +191,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg or not update.message:
+    if not msg or not getattr(update, "message", None):
         return
 
     text = (update.message.text or "").strip()
