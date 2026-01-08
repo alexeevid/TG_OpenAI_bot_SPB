@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import httpx
 
@@ -11,12 +11,12 @@ log = logging.getLogger(__name__)
 
 class WebSearchClient:
     """
-    Реальный веб-поиск через Tavily.
+    Веб-поиск через Tavily.
 
-    Settings уже есть в вашем проекте (25):
-      - enable_web_search: bool
-      - web_search_provider: str  (например, "tavily")
-      - tavily_api_key: str
+    Поддерживаем provider:
+      - "tavily"
+      - "auto" (если есть ключ tavily -> используем tavily)
+      - "disabled"
     """
 
     def __init__(
@@ -27,21 +27,52 @@ class WebSearchClient:
         enabled: bool = False,
         timeout_s: float = 15.0,
     ):
-        self.provider = (provider or "disabled").lower()
+        self.provider = (provider or "disabled").strip().lower()
         self.enabled = bool(enabled)
-        self.tavily_api_key = tavily_api_key or ""
+        self.tavily_api_key = (tavily_api_key or "").strip()
         self.timeout_s = float(timeout_s)
+
+    def _resolved_provider(self) -> str:
+        """
+        Решаем, какой провайдер реально использовать.
+        """
+        if not self.enabled:
+            return "disabled"
+
+        if self.provider in ("disabled", "off", "false", "0"):
+            return "disabled"
+
+        if self.provider == "tavily":
+            return "tavily"
+
+        # AUTO: если ключ есть — берём tavily
+        if self.provider in ("auto", "default", ""):
+            if self.tavily_api_key:
+                return "tavily"
+            return "disabled"
+
+        # неизвестный провайдер
+        return "disabled"
 
     def search(self, query: str, *, max_results: int = 7) -> List[Dict[str, Any]]:
         q = (query or "").strip()
         if not q:
             return []
 
-        if not self.enabled or self.provider == "disabled":
+        provider = self._resolved_provider()
+        if provider == "disabled":
+            # Важно: не спамим логами на каждый запрос, но один раз подсказка полезна
+            if self.enabled and self.provider != "disabled":
+                log.warning(
+                    "WebSearchClient disabled: provider=%s resolved=%s key_present=%s",
+                    self.provider,
+                    provider,
+                    bool(self.tavily_api_key),
+                )
             return []
 
-        if self.provider != "tavily":
-            log.warning("WebSearchClient: provider '%s' is not supported", self.provider)
+        if provider != "tavily":
+            log.warning("WebSearchClient: provider '%s' is not supported", provider)
             return []
 
         if not self.tavily_api_key:
@@ -83,5 +114,4 @@ class WebSearchClient:
                     "snippet": (item.get("content") or "").strip(),
                 }
             )
-
         return out
