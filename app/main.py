@@ -28,6 +28,7 @@ from .services.voice_service import VoiceService
 from .services.image_service import ImageService
 from .services.authz_service import AuthzService
 from .services.search_service import SearchService
+from .services.document_service import DocumentService
 
 from .handlers import (
     start,
@@ -43,11 +44,11 @@ from .handlers import (
     kb,
     kb_ui,
     web,
+    files,
 )
 
 log = logging.getLogger(__name__)
 
-# ✅ ЯВНАЯ, СТАБИЛЬНАЯ РАЗМЕРМНОСТЬ EMBEDDINGS
 EMBEDDING_DIM = 1536
 
 
@@ -140,6 +141,9 @@ def build_application() -> Application:
 
     search_service = SearchService(web_client, enabled=cfg.enable_web_search)
 
+    # --- documents / OCR ---
+    document_service = DocumentService(openai, cfg)
+
     app = Application.builder().token(cfg.telegram_bot_token).post_init(_post_init).build()
 
     app.bot_data.update(
@@ -161,6 +165,7 @@ def build_application() -> Application:
             "svc_image": image_service,
             "svc_authz": authz_service,
             "svc_search": search_service,
+            "svc_document": document_service,
         }
     )
 
@@ -170,6 +175,9 @@ def build_application() -> Application:
     model.register(app)
     mode.register(app)
     web.register(app)
+
+    # важно: files раньше text (group=9 vs group=10)
+    files.register(app)
 
     image.register(app)
     voice.register(app)
