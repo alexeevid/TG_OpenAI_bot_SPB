@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
@@ -18,6 +17,15 @@ log = logging.getLogger(__name__)
 def _tmp_path(unique_id: str, suffix: str) -> str:
     suffix = suffix if suffix.startswith(".") else f".{suffix}" if suffix else ""
     return f"/tmp/{unique_id}{suffix}"
+
+
+def _default_instruction_neutral() -> str:
+    # Нейтральная постановка задачи: подходит для Professional/SEO/Simple/Trainer
+    return (
+        "Проанализируй содержимое. Коротко перечисли, что в документе/на фото, "
+        "и дай заключение о качестве (что хорошо/что не хватает) без длинных рекомендаций. "
+        "Если нужен контекст — задай 1–3 уточняющих вопроса."
+    )
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -52,9 +60,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("⚠️ Не удалось распознать текст на изображении.")
             return
 
-        # Если пользователь добавил подпись — считаем это инструкцией.
-        # Иначе по умолчанию просим сделать разбор/проверку.
-        instruction = caption or "Сделай разбор/проверку по этому материалу. Укажи ошибки и рекомендации."
+        instruction = caption or _default_instruction_neutral()
+
         user_text = (
             f"{instruction}\n\n"
             f"---\n"
@@ -104,18 +111,17 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         extracted = svc.extract_text(local, filename=filename, mime=mime)
 
         if not extracted.text:
-            # частый кейс: скан-PDF без текста
             if extracted.info.startswith("pdf:no_text"):
                 await msg.reply_text(
                     "⚠️ Похоже, PDF сканированный и в нём нет извлекаемого текста.\n"
                     "Пришли страницы как изображения (фото/скриншоты) — я распознаю OCR."
                 )
                 return
-
             await msg.reply_text("⚠️ Не удалось извлечь текст из документа.")
             return
 
-        instruction = caption or "Сделай разбор/проверку по этому документу. Укажи ошибки и рекомендации."
+        instruction = caption or _default_instruction_neutral()
+
         user_text = (
             f"{instruction}\n\n"
             f"---\n"
@@ -132,6 +138,5 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def register(app: Application) -> None:
-    # Фото обрабатываем раньше обычного text (text у вас в group=10)
     app.add_handler(MessageHandler(filters.PHOTO, on_photo), group=9)
     app.add_handler(MessageHandler(filters.Document.ALL, on_document), group=9)
