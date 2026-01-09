@@ -15,6 +15,7 @@ from ..services.rag_service import RagService
 from ..services.search_service import SearchService
 from ..core.types import RetrievedChunk
 from ..core.response_modes import build_system_prompt
+from ..core.utils import with_mode_prefix
 
 log = logging.getLogger(__name__)
 
@@ -49,15 +50,15 @@ async def _handle_web_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     svc: SearchService | None = context.bot_data.get("svc_search")
     if not svc:
-        await msg.reply_text("⚠️ Веб-поиск не настроен.")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id if update.effective_user else None, "⚠️ Веб-поиск не настроен."))
         return True
 
     res = svc.search(query, max_results=7)
     if not res:
-        await msg.reply_text("Нет результатов (или веб-поиск выключен).")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id if update.effective_user else None, "Нет результатов (или веб-поиск выключен)."))
         return True
 
-    await msg.reply_text("🔎 Результаты веб-поиска:\n\n" + "\n\n".join(res))
+    await msg.reply_text(with_mode_prefix(context, update.effective_user.id if update.effective_user else None, "🔎 Результаты веб-поиска:\n\n" + "\n\n".join(res)))
     return True
 
 
@@ -85,7 +86,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
     az: AuthzService | None = context.bot_data.get("svc_authz")
     if az and not az.is_allowed(update.effective_user.id):
-        await msg.reply_text("⛔ Доступ запрещен.")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "⛔ Доступ запрещен."))
         return
 
     # --- WEB SEARCH TRIGGER (ранний выход) ---
@@ -100,7 +101,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     cfg = context.bot_data.get("settings")
 
     if not ds or not gs or not cfg:
-        await msg.reply_text("⚠️ Сервисы не настроены.")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "⚠️ Сервисы не настроены."))
         return
 
     d = ds.ensure_active_dialog(update.effective_user.id)
@@ -157,7 +158,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
         )
     except Exception as e:
         log.exception("GenService.chat failed: %s", e)
-        await msg.reply_text("⚠️ Ошибка генерации.")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "⚠️ Ошибка генерации."))
         return
 
     try:
@@ -182,11 +183,11 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
     if kb_debug and results:
         try:
-            await msg.reply_text(f"🔎 KB chunks: {len(results)} (top_k={kb_top_k}, min_score={kb_min_score})")
+            await msg.reply_text(with_mode_prefix(context, update.effective_user.id, f"🔎 KB chunks: {len(results)} (top_k={kb_top_k}, min_score={kb_min_score})"))
         except Exception:
             pass
 
-    await msg.reply_text(answer or "⚠️ Пустой ответ.")
+    await msg.reply_text(with_mode_prefix(context, update.effective_user.id, answer or "⚠️ Пустой ответ."))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
