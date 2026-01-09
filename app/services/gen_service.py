@@ -134,6 +134,11 @@ class GenService:
 
         use_temp = self.temperature if temperature is None else float(temperature)
 
+        # mode prefix is a UX contract: every assistant answer must start with [РЕЖИМ: ...]
+        mode_for_prefix = None
+        if isinstance(dialog_settings, dict):
+            mode_for_prefix = dialog_settings.get("mode")
+
         # 2) ensure availability (soft)
         safe_model = await asyncio.to_thread(
             self.client.ensure_model_available,
@@ -147,7 +152,7 @@ class GenService:
         try:
             meta["used_model"] = safe_model
             meta["fallback_used"] = False
-            return await asyncio.to_thread(
+            txt = await asyncio.to_thread(
                 self.client.generate_text,
                 model=safe_model,
                 messages=messages,
@@ -155,6 +160,12 @@ class GenService:
                 max_output_tokens=self.max_output_tokens,
                 reasoning_effort=self.reasoning_effort,
             )
+            try:
+                from ..core.response_modes import ensure_mode_prefix
+
+                return ensure_mode_prefix(txt or "", mode_for_prefix)
+            except Exception:
+                return txt
         except Exception as e:
             log.exception("OpenAI generate_text failed (model=%s): %s", safe_model, e)
             meta["error"] = f"{e.__class__.__name__}: {e}"
@@ -175,7 +186,12 @@ class GenService:
                     )
                     # ВАЖНО: здесь не добавляем префикс-предупреждение в текст,
                     # чтобы не засорять ответы. Синхронизацию модели делает хендлер.
-                    return txt
+                    try:
+                        from ..core.response_modes import ensure_mode_prefix
+
+                        return ensure_mode_prefix(txt or "", mode_for_prefix)
+                    except Exception:
+                        return txt
                 except Exception as e2:
                     log.exception("Fallback model also failed: %s", e2)
                     meta["error"] = f"{e2.__class__.__name__}: {e2}"
