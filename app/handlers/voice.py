@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from ..services.dialog_service import DialogService
+from ..core.utils import with_mode_prefix
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = context.application.bot_data.get("settings")
     vs = context.application.bot_data.get("svc_voice")
     if not vs:
-        await msg.reply_text("⚠️ VoiceService не инициализирован.")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "⚠️ VoiceService не инициализирован."))
         return
 
     ds: DialogService | None = context.application.bot_data.get("svc_dialog")
@@ -99,7 +100,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             log.warning("Failed to sync image_model to dialog settings: %s", e)
 
-    await msg.reply_text("🎙️ Распознаю…")
+    await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "🎙️ Распознаю…"))
 
     try:
         # VoiceService уже поддерживает model/dialog_settings — используем.
@@ -112,26 +113,26 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 text = await vs.transcribe(msg)
     except Exception as e:
         log.exception("Voice transcription failed: %s", e)
-        await msg.reply_text(f"❌ Ошибка распознавания голоса: {e}")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, f"❌ Ошибка распознавания голоса: {e}"))
         return
 
     if not text:
-        await msg.reply_text("⚠️ Не удалось распознать речь.")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "⚠️ Не удалось распознать речь."))
         return
 
     # Если распознанный текст начинается с "нарисуй ..." — генерируем картинку
     prompt = _extract_draw_prompt(text)
     if prompt:
         if not getattr(cfg, "enable_image_generation", False):
-            await msg.reply_text("🚫 Генерация изображений отключена в настройках.")
+            await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "🚫 Генерация изображений отключена в настройках."))
             return
 
         img_svc = context.application.bot_data.get("svc_image")
         if img_svc is None:
-            await msg.reply_text("⚠️ Сервис генерации изображений не инициализирован.")
+            await msg.reply_text(with_mode_prefix(context, update.effective_user.id, "⚠️ Сервис генерации изображений не инициализирован."))
             return
 
-        await msg.reply_text(f"🎨 Понял: «{prompt}». Рисую…")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, f"🎨 Понял: «{prompt}». Рисую…"))
         try:
             # Аналогично image.py: не ломаем контракт сервиса
             try:
@@ -142,10 +143,10 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 except TypeError:
                     url = await img_svc.generate_url(prompt)
 
-            await msg.reply_text(url)
+            await msg.reply_text(with_mode_prefix(context, update.effective_user.id, url))
         except Exception as e:
             log.exception("Image generation failed (voice trigger): %s", e)
-            await msg.reply_text(f"❌ Ошибка генерации изображения: {e}")
+            await msg.reply_text(with_mode_prefix(context, update.effective_user.id, f"❌ Ошибка генерации изображения: {e}"))
         return
 
     # Иначе — обычная обработка текста через общий пайплайн
@@ -155,7 +156,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await process_text(update, context, text)
     except Exception as e:
         log.exception("process_text failed after voice: %s", e)
-        await msg.reply_text(f"❌ Ошибка обработки: {e}")
+        await msg.reply_text(with_mode_prefix(context, update.effective_user.id, f"❌ Ошибка обработки: {e}"))
 
 
 def register(app: Application) -> None:
