@@ -2,16 +2,24 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-import tiktoken
-
 
 def split_by_tokens(text: str, max_tokens: int, model: str = "gpt-4o-mini") -> list[str]:
+    """Best-effort splitter that does NOT require optional deps.
+
+    We *try* to use `tiktoken` if installed. If it isn't available (e.g., minimal Railway image),
+    we fall back to a rough character-based split.
+    """
     try:
+        import tiktoken  # optional
+
         enc = tiktoken.get_encoding("cl100k_base")
-        tokens = enc.encode(text)
-        return [enc.decode(tokens[i:i+max_tokens]) for i in range(0, len(tokens), max_tokens)]
+        tokens = enc.encode(text or "")
+        return [enc.decode(tokens[i : i + max_tokens]) for i in range(0, len(tokens), max_tokens)]
     except Exception:
-        return [text[i:i + max_tokens * 4] for i in range(0, len(text), max_tokens * 4)]
+        # Fallback: 1 token ~ 4 chars (very rough), but safe and dependency-free.
+        s = text or ""
+        step = max(1, int(max_tokens) * 4)
+        return [s[i : i + step] for i in range(0, len(s), step)]
 
 
 def with_mode_prefix(context: Any, user_id: Optional[int], text: str) -> str:
