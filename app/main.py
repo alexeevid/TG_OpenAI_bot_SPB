@@ -14,6 +14,7 @@ from .db.session import make_session_factory, reset_schema, ensure_schema
 from .db.repo_dialogs import DialogsRepo
 from .db.repo_dialog_kb import DialogKBRepo
 from .db.repo_kb import KBRepo
+from .db.repo_access import AccessRepo
 
 from .kb.embedder import Embedder
 from .kb.retriever import Retriever
@@ -45,6 +46,7 @@ from .handlers import (
     kb_ui,
     web,
     files,
+    access,
 )
 
 log = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ async def _post_init(app: Application) -> None:
                 ("mode", "Режим ответов"),
                 ("dialogs", "Диалоги"),
                 ("web", "Веб-поиск"),
+                ("access", "Доступы (админ)"),
             ]
         )
     except Exception:
@@ -113,6 +116,7 @@ def build_application() -> Application:
     repo_dialogs = DialogsRepo(sf)
     repo_kb = KBRepo(sf, dim=EMBEDDING_DIM)
     repo_dialog_kb = DialogKBRepo(sf)
+    repo_access = AccessRepo(sf)
 
     # --- KB / RAG ---
     embedder = Embedder(cfg, openai)
@@ -137,7 +141,9 @@ def build_application() -> Application:
 
     voice_service = VoiceService(openai, cfg)
     image_service = ImageService(cfg.openai_api_key, cfg.openai_image_model)
-    authz_service = AuthzService(cfg)
+
+    # ✅ важное: передаём repo_access, и админ всегда allowed
+    authz_service = AuthzService(cfg, repo_access=repo_access)
 
     search_service = SearchService(web_client, enabled=cfg.enable_web_search)
 
@@ -155,6 +161,7 @@ def build_application() -> Application:
             "repo_dialogs": repo_dialogs,
             "repo_kb": repo_kb,
             "repo_dialog_kb": repo_dialog_kb,
+            "repo_access": repo_access,
             "kb_syncer": syncer,
             "svc_syncer": syncer,
             "svc_dialog": dialog_service,
@@ -171,6 +178,10 @@ def build_application() -> Application:
 
     start.register(app)
     help.register(app)
+
+    # ✅ доступы — лучше пораньше, но после help тоже ок
+    access.register(app)
+
     dialogs.register(app)
     model.register(app)
     mode.register(app)
