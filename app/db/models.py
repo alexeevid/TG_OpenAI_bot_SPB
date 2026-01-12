@@ -168,3 +168,24 @@ class DialogKBSecret(Base):
 
     dialog = relationship("Dialog", back_populates="kb_secrets")
     document = relationship("KBDocument")
+
+class AccessEntry(Base):
+    """
+    Динамический ACL (управляется через /access).
+    Если в таблице есть хотя бы 1 запись => DB-режим доступа активен.
+    """
+
+    __tablename__ = "access_entries"
+
+    id = Column(Integer, primary_key=True)
+
+    # tg_id храним как строку (как и в users.tg_id), чтобы избежать разнобоя
+    tg_id = Column(String, unique=True, index=True, nullable=False)
+
+    is_allowed = Column(Boolean, nullable=False, default=True)
+    is_admin = Column(Boolean, nullable=False, default=False)
+
+    note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
