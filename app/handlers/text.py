@@ -80,6 +80,7 @@ def _format_kb_context(results: List[RetrievedChunk]) -> str:
 
 
 async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     msg = update.effective_message
     if not msg or not update.effective_user:
         return
