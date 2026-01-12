@@ -4,7 +4,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from ..services.authz_service import AuthzService
 
 HELP_TEXT = (
-    "📌 *Доступные команды:*\n"
+    "*Можно, но не всем:*\n"
     "/start — начать работу\n"
     "/help — справка по командам\n"
     "/reset — начать новый диалог\n"
