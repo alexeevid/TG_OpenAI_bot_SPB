@@ -1,7 +1,7 @@
 # app/services/dialog_service.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal
 
 from ..db.repo_dialogs import DialogsRepo
 from ..db.models import Dialog, Message
@@ -179,24 +179,33 @@ class DialogService:
     def add_dialog_asset(self, tg_user_id: str | int, asset: Dict[str, Any], *, keep_last: int = 5) -> Dict[str, Any]:
         """
         Сохраняет краткое описание вложения (фото/файл/и т.п.) в dialog.settings["context_assets"].
-        Храним только последние keep_last.
+        Храним только последние keep_last элементов.
         """
-        d = self.get_active_dialog(tg_user_id)
-        s = self.get_active_settings(tg_user_id) or {}
+        s: Dict[str, Any] = self.get_active_settings(tg_user_id) or {}
 
         items = s.get("context_assets")
         if not isinstance(items, list):
             items = []
 
-        items.append(asset)
+        # нормализуем и не кладём мусор
+        a = asset if isinstance(asset, dict) else {}
+        if not a:
+            return s
+
+        items.append(a)
         if len(items) > keep_last:
             items = items[-keep_last:]
 
-        updated = self.update_active_settings(tg_user_id, {"context_assets": items})
-        return updated.settings if isinstance(updated.settings, dict) else {"context_assets": items}
+        d2 = self.update_active_settings(tg_user_id, {"context_assets": items})
+        if isinstance(d2.settings, dict):
+            return d2.settings
+        # fallback
+        s2 = dict(s)
+        s2["context_assets"] = items
+        return s2
 
     def get_dialog_assets(self, tg_user_id: str | int) -> List[Dict[str, Any]]:
-        s = self.get_active_settings(tg_user_id) or {}
+        s: Dict[str, Any] = self.get_active_settings(tg_user_id) or {}
         items = s.get("context_assets")
         if isinstance(items, list):
             return [x for x in items if isinstance(x, dict)]
