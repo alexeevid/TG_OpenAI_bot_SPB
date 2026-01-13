@@ -47,7 +47,6 @@ from .handlers import (
     web,
     files,
     access,
-    access_ui,
 )
 
 log = logging.getLogger(__name__)
@@ -68,7 +67,6 @@ async def _post_init(app: Application) -> None:
                 ("mode", "Режим ответов"),
                 ("dialogs", "Диалоги"),
                 ("web", "Веб-поиск"),
-                ("users", "Доступы (inline, админ)"),
                 ("access", "Доступы (команды, админ)"),
             ]
         )
