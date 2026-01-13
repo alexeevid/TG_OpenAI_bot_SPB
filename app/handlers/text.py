@@ -78,6 +78,36 @@ def _format_kb_context(results: List[RetrievedChunk]) -> str:
         parts.append(hdr + "\n" + text.strip())
     return "\n\n".join(parts)
 
+def _format_assets_context(assets: List[Dict[str, Any]]) -> str:
+    if not assets:
+        return ""
+
+    parts: List[str] = []
+    for i, a in enumerate(assets[-5:], start=1):
+        atype = a.get("type") or "asset"
+        kind = a.get("kind") or ""
+        fn = a.get("filename") or ""
+        cap = (a.get("caption") or "").strip()
+        desc = (a.get("description") or "").strip()
+        txt = (a.get("text_excerpt") or "").strip()
+
+        hdr = f"{i}) {atype}"
+        if kind:
+            hdr += f" kind={kind}"
+        if fn:
+            hdr += f" file={fn}"
+        parts.append(hdr)
+
+        if cap:
+            parts.append(f"CAPTION: {cap}")
+        if desc:
+            parts.append(f"DESCRIPTION:\n{desc}")
+        if txt:
+            parts.append(f"EXTRACTED_TEXT:\n{txt}")
+
+        parts.append("---")
+
+    return "\n".join(parts).strip()
 
 async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -110,7 +140,27 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
     mode = str(settings.get("mode") or "professional")
     sys = build_system_prompt(mode)
+    # --- MULTIMODAL CONTEXT (assets from this dialog) ---
+    assets = []
+    try:
+        assets_raw = settings.get("context_assets")
+        if isinstance(assets_raw, list):
+            assets = [x for x in assets_raw if isinstance(x, dict)]
+    except Exception:
+        assets = []
 
+    if assets:
+        assets_ctx = _format_assets_context(assets)
+        if assets_ctx:
+            sys = (
+                sys
+                + "\n\n"
+                + "КОНТЕКСТ ДИАЛОГА (вложения, присланные ранее):\n"
+                  "Используй эти материалы при ответе. НЕ говори, что ты не видишь прошлые изображения/файлы — "
+                  "ориентируйся на извлечённый текст/описание ниже.\n\n"
+                + assets_ctx
+            )
+    
     results: List[RetrievedChunk] = []
     kb_min_score = float(getattr(cfg, "kb_min_score", 0.35))
     kb_top_k = int(getattr(cfg, "max_kb_chunks", 6))
