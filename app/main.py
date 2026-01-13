@@ -46,7 +46,7 @@ from .handlers import (
     kb_ui,
     web,
     files,
-    access,
+    access,   # ✅ только /access
 )
 
 log = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ async def _post_init(app: Application) -> None:
                 ("mode", "Режим ответов"),
                 ("dialogs", "Диалоги"),
                 ("web", "Веб-поиск"),
-                ("access", "Доступы (команды, админ)"),
+                ("access", "Управление доступами (admin)"),
             ]
         )
     except Exception:
@@ -142,7 +142,7 @@ def build_application() -> Application:
     voice_service = VoiceService(openai, cfg)
     image_service = ImageService(cfg.openai_api_key, cfg.openai_image_model)
 
-    # ✅ authz теперь умеет DB ACL + админ всегда allowed
+    # ✅ authz: DB ACL + админ всегда allowed
     authz_service = AuthzService(cfg, repo_access=repo_access)
 
     search_service = SearchService(web_client, enabled=cfg.enable_web_search)
@@ -178,11 +178,9 @@ def build_application() -> Application:
 
     start.register(app)
     help.register(app)
-    
-    # 🔐 командный доступ (/access)
-    access.register(app) 
-    # ✅ inline доступы: регистрируем пораньше
-    access_ui.register(app)
+
+    # 🔐 единая команда доступа: /access (inline + команды)
+    access.register(app)
 
     dialogs.register(app)
     model.register(app)
