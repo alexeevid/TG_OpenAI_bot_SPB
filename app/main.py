@@ -46,6 +46,7 @@ from .handlers import (
     kb_ui,
     web,
     files,
+    access,
     access_ui,
 )
 
@@ -68,6 +69,7 @@ async def _post_init(app: Application) -> None:
                 ("dialogs", "Диалоги"),
                 ("web", "Веб-поиск"),
                 ("users", "Доступы (inline, админ)"),
+                ("access", "Доступы (команды, админ)"),
             ]
         )
     except Exception:
@@ -178,7 +180,9 @@ def build_application() -> Application:
 
     start.register(app)
     help.register(app)
-
+    
+    # 🔐 командный доступ (/access)
+    access.register(app) 
     # ✅ inline доступы: регистрируем пораньше
     access_ui.register(app)
 
