@@ -174,3 +174,30 @@ class DialogService:
     def history(self, dialog_id: int, limit: int = 30) -> List[Message]:
         repo = self._ensure_repo()
         return repo.list_messages(dialog_id, limit=limit)
+
+    # -------- multimodal context (assets) --------
+    def add_dialog_asset(self, tg_user_id: str | int, asset: Dict[str, Any], *, keep_last: int = 5) -> Dict[str, Any]:
+        """
+        Сохраняет краткое описание вложения (фото/файл/и т.п.) в dialog.settings["context_assets"].
+        Храним только последние keep_last.
+        """
+        d = self.get_active_dialog(tg_user_id)
+        s = self.get_active_settings(tg_user_id) or {}
+
+        items = s.get("context_assets")
+        if not isinstance(items, list):
+            items = []
+
+        items.append(asset)
+        if len(items) > keep_last:
+            items = items[-keep_last:]
+
+        updated = self.update_active_settings(tg_user_id, {"context_assets": items})
+        return updated.settings if isinstance(updated.settings, dict) else {"context_assets": items}
+
+    def get_dialog_assets(self, tg_user_id: str | int) -> List[Dict[str, Any]]:
+        s = self.get_active_settings(tg_user_id) or {}
+        items = s.get("context_assets")
+        if isinstance(items, list):
+            return [x for x in items if isinstance(x, dict)]
+        return []
