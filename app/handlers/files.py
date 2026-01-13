@@ -8,6 +8,8 @@ from typing import Dict, List
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+from ..services.dialog_service import DialogService
+
 from ..services.authz_service import AuthzService
 from ..services.document_service import DocumentService
 from .text import process_text
@@ -84,6 +86,29 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         caption = (msg.caption or "").strip()
         res = svc.extract_text(local, filename="photo.jpg", mime="image/jpeg")
+        ds: DialogService | None = context.bot_data.get("svc_dialog")
+        if ds:
+            try:
+                # сохраняем “суть” картинки в контекст диалога (не сам файл)
+                asset_text = (res.text or "").strip()
+                asset_desc = (res.description or "").strip()
+
+                ds.add_dialog_asset(
+                    update.effective_user.id,
+                    {
+                        "type": "photo",
+                        "kind": res.kind,
+                        "source": "telegram",
+                        "filename": "photo.jpg",
+                        "caption": (msg.caption or "").strip(),
+                        "text_excerpt": asset_text[:6000],
+                        "description": asset_desc[:2000],
+                    },
+                    keep_last=5,
+                )
+            except Exception:
+                pass
+
 
         # --- выбор инструкции ---
         if caption:
@@ -150,6 +175,28 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         caption = (msg.caption or "").strip()
         res = svc.extract_text(local, filename=filename, mime=mime)
+        ds: DialogService | None = context.bot_data.get("svc_dialog")
+        if ds:
+            try:
+                asset_text = (res.text or "").strip()
+                asset_desc = (res.description or "").strip()
+
+                ds.add_dialog_asset(
+                    update.effective_user.id,
+                    {
+                        "type": "document",
+                        "kind": res.kind,
+                        "source": "telegram",
+                        "filename": filename,
+                        "mime": mime or "",
+                        "caption": (msg.caption or "").strip(),
+                        "text_excerpt": asset_text[:8000],
+                        "description": asset_desc[:2000],
+                    },
+                    keep_last=5,
+                )
+            except Exception:
+                pass
 
         instruction = caption or _default_instruction_for_document()
 
