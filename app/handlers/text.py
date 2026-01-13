@@ -78,39 +78,44 @@ def _format_kb_context(results: List[RetrievedChunk]) -> str:
         parts.append(hdr + "\n" + text.strip())
     return "\n\n".join(parts)
 
+
 def _format_assets_context(assets: List[Dict[str, Any]]) -> str:
+    """Сериализует сохранённые вложения диалога в читаемый контекст для system prompt."""
     if not assets:
         return ""
 
     parts: List[str] = []
     for i, a in enumerate(assets[-5:], start=1):
-        atype = a.get("type") or "asset"
-        kind = a.get("kind") or ""
-        fn = a.get("filename") or ""
-        cap = (a.get("caption") or "").strip()
-        desc = (a.get("description") or "").strip()
-        txt = (a.get("text_excerpt") or "").strip()
+        atype = str(a.get("type") or "asset").strip()
+        kind = str(a.get("kind") or "").strip()
+        fn = str(a.get("filename") or "").strip()
+        mime = str(a.get("mime") or "").strip()
+        cap = str(a.get("caption") or "").strip()
+        desc = str(a.get("description") or "").strip()
+        txt = str(a.get("text_excerpt") or "").strip()
 
         hdr = f"{i}) {atype}"
         if kind:
             hdr += f" kind={kind}"
         if fn:
             hdr += f" file={fn}"
+        if mime and atype == "document":
+            hdr += f" mime={mime}"
         parts.append(hdr)
 
         if cap:
             parts.append(f"CAPTION: {cap}")
         if desc:
-            parts.append(f"DESCRIPTION:\n{desc}")
+            parts.append("DESCRIPTION:\n" + desc)
         if txt:
-            parts.append(f"EXTRACTED_TEXT:\n{txt}")
+            parts.append("EXTRACTED_TEXT:\n" + txt)
 
         parts.append("---")
 
     return "\n".join(parts).strip()
 
+
 async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     msg = update.effective_message
     if not msg or not update.effective_user:
         return
@@ -140,12 +145,13 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
     mode = str(settings.get("mode") or "professional")
     sys = build_system_prompt(mode)
+
     # --- MULTIMODAL CONTEXT (assets from this dialog) ---
-    assets = []
+    assets: List[Dict[str, Any]] = []
     try:
-        assets_raw = settings.get("context_assets")
-        if isinstance(assets_raw, list):
-            assets = [x for x in assets_raw if isinstance(x, dict)]
+        raw_assets = settings.get("context_assets")
+        if isinstance(raw_assets, list):
+            assets = [a for a in raw_assets if isinstance(a, dict)]
     except Exception:
         assets = []
 
@@ -156,11 +162,10 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
                 sys
                 + "\n\n"
                 + "КОНТЕКСТ ДИАЛОГА (вложения, присланные ранее):\n"
-                  "Используй эти материалы при ответе. НЕ говори, что ты не видишь прошлые изображения/файлы — "
-                  "ориентируйся на извлечённый текст/описание ниже.\n\n"
+                  "Используй эти материалы при ответе. Ориентируйся на извлечённый текст/описание ниже.\n\n"
                 + assets_ctx
             )
-    
+
     results: List[RetrievedChunk] = []
     kb_min_score = float(getattr(cfg, "kb_min_score", 0.35))
     kb_top_k = int(getattr(cfg, "max_kb_chunks", 6))
