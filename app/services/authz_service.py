@@ -37,7 +37,21 @@ class AuthzService:
         self.repo_access = repo_access
 
     def is_admin(self, user_id: int) -> bool:
-        return str(user_id) in self.admins
+        uid = str(user_id)
+
+        # 1) ENV админы
+        if uid in self.admins:
+            return True
+
+        # 2) DB админы (если repo_access подключён)
+        if self.repo_access:
+            try:
+                entry = self.repo_access.get(user_id)
+                return bool(entry and getattr(entry, "is_admin", False))
+            except Exception:
+                pass
+
+        return False
 
     def _db_mode_enabled(self) -> bool:
         if not self.repo_access:
