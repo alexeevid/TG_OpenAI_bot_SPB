@@ -35,13 +35,11 @@ class AccessRepo:
                 .first()
             )
 
-    def list(self) -> List[AccessRow]:
+    def list(self, limit: int = 200) -> List[AccessRow]:
         with self.sf() as s:  # type: Session
-            rows = (
-                s.execute(select(AccessEntry).order_by(AccessEntry.id.asc()))
-                .scalars()
-                .all()
-            )
+            q = select(AccessEntry).order_by(AccessEntry.id.asc()).limit(int(limit))
+            rows = s.execute(q).scalars().all()
+
             out: List[AccessRow] = []
             for r in rows:
                 out.append(
@@ -53,6 +51,7 @@ class AccessRepo:
                     )
                 )
             return out
+
 
     def upsert(self, tg_id: int, *, allow: bool, admin: bool = False, note: str = "") -> AccessEntry:
         tid = str(tg_id)
