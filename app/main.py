@@ -46,7 +46,7 @@ from .handlers import (
     kb_ui,
     web,
     files,
-    access,
+    access_ui,
 )
 
 log = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ async def _post_init(app: Application) -> None:
                 ("mode", "Режим ответов"),
                 ("dialogs", "Диалоги"),
                 ("web", "Веб-поиск"),
-                ("access", "Доступы (админ)"),
+                ("users", "Доступы (inline, админ)"),
             ]
         )
     except Exception:
@@ -142,12 +142,12 @@ def build_application() -> Application:
     voice_service = VoiceService(openai, cfg)
     image_service = ImageService(cfg.openai_api_key, cfg.openai_image_model)
 
-    # ✅ важное: передаём repo_access, и админ всегда allowed
+    # ✅ authz теперь умеет DB ACL + админ всегда allowed
     authz_service = AuthzService(cfg, repo_access=repo_access)
 
     search_service = SearchService(web_client, enabled=cfg.enable_web_search)
 
-    # --- documents (3.1–3.5) ---
+    # --- documents ---
     document_service = DocumentService(openai, cfg)
 
     app = Application.builder().token(cfg.telegram_bot_token).post_init(_post_init).build()
@@ -179,8 +179,8 @@ def build_application() -> Application:
     start.register(app)
     help.register(app)
 
-    # ✅ доступы — лучше пораньше, но после help тоже ок
-    access.register(app)
+    # ✅ inline доступы: регистрируем пораньше
+    access_ui.register(app)
 
     dialogs.register(app)
     model.register(app)
