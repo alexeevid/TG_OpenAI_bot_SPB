@@ -227,13 +227,14 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     except Exception as e:
         log.warning("Failed to sync used text model to dialog settings: %s", e)
 
+    # --- FIX: корректно сохраняем историю в БД через DialogService ---
     try:
-        ds.add_message(d.id, role="user", content=text)
+        ds.add_user_message(d.id, text)
     except Exception:
         pass
 
     try:
-        ds.add_message(d.id, role="assistant", content=answer or "")
+        ds.add_assistant_message(d.id, answer or "")
     except Exception:
         pass
 
