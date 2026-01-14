@@ -153,17 +153,16 @@ async def _send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     az = context.bot_data.get("svc_authz")
     uid = update.effective_user.id if update.effective_user else None
-    await update.effective_message.reply_text(
-        f"DEBUG /access: uid={uid}, has_authz={bool(az)}, is_admin={az.is_admin(uid) if (az and uid) else None}"
+
+    log.debug(
+        "DEBUG /access: uid=%s, has_authz=%s, is_admin=%s",
+        uid,
+        bool(az),
+        az.is_admin(uid) if (az and uid) else None,
     )
 
     if not _is_admin(update, context):
         await update.effective_message.reply_text("⛔ Доступ запрещен.")
-        return ConversationHandler.END
-
-    repo = _repo(context)
-    if not repo:
-        await update.effective_message.reply_text("⚠️ repo_access не подключен (проверь main.py).")
         return ConversationHandler.END
 
     # --- CLI режим ---
