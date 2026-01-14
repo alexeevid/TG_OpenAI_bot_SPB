@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 
 from ..db.repo_access import AccessRepo
+from ..settings import get_settings
 
 # Conversation states
 MENU, WAIT_ALLOW_MASS, WAIT_BLOCK_MASS, WAIT_DELETE_MASS, WAIT_ADMIN_ONE, WAIT_UNADMIN_ONE = range(6)
