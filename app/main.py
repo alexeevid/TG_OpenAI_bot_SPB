@@ -85,6 +85,12 @@ def _setup_logging(cfg) -> None:
 
 def build_application() -> Application:
     cfg = load_settings()
+    import os
+    log = logging.getLogger(__name__)
+    log.warning("AUTHZ DEBUG: ADMIN_USER_IDS env raw=%r", os.getenv("ADMIN_USER_IDS"))
+    log.warning("AUTHZ DEBUG: cfg.admin_user_ids=%r", getattr(cfg, "admin_user_ids", None))
+    log.warning("AUTHZ DEBUG: cfg.allowed_user_ids=%r", getattr(cfg, "allowed_user_ids", None))
+
     _setup_logging(cfg)
 
     log.info(
