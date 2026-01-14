@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ApplicationHandlerStop
 
 from ..services.dialog_service import DialogService
 
@@ -41,24 +41,6 @@ def _safe_model(openai, *, model: Optional[str], kind: str, fallback: str) -> st
         return openai.ensure_model_available(model=model, kind=kind, fallback=fallback)
     except Exception:
         return model or fallback
-
-
-def _append_context_asset(settings: Dict[str, Any], asset: Dict[str, Any], *, keep_last: int = 5) -> List[Dict[str, Any]]:
-    """
-    Добавляет asset в settings['context_assets'] (список dict), возвращает обновлённый список.
-    Никогда не бросает исключений наружу.
-    """
-    raw = settings.get("context_assets")
-    assets: List[Dict[str, Any]] = []
-    if isinstance(raw, list):
-        assets = [a for a in raw if isinstance(a, dict)]
-
-    assets.append(asset)
-    if keep_last and len(assets) > keep_last:
-        assets = assets[-keep_last:]
-
-    settings["context_assets"] = assets
-    return assets
 
 
 async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
@@ -140,22 +122,19 @@ async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 pass
 
-            # 2) context_assets (чтобы text.py добавлял в system prompt)
+            # 2) Asset (единый механизм через DialogService)
             try:
-                settings = ds.get_active_settings(update.effective_user.id) or {}
-                asset = {
-                    "type": "generated_image",
-                    "kind": "openai",
-                    "filename": "",
-                    "mime": "image/*",
-                    "caption": prompt,
-                    "description": "",
-                    "text_excerpt": "",
-                    "url": url,
-                    "model": image_model,
-                }
-                assets = _append_context_asset(settings, asset, keep_last=5)
-                ds.update_active_settings(update.effective_user.id, {"context_assets": assets})
+                ds.add_dialog_asset(
+                    update.effective_user.id,
+                    {
+                        "type": "generated_image",
+                        "kind": "openai",
+                        "caption": prompt,
+                        "url": url,
+                        "model": image_model,
+                    },
+                    keep_last=5,
+                )
             except Exception:
                 pass
 
@@ -189,7 +168,10 @@ async def on_draw_text_trigger(update: Update, context: ContextTypes.DEFAULT_TYP
     prompt = _extract_draw_prompt(text)
     if not prompt:
         return
+
     await _generate_and_reply(update, context, prompt)
+    # ВАЖНО: останавливаем дальнейшие обработчики (иначе text.py тоже ответит на это сообщение)
+    raise ApplicationHandlerStop
 
 
 def register(app: Application) -> None:
