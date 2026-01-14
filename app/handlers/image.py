@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -41,6 +41,24 @@ def _safe_model(openai, *, model: Optional[str], kind: str, fallback: str) -> st
         return openai.ensure_model_available(model=model, kind=kind, fallback=fallback)
     except Exception:
         return model or fallback
+
+
+def _append_context_asset(settings: Dict[str, Any], asset: Dict[str, Any], *, keep_last: int = 5) -> List[Dict[str, Any]]:
+    """
+    Добавляет asset в settings['context_assets'] (список dict), возвращает обновлённый список.
+    Никогда не бросает исключений наружу.
+    """
+    raw = settings.get("context_assets")
+    assets: List[Dict[str, Any]] = []
+    if isinstance(raw, list):
+        assets = [a for a in raw if isinstance(a, dict)]
+
+    assets.append(asset)
+    if keep_last and len(assets) > keep_last:
+        assets = assets[-keep_last:]
+
+    settings["context_assets"] = assets
+    return assets
 
 
 async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
@@ -102,6 +120,45 @@ async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
                 url = await img_svc.generate_url(prompt)
 
         await msg.reply_text(url)
+
+        # --- MULTIMODAL CONTEXT: сохраняем шаг в историю и в context_assets ---
+        if ds:
+            try:
+                d = ds.ensure_active_dialog(update.effective_user.id)
+            except Exception:
+                d = None
+
+            # 1) История (чтобы диалог не "обнулялся")
+            try:
+                if d:
+                    ds.add_user_message(d.id, f"НАРИСУЙ: {prompt}")
+            except Exception:
+                pass
+            try:
+                if d:
+                    ds.add_assistant_message(d.id, url or "")
+            except Exception:
+                pass
+
+            # 2) context_assets (чтобы text.py добавлял в system prompt)
+            try:
+                settings = ds.get_active_settings(update.effective_user.id) or {}
+                asset = {
+                    "type": "generated_image",
+                    "kind": "openai",
+                    "filename": "",
+                    "mime": "image/*",
+                    "caption": prompt,
+                    "description": "",
+                    "text_excerpt": "",
+                    "url": url,
+                    "model": image_model,
+                }
+                assets = _append_context_asset(settings, asset, keep_last=5)
+                ds.update_active_settings(update.effective_user.id, {"context_assets": assets})
+            except Exception:
+                pass
+
     except Exception as e:
         log.exception("Image generation failed: %s", e)
         await msg.reply_text(f"❌ Ошибка генерации изображения: {e}")
