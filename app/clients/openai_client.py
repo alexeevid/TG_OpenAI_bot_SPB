@@ -285,7 +285,17 @@ class OpenAIClient:
             raise RuntimeError("No image URL in response")
         return str(url)
 
-
+    def generate_image_url(self, *, prompt: str, model: str, size: str = "1024x1024") -> str:
+        r = self.client.images.generate(model=model, prompt=prompt, size=size)
+        data = getattr(r, "data", None) or []
+        if not data:
+            raise RuntimeError("Empty image response")
+        first = data[0]
+        url = getattr(first, "url", None)
+        if not url:
+            raise RuntimeError("No image URL in response")
+        return str(url)
+    
     # -------- audio transcription --------
     def transcribe_file(self, file_obj, model: str = "whisper-1") -> str:
         """
