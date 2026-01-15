@@ -1,3 +1,4 @@
+# app/handlers/access.py
 from __future__ import annotations
 
 import logging
@@ -8,6 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -87,6 +89,7 @@ def _extract_ids_from_text(update: Update, text: str) -> List[int]:
         except Exception:
             pass
 
+    # uniq preserve order
     seen = set()
     out: List[int] = []
     for x in ids:
@@ -156,7 +159,6 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("repo_access не подключен (проверь bootstrap/main).")
         return
 
-    # лог видимый в проде — по нему мы точно понимаем, что /access дошёл
     try:
         uid = update.effective_user.id if update.effective_user else None
         log.warning("ACCESS_CMD hit: uid=%s", uid)
@@ -289,25 +291,28 @@ async def on_access_menu_click(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def on_access_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    ВАЖНО: этот handler block=False. Он не мешает общему text.py.
-    Но если мы в access_state != None — он отрабатывает и фактически “забирает” сообщение.
+    ВАЖНО: handler registered with block=False, so we MUST raise ApplicationHandlerStop
+    when we actually handled a message, to prevent double replies from text.py.
     """
     state = _get_state(context)
     if not state:
-        return  # не в режиме access — пропускаем
+        return  # not in access flow
 
     repo = _repo(context)
     if not repo or not _is_admin(update, context):
         _set_state(context, ST_NONE)
-        return
+        raise ApplicationHandlerStop
 
     await _typing(update, context)
 
     text = update.effective_message.text or ""
     ids = _extract_ids_from_text(update, text)
     if not ids:
-        await update.effective_message.reply_text("Не вижу tg_id. Пришли числа (5+ цифр) или reply.", reply_markup=_kbd_menu())
-        return
+        await update.effective_message.reply_text(
+            "Не вижу tg_id. Пришли числа (5+ цифр) или reply.",
+            reply_markup=_kbd_menu(),
+        )
+        raise ApplicationHandlerStop
 
     if state in (ST_ALLOW_MASS, ST_BLOCK_MASS, ST_DELETE_MASS):
         ok = 0
@@ -324,7 +329,7 @@ async def on_access_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         _set_state(context, ST_NONE)
         await update.effective_message.reply_text(f"Готово: {ok}/{len(ids)}", reply_markup=_kbd_menu())
-        return
+        raise ApplicationHandlerStop
 
     if state in (ST_ADMIN_ONE, ST_UNADMIN_ONE):
         target = ids[0]
@@ -335,14 +340,17 @@ async def on_access_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception:
             _set_state(context, ST_NONE)
             await update.effective_message.reply_text("Не удалось выполнить операцию.", reply_markup=_kbd_menu())
-        return
+        raise ApplicationHandlerStop
+
+    # unknown state -> reset and stop
+    _set_state(context, ST_NONE)
+    raise ApplicationHandlerStop
 
 
 def register(app: Application) -> None:
-    # жёсткий приоритет
+    # Hard priority so /access is never swallowed by other flows
     app.add_handler(CommandHandler("access", cmd_access), group=-10)
     app.add_handler(CallbackQueryHandler(on_access_menu_click, pattern=rf"^{CB_NS}:"), group=-10)
 
-    # ВАЖНО: block=False — не ломаем обычные текстовые ответы.
-    # Но если включён access_state, мы обрабатываем сообщение.
+    # block=False (do not break normal chat), but we stop processing when active
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_access_text, block=False), group=-10)
