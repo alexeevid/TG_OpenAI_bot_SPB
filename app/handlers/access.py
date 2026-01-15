@@ -379,18 +379,40 @@ def register(app: Application) -> None:
         entry_points=[CommandHandler("access", cmd_access)],
         states={
             MENU: [CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:")],
-            WAIT_ALLOW_MASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_allow_mass)],
-            WAIT_BLOCK_MASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_block_mass)],
-            WAIT_DELETE_MASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_delete_mass)],
-            WAIT_ADMIN_ONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_admin_one)],
-            WAIT_UNADMIN_ONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_unadmin_one)],
+
+            # ВАЖНО: в каждом WAIT_* добавляем CallbackQueryHandler,
+            # чтобы кнопки работали даже пока ждём tg_id
+            WAIT_ALLOW_MASS: [
+                CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_allow_mass),
+            ],
+            WAIT_BLOCK_MASS: [
+                CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_block_mass),
+            ],
+            WAIT_DELETE_MASS: [
+                CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_delete_mass),
+            ],
+            WAIT_ADMIN_ONE: [
+                CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_admin_one),
+            ],
+            WAIT_UNADMIN_ONE: [
+                CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, on_unadmin_one),
+            ],
         },
         fallbacks=[CommandHandler("access", cmd_access)],
         name="access",
         persistent=False,
         per_user=True,
         per_chat=True,
-        per_message=False,
+
+        # КЛЮЧЕВОЕ: для callback_query внутри ConversationHandler нужно per_message=True
+        per_message=True,
+
         allow_reentry=True,
     )
     app.add_handler(conv)
+
