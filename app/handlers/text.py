@@ -269,4 +269,4 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def register(app: Application) -> None:
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=10)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=50)
