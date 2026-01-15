@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from ..services.authz_service import AuthzService
 
-BASE_HELP = (
+HELP_TEXT = (
     "Доступные команды:\n"
     "/start — начать работу\n"
     "/help — справка по командам\n"
@@ -19,23 +21,25 @@ BASE_HELP = (
     "/feedback <текст> — оставить отзыв\n"
 )
 
-ADMIN_HELP = (
+ADMIN_TEXT = (
     "\nАдмин-команды:\n"
     "/access — управление доступом (allow/block/admin/list)\n"
     "/update — синхронизировать базу знаний\n"
 )
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    az: AuthzService = context.bot_data.get("svc_authz")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    az: AuthzService | None = context.application.bot_data.get("svc_authz") or context.bot_data.get("svc_authz")
     if az and update.effective_user and not az.is_allowed(update.effective_user.id):
-        await update.message.reply_text("Доступ запрещен.")
+        await update.effective_message.reply_text("Доступ запрещен.")
         return
 
-    text = BASE_HELP
+    text = HELP_TEXT
     if az and update.effective_user and az.is_admin(update.effective_user.id):
-        text += ADMIN_HELP
+        text += ADMIN_TEXT
 
-    await update.message.reply_text(text)  # без Markdown
+    await update.effective_message.reply_text(text)
+
 
 def register(app: Application) -> None:
     app.add_handler(CommandHandler("help", cmd_help))
