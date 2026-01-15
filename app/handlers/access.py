@@ -18,12 +18,13 @@ from telegram.ext import (
 )
 
 from ..db.repo_access import AccessRepo
+from ..services.dialog_service import DialogService
 
 log = logging.getLogger(__name__)
 
 CB_NS = "acc"
 
-# access ui states (stored in chat_data)
+# access ui states (persisted in DB via DialogService active_settings)
 ST_NONE = None
 ST_ALLOW_MASS = "allow_mass"
 ST_BLOCK_MASS = "block_mass"
@@ -36,18 +37,49 @@ def _repo(context: ContextTypes.DEFAULT_TYPE) -> Optional[AccessRepo]:
     return context.application.bot_data.get("repo_access") or context.bot_data.get("repo_access")
 
 
+def _ds(context: ContextTypes.DEFAULT_TYPE) -> Optional[DialogService]:
+    return context.application.bot_data.get("svc_dialog") or context.bot_data.get("svc_dialog")
+
+
+def _uid(update: Update) -> Optional[int]:
+    return update.effective_user.id if update.effective_user else None
+
+
 def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     az = context.application.bot_data.get("svc_authz") or context.bot_data.get("svc_authz")
-    uid = update.effective_user.id if update.effective_user else None
+    uid = _uid(update)
     return bool(az and uid is not None and az.is_admin(uid))
 
 
-def _set_state(context: ContextTypes.DEFAULT_TYPE, state: Optional[str]) -> None:
-    context.chat_data["access_state"] = state
-
-
-def _get_state(context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+def _get_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    """
+    Read access_state from DB (active dialog settings). Fallback to chat_data if DS missing.
+    """
+    uid = _uid(update)
+    ds = _ds(context)
+    if ds and uid is not None:
+        try:
+            s = ds.get_active_settings(uid) or {}
+            st = s.get("access_state")
+            return str(st) if st else None
+        except Exception:
+            pass
+    # fallback (shouldn't be primary)
     return context.chat_data.get("access_state")
+
+
+def _set_state(update: Update, context: ContextTypes.DEFAULT_TYPE, state: Optional[str]) -> None:
+    """
+    Persist access_state into DB (active dialog settings). Also mirror to chat_data for UX.
+    """
+    uid = _uid(update)
+    ds = _ds(context)
+    if ds and uid is not None:
+        try:
+            ds.update_active_settings(uid, {"access_state": state})
+        except Exception:
+            pass
+    context.chat_data["access_state"] = state
 
 
 def _kbd_menu() -> InlineKeyboardMarkup:
@@ -89,7 +121,6 @@ def _extract_ids_from_text(update: Update, text: str) -> List[int]:
         except Exception:
             pass
 
-    # uniq preserve order
     seen = set()
     out: List[int] = []
     for x in ids:
@@ -159,12 +190,6 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("repo_access не подключен (проверь bootstrap/main).")
         return
 
-    try:
-        uid = update.effective_user.id if update.effective_user else None
-        log.warning("ACCESS_CMD hit: uid=%s", uid)
-    except Exception:
-        pass
-
     if not _is_admin(update, context):
         await update.effective_message.reply_text("Доступ запрещен.")
         return
@@ -217,7 +242,7 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     # UI режим
-    _set_state(context, ST_NONE)
+    _set_state(update, context, ST_NONE)
     await update.effective_message.reply_text("Управление доступами", reply_markup=_kbd_menu())
 
 
@@ -249,58 +274,59 @@ async def on_access_menu_click(update: Update, context: ContextTypes.DEFAULT_TYP
     action = data.split(":", 1)[1].strip()
 
     if action == "list":
-        _set_state(context, ST_NONE)
+        _set_state(update, context, ST_NONE)
         await q.edit_message_text(_format_list(repo), reply_markup=_kbd_menu())
         return
 
     if action == "cancel":
-        _set_state(context, ST_NONE)
+        _set_state(update, context, ST_NONE)
         await q.edit_message_text("Управление доступами", reply_markup=_kbd_menu())
         return
 
     if action == "close":
-        _set_state(context, ST_NONE)
+        _set_state(update, context, ST_NONE)
         await q.edit_message_text("Закрыто.", reply_markup=None)
         return
 
     if action == "allow_mass":
-        _set_state(context, ST_ALLOW_MASS)
+        _set_state(update, context, ST_ALLOW_MASS)
         await q.edit_message_text("Пришли tg_id (списком).", reply_markup=_kbd_menu())
         return
 
     if action == "block_mass":
-        _set_state(context, ST_BLOCK_MASS)
+        _set_state(update, context, ST_BLOCK_MASS)
         await q.edit_message_text("Пришли tg_id (списком).", reply_markup=_kbd_menu())
         return
 
     if action == "delete_mass":
-        _set_state(context, ST_DELETE_MASS)
+        _set_state(update, context, ST_DELETE_MASS)
         await q.edit_message_text("Пришли tg_id (списком).", reply_markup=_kbd_menu())
         return
 
     if action == "admin_one":
-        _set_state(context, ST_ADMIN_ONE)
+        _set_state(update, context, ST_ADMIN_ONE)
         await q.edit_message_text("Пришли tg_id (один) или reply.", reply_markup=_kbd_menu())
         return
 
     if action == "unadmin_one":
-        _set_state(context, ST_UNADMIN_ONE)
+        _set_state(update, context, ST_UNADMIN_ONE)
         await q.edit_message_text("Пришли tg_id (один) или reply.", reply_markup=_kbd_menu())
         return
 
 
 async def on_access_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    ВАЖНО: handler registered with block=False, so we MUST raise ApplicationHandlerStop
+    handler registered with block=False, so we MUST raise ApplicationHandlerStop
     when we actually handled a message, to prevent double replies from text.py.
+    State is persisted in DB to avoid loss between updates.
     """
-    state = _get_state(context)
+    state = _get_state(update, context)
     if not state:
-        return  # not in access flow
+        return  # not in access flow -> let normal text handler work
 
     repo = _repo(context)
     if not repo or not _is_admin(update, context):
-        _set_state(context, ST_NONE)
+        _set_state(update, context, ST_NONE)
         raise ApplicationHandlerStop
 
     await _typing(update, context)
@@ -327,7 +353,7 @@ async def on_access_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
 
-        _set_state(context, ST_NONE)
+        _set_state(update, context, ST_NONE)
         await update.effective_message.reply_text(f"Готово: {ok}/{len(ids)}", reply_markup=_kbd_menu())
         raise ApplicationHandlerStop
 
@@ -335,22 +361,21 @@ async def on_access_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         target = ids[0]
         try:
             repo.upsert(target, allow=True, admin=(state == ST_ADMIN_ONE), note="ui")
-            _set_state(context, ST_NONE)
+            _set_state(update, context, ST_NONE)
             await update.effective_message.reply_text("Готово.", reply_markup=_kbd_menu())
         except Exception:
-            _set_state(context, ST_NONE)
+            _set_state(update, context, ST_NONE)
             await update.effective_message.reply_text("Не удалось выполнить операцию.", reply_markup=_kbd_menu())
         raise ApplicationHandlerStop
 
-    # unknown state -> reset and stop
-    _set_state(context, ST_NONE)
+    _set_state(update, context, ST_NONE)
     raise ApplicationHandlerStop
 
 
 def register(app: Application) -> None:
-    # Hard priority so /access is never swallowed by other flows
+    # High priority so /access is never swallowed by other flows
     app.add_handler(CommandHandler("access", cmd_access), group=-10)
     app.add_handler(CallbackQueryHandler(on_access_menu_click, pattern=rf"^{CB_NS}:"), group=-10)
 
-    # block=False (do not break normal chat), but we stop processing when active
+    # block=False: doesn't break normal chat; we stop via ApplicationHandlerStop when active
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_access_text, block=False), group=-10)
