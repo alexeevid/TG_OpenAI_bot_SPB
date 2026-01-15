@@ -379,9 +379,7 @@ def register(app: Application) -> None:
         entry_points=[CommandHandler("access", cmd_access)],
         states={
             MENU: [CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:")],
-
-            # ВАЖНО: в каждом WAIT_* добавляем CallbackQueryHandler,
-            # чтобы кнопки работали даже пока ждём tg_id
+        
             WAIT_ALLOW_MASS: [
                 CallbackQueryHandler(on_menu_click, pattern=rf"^{CB_NS}:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_allow_mass),
