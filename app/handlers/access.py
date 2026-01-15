@@ -414,5 +414,5 @@ def register(app: Application) -> None:
 
         allow_reentry=True,
     )
-    app.add_handler(conv)
-
+    app.add_handler(conv, group=-10)
+    
