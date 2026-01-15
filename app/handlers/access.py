@@ -23,6 +23,10 @@ MENU, WAIT_ALLOW_MASS, WAIT_BLOCK_MASS, WAIT_DELETE_MASS, WAIT_ADMIN_ONE, WAIT_U
 
 CB_NS = "acc"  # namespace для callback_data
 
+# --- callback patterns (строго, чтобы не перехватывать лишнее) ---
+CB_MENU_PATTERN = rf"^{CB_NS}:(allow_mass|block_mass|delete_mass|admin_one|unadmin_one|list|cancel|close)$"
+CB_NAV_PATTERN = rf"^{CB_NS}:(list|cancel|close)$"
+
 
 def _repo(context: ContextTypes.DEFAULT_TYPE) -> Optional[AccessRepo]:
     return context.bot_data.get("repo_access")
@@ -43,21 +47,42 @@ def _kbd_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("👑 Назначить админом", callback_data=f"{CB_NS}:admin_one"),
-                InlineKeyboardButton("✅ Снять админа", callback_data=f"{CB_NS}:unadmin_one"),
+                InlineKeyboardButton("⬇️ Снять админа", callback_data=f"{CB_NS}:unadmin_one"),
             ],
             [
-                InlineKeyboardButton("🗑 Удалить записи", callback_data=f"{CB_NS}:delete_mass"),
-                InlineKeyboardButton("📋 Показать список", callback_data=f"{CB_NS}:list"),
+                InlineKeyboardButton("🗑 Удалить (массово)", callback_data=f"{CB_NS}:delete_mass"),
             ],
             [
-                InlineKeyboardButton("✖ Закрыть", callback_data=f"{CB_NS}:close"),
+                InlineKeyboardButton("📋 Список", callback_data=f"{CB_NS}:list"),
+                InlineKeyboardButton("❌ Закрыть", callback_data=f"{CB_NS}:close"),
             ],
         ]
     )
 
 
 def _kbd_cancel() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩ Отмена", callback_data=f"{CB_NS}:cancel")]])
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⬅️ Назад", callback_data=f"{CB_NS}:cancel")]]
+    )
+
+
+def _parse_target_id(update: Update, args: List[str]) -> Optional[int]:
+    """Берёт tg_id из аргументов или из reply."""
+    msg = update.effective_message
+    if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+        try:
+            return int(msg.reply_to_message.from_user.id)
+        except Exception:
+            pass
+
+    for a in args:
+        m = re.search(r"\d{5,}", a or "")
+        if m:
+            try:
+                return int(m.group(0))
+            except Exception:
+                continue
+    return None
 
 
 def _extract_ids_from_text(update: Update, text: str) -> List[int]:
@@ -81,40 +106,14 @@ def _extract_ids_from_text(update: Update, text: str) -> List[int]:
         except Exception:
             pass
 
+    # uniq, сохранить порядок
     seen = set()
-    uniq: List[int] = []
+    out: List[int] = []
     for x in ids:
         if x not in seen:
             seen.add(x)
-            uniq.append(x)
-    return uniq
-
-
-def _parse_target_id(update: Update, args: List[str]) -> int | None:
-    """
-    Для CLI режима:
-    /access allow|block|admin|unadmin|delete <tgid> [note]
-    или reply на сообщение пользователя + /access allow ...
-    """
-    msg = update.effective_message
-    if msg and msg.reply_to_message and msg.reply_to_message.from_user:
-        try:
-            return int(msg.reply_to_message.from_user.id)
-        except Exception:
-            return None
-
-    if not args:
-        return None
-
-    # ищем первую "длинную" цифру
-    for a in args:
-        m = re.search(r"\d{5,}", a)
-        if m:
-            try:
-                return int(m.group(0))
-            except Exception:
-                continue
-    return None
+            out.append(x)
+    return out
 
 
 def _format_list(repo: AccessRepo) -> str:
@@ -145,21 +144,25 @@ def _format_list(repo: AccessRepo) -> str:
 
 async def _send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        if update.effective_chat:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     except Exception:
         pass
 
 
 async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    az = context.bot_data.get("svc_authz")
-    uid = update.effective_user.id if update.effective_user else None
+    """
+    /access
+    /access list
+    /access allow|block|admin|unadmin|delete <tgid> [note]
+    или reply на сообщение пользователя + /access allow
+    """
+    await _send_typing(update, context)
 
-    log.debug(
-        "DEBUG /access: uid=%s, has_authz=%s, is_admin=%s",
-        uid,
-        bool(az),
-        az.is_admin(uid) if (az and uid) else None,
-    )
+    repo = _repo(context)
+    if not repo:
+        await update.effective_message.reply_text("⚠️ repo_access не подключен (проверь main.py).")
+        return ConversationHandler.END
 
     if not _is_admin(update, context):
         await update.effective_message.reply_text("⛔ Доступ запрещен.")
@@ -204,15 +207,13 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 return ConversationHandler.END
 
             if sub == "unadmin":
-                cur = repo.get(target)
-                allow = bool(cur.is_allowed) if cur else True
-                repo.upsert(target, allow=allow, admin=False, note=note)
-                await update.effective_message.reply_text(f"✅ Админ снят: {target}")
+                repo.upsert(target, allow=True, admin=False, note=note)
+                await update.effective_message.reply_text(f"⬇️ Снят админ: {target}")
                 return ConversationHandler.END
 
             if sub == "delete":
                 ok = repo.delete(target)
-                await update.effective_message.reply_text(f"🗑 {'Удалено' if ok else 'Не найдено'}: {target}")
+                await update.effective_message.reply_text(("🗑 Удалено: " if ok else "⚠️ Не найдено: ") + str(target))
                 return ConversationHandler.END
 
         await update.effective_message.reply_text(
@@ -252,7 +253,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     data = q.data or ""
-    if not data.startswith(f"{CB_NS}:"):
+    if not re.match(CB_MENU_PATTERN, data):
         return MENU
 
     action = data.split(":", 1)[1].strip()
@@ -269,7 +270,7 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if action == "block_mass":
         await q.edit_message_text(
             "⛔ Блокировка (массово)\n"
-            "Пришли tg_id (можно списком).\n"
+            "Пришли tg_id (можно списком/через пробел/строки).\n"
             "Можно также reply на сообщение пользователя.",
             reply_markup=_kbd_cancel(),
         )
@@ -277,8 +278,9 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     if action == "delete_mass":
         await q.edit_message_text(
-            "🗑 Удаление записей (массово)\n"
-            "Пришли tg_id (можно списком).",
+            "🗑 Удаление (массово)\n"
+            "Пришли tg_id (можно списком/через пробел/строки).\n"
+            "Можно также reply на сообщение пользователя.",
             reply_markup=_kbd_cancel(),
         )
         return WAIT_DELETE_MASS
@@ -286,15 +288,15 @@ async def on_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if action == "admin_one":
         await q.edit_message_text(
             "👑 Назначить админом\n"
-            "Пришли tg_id (одно число) или reply на сообщение пользователя.",
+            "Пришли tg_id (один) или ответь reply на сообщение пользователя.",
             reply_markup=_kbd_cancel(),
         )
         return WAIT_ADMIN_ONE
 
     if action == "unadmin_one":
         await q.edit_message_text(
-            "✅ Снять админа\n"
-            "Пришли tg_id (одно число) или reply на сообщение пользователя.",
+            "⬇️ Снять админа\n"
+            "Пришли tg_id (один) или ответь reply на сообщение пользователя.",
             reply_markup=_kbd_cancel(),
         )
         return WAIT_UNADMIN_ONE
@@ -328,7 +330,7 @@ async def _apply_mass(update: Update, context: ContextTypes.DEFAULT_TYPE, *, all
     ids = _extract_ids_from_text(update, text)
 
     if not ids:
-        await update.effective_message.reply_text("⚠️ Укажи tg_id.", reply_markup=_kbd_menu())
+        await update.effective_message.reply_text("⚠️ Не вижу tg_id. Пришли числа (5+ цифр) или ответь reply.")
         return MENU
 
     ok = 0
@@ -338,20 +340,46 @@ async def _apply_mass(update: Update, context: ContextTypes.DEFAULT_TYPE, *, all
                 if repo.delete(tg_id):
                     ok += 1
             else:
-                # allow True/False
                 repo.upsert(tg_id, allow=bool(allow), admin=False, note="ui mass")
                 ok += 1
         except Exception:
-            # тут лучше не падать на одном id
             pass
 
     if delete:
         await update.effective_message.reply_text(f"🗑 Удалено: {ok}/{len(ids)}", reply_markup=_kbd_menu())
     else:
         if allow:
-            await update.effective_message.reply_text(f"➕ Добавлено/разрешено: {ok}/{len(ids)}", reply_markup=_kbd_menu())
+            await update.effective_message.reply_text(f"✅ Разрешено: {ok}/{len(ids)}", reply_markup=_kbd_menu())
         else:
             await update.effective_message.reply_text(f"⛔ Заблокировано: {ok}/{len(ids)}", reply_markup=_kbd_menu())
+
+    return MENU
+
+
+async def _apply_one(update: Update, context: ContextTypes.DEFAULT_TYPE, *, admin: bool) -> int:
+    if not _is_admin(update, context):
+        await update.effective_message.reply_text("⛔ Доступ запрещен.")
+        return ConversationHandler.END
+
+    repo = _repo(context)
+    if not repo:
+        await update.effective_message.reply_text("⚠️ repo_access не подключен (проверь main.py).")
+        return ConversationHandler.END
+
+    target = _parse_target_id(update, [update.effective_message.text or ""])
+    if not target:
+        await update.effective_message.reply_text("⚠️ Не вижу tg_id. Пришли число (5+ цифр) или ответь reply.")
+        return MENU
+
+    try:
+        repo.upsert(target, allow=True, admin=admin, note="ui one")
+        await update.effective_message.reply_text(
+            ("👑 Назначен админ: " if admin else "⬇️ Снят админ: ") + str(target),
+            reply_markup=_kbd_menu(),
+        )
+    except Exception:
+        await update.effective_message.reply_text("⚠️ Не удалось выполнить операцию.", reply_markup=_kbd_menu())
+
     return MENU
 
 
@@ -372,84 +400,63 @@ async def on_delete_mass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def on_admin_one(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _send_typing(update, context)
-
-    if not _is_admin(update, context):
-        await update.effective_message.reply_text("⛔ Доступ запрещен.")
-        return ConversationHandler.END
-
-    repo = _repo(context)
-    if not repo:
-        await update.effective_message.reply_text("⚠️ repo_access не подключен (проверь main.py).")
-        return ConversationHandler.END
-
-    ids = _extract_ids_from_text(update, update.effective_message.text or "")
-    if not ids:
-        await update.effective_message.reply_text("⚠️ Укажи tg_id.", reply_markup=_kbd_menu())
-        return MENU
-
-    tg_id = ids[0]
-    repo.upsert(tg_id, allow=True, admin=True, note="ui admin")
-    await update.effective_message.reply_text(f"👑 Назначен админ: {tg_id}", reply_markup=_kbd_menu())
-    return MENU
+    return await _apply_one(update, context, admin=True)
 
 
 async def on_unadmin_one(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await _send_typing(update, context)
+    return await _apply_one(update, context, admin=False)
 
-    if not _is_admin(update, context):
-        await update.effective_message.reply_text("⛔ Доступ запрещен.")
+
+async def on_nav_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Во время ожидания текста всё равно должны работать назад/список/закрыть."""
+    q = update.callback_query
+    if not q:
         return ConversationHandler.END
-
-    repo = _repo(context)
-    if not repo:
-        await update.effective_message.reply_text("⚠️ repo_access не подключен (проверь main.py).")
+    data = q.data or ""
+    if not re.match(CB_NAV_PATTERN, data):
+        # не перехватываем чужие callback'и
         return ConversationHandler.END
-
-    ids = _extract_ids_from_text(update, update.effective_message.text or "")
-    if not ids:
-        await update.effective_message.reply_text("⚠️ Укажи tg_id.", reply_markup=_kbd_menu())
-        return MENU
-
-    tg_id = ids[0]
-    cur = repo.get(tg_id)
-    allow = bool(cur.is_allowed) if cur else True
-    repo.upsert(tg_id, allow=allow, admin=False, note="ui unadmin")
-    await update.effective_message.reply_text(f"✅ Админ снят: {tg_id}", reply_markup=_kbd_menu())
-    return MENU
+    return await on_menu_click(update, context)
 
 
 def register(app: Application) -> None:
+    settings = get_settings()
+
     conv = ConversationHandler(
         entry_points=[CommandHandler("access", cmd_access)],
         states={
-            MENU: [CallbackQueryHandler(on_menu_click, pattern=f"^{CB_NS}:")],
+            MENU: [
+                CallbackQueryHandler(on_menu_click, pattern=CB_MENU_PATTERN),
+            ],
             WAIT_ALLOW_MASS: [
-                CallbackQueryHandler(on_menu_click, pattern=f"^{CB_NS}:"),
+                CallbackQueryHandler(on_nav_click, pattern=CB_NAV_PATTERN),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_allow_mass),
             ],
             WAIT_BLOCK_MASS: [
-                CallbackQueryHandler(on_menu_click, pattern=f"^{CB_NS}:"),
+                CallbackQueryHandler(on_nav_click, pattern=CB_NAV_PATTERN),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_block_mass),
             ],
             WAIT_DELETE_MASS: [
-                CallbackQueryHandler(on_menu_click, pattern=f"^{CB_NS}:"),
+                CallbackQueryHandler(on_nav_click, pattern=CB_NAV_PATTERN),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_delete_mass),
             ],
             WAIT_ADMIN_ONE: [
-                CallbackQueryHandler(on_menu_click, pattern=f"^{CB_NS}:"),
+                CallbackQueryHandler(on_nav_click, pattern=CB_NAV_PATTERN),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_admin_one),
             ],
             WAIT_UNADMIN_ONE: [
-                CallbackQueryHandler(on_menu_click, pattern=f"^{CB_NS}:"),
+                CallbackQueryHandler(on_nav_click, pattern=CB_NAV_PATTERN),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_unadmin_one),
             ],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("access", cmd_access)],
         name="access",
         persistent=False,
         per_user=True,
         per_chat=True,
-        per_message=False,  # важно: меню создаётся отдельным сообщением -> per_message=True ломает callback-state
-        allow_reentry=True,  # UX: можно заново входить в /access без зависаний состояния
+        # InlineKeyboard callbacks привязаны к сообщению; per_message=True стабилизирует state-machine.
+        per_message=True,
+        allow_reentry=True,
     )
     app.add_handler(conv)
