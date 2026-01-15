@@ -1,7 +1,7 @@
 from telegram.ext import Application
 
 # Базовые модули, которые точно есть
-from .handlers import start, dialogs, kb, model, mode, img, web, stats, admin, text, voice
+from .handlers import start, dialogs, kb, model, mode, img, web, stats, admin, access, text, voice
 
 # errors импортируем безопасно — чтобы не уронить приложение, если файла нет/ошибка внутри
 try:
@@ -21,6 +21,7 @@ def register(app: Application) -> None:
     web.register(app)
     stats.register(app)
     admin.register(app)
+    access.register(app)
     voice.register(app)   # голос ставим до text
     text.register(app)
     if errors_mod:
