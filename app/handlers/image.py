@@ -5,22 +5,13 @@ import logging
 from typing import Any, Dict, Optional
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-    ApplicationHandlerStop,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, ApplicationHandlerStop
 
 from ..services.dialog_service import DialogService
 
 log = logging.getLogger(__name__)
 
 DRAW_PREFIXES = ("нарисуй", "рисуй", "draw")
-
-...
 
 
 def _get_openai_client(context: ContextTypes.DEFAULT_TYPE):
@@ -40,13 +31,15 @@ def _safe_model(openai, *, model: Optional[str], kind: str, fallback: str) -> st
         return model or fallback
 
 
-def _extract_draw_prompt(text: str) -> str:
-    t = (text or "").strip()
-    low = t.lower().strip()
+def _extract_draw_prompt(text: str) -> Optional[str]:
+    if not text:
+        return None
+    t = text.strip()
+    low = t.lower()
     for p in DRAW_PREFIXES:
         if low.startswith(p):
             return t[len(p):].strip(" :,-\n\t")
-    return ""
+    return None
 
 
 async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str) -> None:
@@ -56,12 +49,12 @@ async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     cfg = context.application.bot_data.get("settings")
     if not getattr(cfg, "enable_image_generation", False):
-        await msg.reply_text("Генерация изображений отключена в настройках.")
+        await msg.reply_text("🚫 Генерация изображений отключена в настройках.")
         return
 
     img_svc = context.application.bot_data.get("svc_image")
     if img_svc is None:
-        await msg.reply_text("Сервис генерации изображений не инициализирован.")
+        await msg.reply_text("⚠️ Сервис генерации изображений не инициализирован.")
         return
 
     ds: DialogService | None = context.application.bot_data.get("svc_dialog")
@@ -97,89 +90,82 @@ async def _generate_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
 
-    await msg.reply_text("Рисую...")
+    await msg.reply_text("🎨 Рисую…")
 
-    url: Optional[str] = None
     try:
-        # 1) новый контракт: (prompt, model, dialog_settings=...)
+        # Совместимость по контрактам svc_image.generate_url(...)
         try:
             url = await img_svc.generate_url(prompt, model=image_model, dialog_settings=dialog_settings)
         except TypeError:
-            # 2) промежуточный контракт: (prompt, model)
             try:
                 url = await img_svc.generate_url(prompt, model=image_model)
             except TypeError:
-                # 3) старый контракт: (prompt)
                 url = await img_svc.generate_url(prompt)
 
-        # Отправляем изображение как фото, чтобы не показывать пользователю длинный URL
+        # Скрываем URL: отправляем как фото
         try:
             await msg.reply_photo(photo=url, caption="Готово.")
         except Exception:
-            # fallback: если Telegram не принял URL как photo
-            await msg.reply_text("Готово: " + str(url))
+            # если Telegram не принял URL как фото — тогда уже показываем ссылку
+            await msg.reply_text(str(url))
 
         # --- MULTIMODAL CONTEXT: сохраняем шаг в историю и в context_assets ---
         if ds:
             try:
-                d = ds.ensure_active_dialog(update.effective_user.id)
+                ds.add_message(
+                    tg_user_id=update.effective_user.id,
+                    role="assistant",
+                    text=f"[image]{url}",
+                )
             except Exception:
-                d = None
+                pass
 
-            if d:
-                try:
-                    ds.add_message(
-                        tg_user_id=update.effective_user.id,
-                        role="assistant",
-                        text=f"[image]{url}",
-                    )
-                except Exception:
-                    pass
-
-                try:
-                    assets = context.chat_data.get("context_assets") or []
-                    assets.append({"type": "image_url", "url": url})
-                    context.chat_data["context_assets"] = assets
-                except Exception:
-                    pass
+            try:
+                assets = context.chat_data.get("context_assets") or []
+                assets.append({"type": "image_url", "url": url})
+                context.chat_data["context_assets"] = assets
+            except Exception:
+                pass
 
     except Exception as e:
         log.exception("Image generation failed: %s", e)
-        await msg.reply_text("Не удалось сгенерировать изображение.")
+        await msg.reply_text(f"❌ Ошибка генерации изображения: {e}")
 
 
 async def on_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if not msg:
-        return
-
     # /img <prompt> или /draw <prompt>
-    prompt = (msg.text or "").split(maxsplit=1)
-    if len(prompt) < 2 or not prompt[1].strip():
-        await msg.reply_text("Использование: /img <описание>")
-        return
-
-    await _generate_and_reply(update, context, prompt[1].strip())
-
-
-async def on_draw_text_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
         return
 
     text = (msg.text or "").strip()
-    prompt = _extract_draw_prompt(text)
+    parts = text.split(maxsplit=1)
+    prompt = parts[1].strip() if len(parts) > 1 else None
+    if not prompt:
+        await msg.reply_text("Напиши: /img <что рисовать> (или /draw …, или текстом: «нарисуй …»).")
+        return
+
+    await _generate_and_reply(update, context, prompt)
+
+
+async def on_draw_text_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Триггер: "нарисуй ..." / "рисуй ..." / "draw ..."
+    msg = update.effective_message
+    if not msg:
+        return
+
+    prompt = _extract_draw_prompt(msg.text or "")
     if not prompt:
         return
 
     await _generate_and_reply(update, context, prompt)
-    # ВАЖНО: останавливаем дальнейшие обработчики (иначе text.py тоже ответит на это сообщение)
+
+    # Останавливаем дальнейшие обработчики (иначе text.py тоже ответит на это сообщение)
     raise ApplicationHandlerStop
 
 
 def register(app: Application) -> None:
-    # Команды-алиасы: /img — основная, /draw — совместимость/привычка
+    # Основная команда: /img. Алиас: /draw (для совместимости)
     app.add_handler(CommandHandler("img", on_draw_command))
     app.add_handler(CommandHandler("draw", on_draw_command))
-    # Триггеры в обычном тексте: "нарисуй ...", "рисуй ...", "draw ..."
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_draw_text_trigger))
